@@ -1,0 +1,968 @@
+//! Official camelCase YAML. Parse is loose; fill rejects v1-unimplemented keys.
+
+use crate::bps::parse_bps;
+use crate::listen::{parse_listen, parse_server};
+use hy_core::client::{self as core_client};
+use hy_core::io::{DatagramIo, StdUdp, StdUdpFactory};
+use hy_core::server::{self as core_server};
+use hy_core::Error;
+use hy_extras::auth::{CommandAuth, HttpAuth, Password, UserPass};
+use hy_extras::obfs::ObfsSalamander;
+use hy_extras::outbounds::{
+    AclEngine, Adapter, Direct, DirectMode, PluggableOutbound, SpeedtestHandler, SystemResolver,
+};
+use hy_extras::acl::CompiledRuleSet;
+use hy_extras::masq::StringMasq;
+use hy_extras::trafficlogger::TrafficStats;
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientYaml {
+    pub server: Option<String>,
+    pub auth: Option<serde_yaml::Value>,
+    pub tls: Option<ClientTlsYaml>,
+    pub quic: Option<QuicYaml>,
+    pub bandwidth: Option<BandwidthYaml>,
+    pub congestion: Option<CongestionYaml>,
+    pub fast_open: Option<bool>,
+    pub lazy: Option<bool>,
+    pub obfs: Option<ObfsYaml>,
+    pub socks5: Option<Socks5Yaml>,
+    pub http: Option<HttpYaml>,
+    pub tcp_forwarding: Option<Vec<ForwardYaml>>,
+    pub udp_forwarding: Option<Vec<ForwardYaml>>,
+    pub transport: Option<serde_yaml::Value>,
+    pub realm: Option<serde_yaml::Value>,
+    pub mimic: Option<serde_yaml::Value>,
+    pub tun: Option<serde_yaml::Value>,
+    #[serde(rename = "tcpTProxy")]
+    pub tcp_tproxy: Option<serde_yaml::Value>,
+    #[serde(rename = "udpTProxy")]
+    pub udp_tproxy: Option<serde_yaml::Value>,
+    pub tcp_redirect: Option<serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientTlsYaml {
+    pub sni: Option<String>,
+    pub insecure: Option<bool>,
+    #[serde(rename = "pinSHA256")]
+    pub pin_sha256: Option<String>,
+    pub ca: Option<String>,
+    pub client_certificate: Option<String>,
+    pub client_key: Option<String>,
+    pub ech: Option<serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerYaml {
+    pub listen: Option<String>,
+    pub tls: Option<ServerTlsYaml>,
+    pub auth: Option<ServerAuthYaml>,
+    pub obfs: Option<ObfsYaml>,
+    pub bandwidth: Option<BandwidthYaml>,
+    pub ignore_client_bandwidth: Option<bool>,
+    pub congestion: Option<CongestionYaml>,
+    #[serde(rename = "disableUDP")]
+    pub disable_udp: Option<bool>,
+    pub udp_idle_timeout: Option<String>,
+    pub resolver: Option<ResolverYaml>,
+    pub acl: Option<AclYaml>,
+    pub outbounds: Option<Vec<OutboundYaml>>,
+    pub speed_test: Option<bool>,
+    pub traffic_stats: Option<TrafficStatsYaml>,
+    pub masquerade: Option<MasqYaml>,
+    pub acme: Option<serde_yaml::Value>,
+    pub ech: Option<serde_yaml::Value>,
+    pub sniff: Option<SniffYaml>,
+    pub realm: Option<serde_yaml::Value>,
+    pub mimic: Option<serde_yaml::Value>,
+    pub quic: Option<QuicYaml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerTlsYaml {
+    pub cert: Option<String>,
+    pub key: Option<String>,
+    pub sni_guard: Option<String>,
+    #[serde(rename = "clientCA")]
+    pub client_ca: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerAuthYaml {
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+    pub password: Option<String>,
+    pub userpass: Option<HashMap<String, String>>,
+    pub http: Option<HttpAuthYaml>,
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct HttpAuthYaml {
+    pub url: Option<String>,
+    pub insecure: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ObfsYaml {
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+    pub salamander: Option<SalamanderYaml>,
+    pub gecko: Option<serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SalamanderYaml {
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BandwidthYaml {
+    pub up: Option<String>,
+    pub down: Option<String>,
+    pub disable_loss_compensation: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CongestionYaml {
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+    pub bbr_profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuicYaml {
+    pub init_stream_receive_window: Option<u64>,
+    pub max_stream_receive_window: Option<u64>,
+    pub init_conn_receive_window: Option<u64>,
+    pub max_conn_receive_window: Option<u64>,
+    pub max_idle_timeout: Option<String>,
+    pub keep_alive_period: Option<String>,
+    pub disable_path_mtu_discovery: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct Socks5Yaml {
+    pub listen: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    #[serde(rename = "disableUDP")]
+    pub disable_udp: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct HttpYaml {
+    pub listen: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub realm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ForwardYaml {
+    pub listen: Option<String>,
+    pub remote: Option<String>,
+    pub timeout: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ResolverYaml {
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AclYaml {
+    pub file: Option<String>,
+    #[serde(default, deserialize_with = "de_acl_inline")]
+    pub inline: Option<String>,
+}
+
+fn de_acl_inline<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let v = Option::<serde_yaml::Value>::deserialize(d)?;
+    match v {
+        None | Some(serde_yaml::Value::Null) => Ok(None),
+        Some(serde_yaml::Value::String(s)) => Ok(Some(s)),
+        Some(serde_yaml::Value::Sequence(seq)) => {
+            let mut lines = Vec::new();
+            for x in seq {
+                match x {
+                    serde_yaml::Value::String(s) => lines.push(s),
+                    other => {
+                        return Err(serde::de::Error::custom(format!(
+                            "acl.inline entry must be a string, got {other:?}"
+                        )))
+                    }
+                }
+            }
+            Ok(Some(lines.join("
+")))
+        }
+        Some(_) => Err(serde::de::Error::custom("acl.inline must be a string or sequence")),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct OutboundYaml {
+    pub name: Option<String>,
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+    pub direct: Option<DirectYaml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct DirectYaml {
+    pub mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MasqYaml {
+    #[serde(rename = "type")]
+    pub ty: Option<String>,
+    pub string: Option<MasqStringYaml>,
+    #[serde(rename = "listenHTTP")]
+    pub listen_http: Option<String>,
+    #[serde(rename = "listenHTTPS")]
+    pub listen_https: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MasqStringYaml {
+    pub status: Option<u16>,
+    #[serde(rename = "statusCode")]
+    pub status_code: Option<u16>,
+    pub content: Option<String>,
+    pub headers: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct TrafficStatsYaml {
+    pub listen: Option<String>,
+    pub secret: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct SniffYaml {
+    pub enable: Option<bool>,
+}
+
+pub fn parse_client_yaml(s: &str) -> Result<ClientYaml, Error> {
+    serde_yaml::from_str(s).map_err(|e| Error::config("YAML", e.to_string()))
+}
+
+pub fn parse_server_yaml(s: &str) -> Result<ServerYaml, Error> {
+    serde_yaml::from_str(s).map_err(|e| Error::config("YAML", e.to_string()))
+}
+
+fn parse_dur(s: &str, field: &'static str) -> Result<Duration, Error> {
+    let t = s.trim().to_ascii_lowercase();
+    if let Some(n) = t.strip_suffix("ms") {
+        let v: u64 = n.trim().parse().map_err(|_| Error::config(field, format!("bad duration {s}")))?;
+        return Ok(Duration::from_millis(v));
+    }
+    if let Some(n) = t.strip_suffix('s') {
+        let v: u64 = n.trim().parse().map_err(|_| Error::config(field, format!("bad duration {s}")))?;
+        return Ok(Duration::from_secs(v));
+    }
+    Err(Error::config(field, format!("bad duration {s}")))
+}
+
+fn auth_string(v: &serde_yaml::Value) -> Result<String, Error> {
+    if let Some(s) = v.as_str() {
+        return Ok(s.to_string());
+    }
+    if let Some(m) = v.as_mapping() {
+        if let Some(p) = m.get(serde_yaml::Value::from("password")).and_then(|x| x.as_str()) {
+            return Ok(p.to_string());
+        }
+    }
+    Err(Error::config("auth", "expected string or {password}"))
+}
+
+pub struct ClientApp {
+    pub core: core_client::Config,
+    pub socks5: Option<Socks5Yaml>,
+    pub http: Option<HttpYaml>,
+    pub tcp_fwd: Vec<ForwardYaml>,
+    pub udp_fwd: Vec<ForwardYaml>,
+    pub lazy: bool,
+}
+
+pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
+    if y.tun.is_some() {
+        return Err(Error::config("tun", "not implemented"));
+    }
+    if y.realm.is_some() {
+        return Err(Error::config("realm", "not implemented"));
+    }
+    if y.mimic.is_some() {
+        return Err(Error::config("mimic", "not implemented"));
+    }
+    if y.tcp_tproxy.is_some() {
+        return Err(Error::config("tcpTProxy", "not implemented"));
+    }
+    if y.udp_tproxy.is_some() {
+        return Err(Error::config("udpTProxy", "not implemented"));
+    }
+    if y.tcp_redirect.is_some() {
+        return Err(Error::config("tcpRedirect", "not implemented"));
+    }
+    if let Some(t) = &y.tls {
+        if t.ech.is_some() {
+            return Err(Error::config("tls.ech", "not implemented"));
+        }
+    }
+    if let Some(o) = &y.obfs {
+        if o.gecko.is_some() || o.ty.as_deref() == Some("gecko") {
+            return Err(Error::config("obfs.gecko", "not implemented"));
+        }
+    }
+    if let Some(tr) = &y.transport {
+        if let Some(m) = tr.as_mapping() {
+            if let Some(udp) = m.get(serde_yaml::Value::from("udp")) {
+                if let Some(um) = udp.as_mapping() {
+                    if um.contains_key(serde_yaml::Value::from("hopInterval"))
+                        || um.contains_key(serde_yaml::Value::from("minHopInterval"))
+                    {
+                        return Err(Error::config("transport.udp.hopInterval", "not implemented"));
+                    }
+                }
+            }
+        }
+    }
+
+    let server = y.server.as_deref().ok_or_else(|| Error::config("Server", "must be set"))?;
+    let server_addr = parse_server(server)?;
+
+    let mut cfg = core_client::Config::default();
+    cfg.server_addr = Some(server_addr);
+    cfg.auth = match &y.auth {
+        Some(v) => auth_string(v)?,
+        None => String::new(),
+    };
+    if let Some(t) = &y.tls {
+        cfg.tls.server_name = t.sni.clone().unwrap_or_default();
+        cfg.tls.insecure_skip_verify = t.insecure.unwrap_or(false);
+        cfg.tls.pin_sha256 = t.pin_sha256.clone();
+        if let Some(ca) = &t.ca {
+            cfg.tls.ca_pem = std::fs::read(ca).map_err(|e| Error::config("tls.ca", e.to_string()))?;
+        }
+        if let Some(c) = &t.client_certificate {
+            cfg.tls.client_cert_pem = std::fs::read(c).map_err(|e| Error::config("tls.clientCertificate", e.to_string()))?;
+        }
+        if let Some(k) = &t.client_key {
+            cfg.tls.client_key_pem = std::fs::read(k).map_err(|e| Error::config("tls.clientKey", e.to_string()))?;
+        }
+    }
+    if let Some(q) = &y.quic {
+        if let Some(s) = &q.max_idle_timeout {
+            cfg.quic.max_idle_timeout = parse_dur(s, "quic.maxIdleTimeout")?;
+        }
+        if let Some(s) = &q.keep_alive_period {
+            cfg.quic.keep_alive_period = parse_dur(s, "quic.keepAlivePeriod")?;
+        }
+        cfg.quic.disable_path_mtu_discovery = q.disable_path_mtu_discovery.unwrap_or(false);
+    }
+    if let Some(b) = &y.bandwidth {
+        if let Some(u) = &b.up {
+            cfg.bandwidth.max_tx = parse_bps(u)?;
+        }
+        if let Some(d) = &b.down {
+            cfg.bandwidth.max_rx = parse_bps(d)?;
+        }
+        cfg.bandwidth.disable_loss_compensation = b.disable_loss_compensation.unwrap_or(false);
+    }
+    if let Some(c) = &y.congestion {
+        cfg.congestion.ty = c.ty.clone().unwrap_or_default();
+        cfg.congestion.bbr_profile = c.bbr_profile.clone().unwrap_or_default();
+    }
+    cfg.fast_open = y.fast_open.unwrap_or(false);
+
+    if let Some(o) = &y.obfs {
+        let ty = o.ty.as_deref().unwrap_or("plain");
+        if ty == "salamander" {
+            let psk = o
+                .salamander
+                .as_ref()
+                .and_then(|s| s.password.as_deref())
+                .ok_or_else(|| Error::config("obfs.salamander.password", "must be set"))?;
+            let psk = psk.as_bytes().to_vec();
+            cfg.conn_factory = Some(Arc::new(SalamanderFactory { psk }));
+        } else if ty != "plain" {
+            return Err(Error::config("obfs.type", format!("{ty} not implemented")));
+        }
+    }
+
+    Ok(ClientApp {
+        core: cfg,
+        socks5: y.socks5.clone(),
+        http: y.http.clone(),
+        tcp_fwd: y.tcp_forwarding.clone().unwrap_or_default(),
+        udp_fwd: y.udp_forwarding.clone().unwrap_or_default(),
+        lazy: y.lazy.unwrap_or(false),
+    })
+}
+
+struct SalamanderFactory {
+    psk: Vec<u8>,
+}
+
+#[async_trait::async_trait]
+impl hy_core::io::ConnFactory for SalamanderFactory {
+    async fn open(&self, server: std::net::SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
+        let inner = StdUdpFactory.open(server).await?;
+        Ok(Arc::new(ObfsSalamander::new(inner, &self.psk)?))
+    }
+}
+
+pub struct ServerApp {
+    pub core: core_server::Config,
+    pub traffic: Option<(std::net::SocketAddr, std::sync::Arc<TrafficStats>)>,
+}
+
+pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
+    if y.acme.is_some() {
+        return Err(Error::config("acme", "not implemented"));
+    }
+    if y.ech.is_some() {
+        return Err(Error::config("ech", "not implemented"));
+    }
+    if y.realm.is_some() {
+        return Err(Error::config("realm", "not implemented"));
+    }
+    if y.mimic.is_some() {
+        return Err(Error::config("mimic", "not implemented"));
+    }
+    if y.sniff.as_ref().and_then(|s| s.enable) == Some(true) {
+        return Err(Error::config("sniff", "not implemented"));
+    }
+    if let Some(r) = &y.resolver {
+        let ty = r.ty.as_deref().unwrap_or("system");
+        if ty != "system" {
+            return Err(Error::config("resolver.type", format!("{ty} not implemented")));
+        }
+    }
+    if let Some(m) = &y.masquerade {
+        if m.listen_http.is_some() {
+            return Err(Error::config("masquerade.listenHTTP", "not implemented"));
+        }
+        if m.listen_https.is_some() {
+            return Err(Error::config("masquerade.listenHTTPS", "not implemented"));
+        }
+        let ty = m.ty.as_deref().unwrap_or("");
+        if matches!(ty, "file" | "proxy" | "listenHTTP") {
+            return Err(Error::config("masquerade.type", format!("{ty} not implemented")));
+        }
+        if ty == "string" {
+            let s = m.string.as_ref().ok_or_else(|| Error::config("masquerade.string", "must be set"))?;
+            let content = s.content.clone().unwrap_or_default();
+            if content.is_empty() {
+                return Err(Error::config("masquerade.string.content", "empty string content"));
+            }
+            let status = s.status_code.or(s.status).unwrap_or(200);
+            if status == 233 || !(200..=599).contains(&status) {
+                return Err(Error::config(
+                    "masquerade.string.statusCode",
+                    "invalid status code (must be 200-599, except 233)",
+                ));
+            }
+        } else if !ty.is_empty() && ty != "404" {
+            return Err(Error::config("masquerade.type", format!("{ty} not implemented")));
+        }
+    }
+    if let Some(list) = &y.outbounds {
+        for o in list {
+            let ty = o.ty.as_deref().unwrap_or("direct");
+            if ty == "socks5" || ty == "http" {
+                return Err(Error::config("outbounds", format!("{ty} not implemented")));
+            }
+        }
+    }
+    if let Some(o) = &y.obfs {
+        if o.gecko.is_some() || o.ty.as_deref() == Some("gecko") {
+            return Err(Error::config("obfs.gecko", "not implemented"));
+        }
+    }
+
+    let listen = y.listen.as_deref().unwrap_or(":443");
+    let bind = parse_listen(listen, "listen")?;
+    let mut io: Arc<dyn DatagramIo> = Arc::new(StdUdp::bind(bind).await.map_err(Error::Io)?);
+    if let Some(o) = &y.obfs {
+        if o.ty.as_deref() == Some("salamander") {
+            let psk = o
+                .salamander
+                .as_ref()
+                .and_then(|s| s.password.as_deref())
+                .ok_or_else(|| Error::config("obfs.salamander.password", "must be set"))?;
+            io = Arc::new(ObfsSalamander::new(io, psk.as_bytes())?);
+        }
+    }
+
+    let tls = y.tls.as_ref().ok_or_else(|| Error::config("tls", "must be set"))?;
+    let cert = tls.cert.as_deref().ok_or_else(|| Error::config("tls.cert", "must be set"))?;
+    let key = tls.key.as_deref().ok_or_else(|| Error::config("tls.key", "must be set"))?;
+
+    let mut cfg = core_server::Config::default();
+    cfg.tls.cert_pem = std::fs::read(cert).map_err(|e| Error::config("tls.cert", e.to_string()))?;
+    cfg.tls.key_pem = std::fs::read(key).map_err(|e| Error::config("tls.key", e.to_string()))?;
+    if let Some(ca) = tls.client_ca.as_deref() {
+        cfg.tls.client_ca_pem = std::fs::read(ca).map_err(|e| Error::config("tls.clientCA", e.to_string()))?;
+    }
+    cfg.conn = Some(io);
+    cfg.disable_udp = y.disable_udp.unwrap_or(false);
+    if let Some(s) = y.udp_idle_timeout.as_deref() {
+        cfg.udp_idle_timeout = parse_dur(s, "udpIdleTimeout")?;
+    }
+    cfg.ignore_client_bandwidth = y.ignore_client_bandwidth.unwrap_or(false);
+    if let Some(b) = &y.bandwidth {
+        if let Some(u) = &b.up {
+            cfg.bandwidth.max_tx = parse_bps(u)?;
+        }
+        if let Some(d) = &b.down {
+            cfg.bandwidth.max_rx = parse_bps(d)?;
+        }
+        cfg.bandwidth.disable_loss_compensation = b.disable_loss_compensation.unwrap_or(false);
+    }
+    if let Some(c) = &y.congestion {
+        cfg.congestion.ty = c.ty.clone().unwrap_or_default();
+        cfg.congestion.bbr_profile = c.bbr_profile.clone().unwrap_or_default();
+    }
+
+    cfg.authenticator = Some(build_auth(y.auth.as_ref())?);
+    cfg.outbound = Some(build_outbound(y)?);
+    if let Some(m) = &y.masquerade {
+        let ty = m.ty.as_deref().unwrap_or("");
+        if ty == "string" {
+            let s = m.string.as_ref().unwrap();
+            let status = s.status_code.or(s.status).unwrap_or(200);
+            let headers = s
+                .headers
+                .as_ref()
+                .map(|h| h.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default();
+            cfg.masq_handler = Some(Arc::new(StringMasq::new(
+                status,
+                headers,
+                s.content.clone().unwrap_or_default().into_bytes(),
+            )));
+        }
+    }
+    let traffic = if let Some(ts) = &y.traffic_stats {
+        if let Some(listen) = ts.listen.as_deref() {
+            let addr = parse_listen(listen, "trafficStats.listen")?;
+            let logger = TrafficStats::new(ts.secret.clone().unwrap_or_default());
+            cfg.traffic_logger = Some(logger.clone());
+            Some((addr, logger))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(ServerApp { core: cfg, traffic })
+}
+
+fn build_auth(a: Option<&ServerAuthYaml>) -> Result<Arc<dyn hy_core::server::Authenticator>, Error> {
+    let a = a.ok_or_else(|| Error::config("auth", "must be set"))?;
+    let ty = a.ty.as_deref().unwrap_or("password");
+    match ty {
+        "password" => {
+            let p = a.password.clone().ok_or_else(|| Error::config("auth.password", "must be set"))?;
+            Ok(Arc::new(Password(p)))
+        }
+        "userpass" => {
+            let m = a.userpass.clone().ok_or_else(|| Error::config("auth.userpass", "must be set"))?;
+            Ok(Arc::new(UserPass::new(m)))
+        }
+        "http" => {
+            let h = a.http.as_ref().ok_or_else(|| Error::config("auth.http", "must be set"))?;
+            Ok(Arc::new(HttpAuth {
+                url: h.url.clone().unwrap_or_default(),
+                insecure: h.insecure.unwrap_or(false),
+            }))
+        }
+        "command" => {
+            let c = a.command.clone().ok_or_else(|| Error::config("auth.command", "must be set"))?;
+            Ok(Arc::new(CommandAuth::new(PathBuf::from(c))))
+        }
+        other => Err(Error::config("auth.type", format!("{other} not implemented"))),
+    }
+}
+
+fn build_outbound(y: &ServerYaml) -> Result<Arc<dyn hy_core::server::Outbound>, Error> {
+    let direct: Arc<dyn PluggableOutbound> = Arc::new(Direct::new(DirectMode::Auto));
+    let mut table: HashMap<String, Arc<dyn PluggableOutbound>> = HashMap::new();
+    table.insert("direct".into(), Arc::clone(&direct));
+    table.insert("default".into(), Arc::clone(&direct));
+
+    if let Some(list) = &y.outbounds {
+        for o in list {
+            let name = o.name.clone().unwrap_or_else(|| "default".into()).to_ascii_lowercase();
+            let ty = o.ty.as_deref().unwrap_or("direct");
+            if ty != "direct" {
+                return Err(Error::config("outbounds", format!("{ty} not implemented")));
+            }
+            let mode = match o.direct.as_ref().and_then(|d| d.mode.as_deref()).unwrap_or("auto") {
+                "auto" => DirectMode::Auto,
+                "64" => DirectMode::Prefer64,
+                "46" => DirectMode::Prefer46,
+                "6" => DirectMode::V6,
+                "4" => DirectMode::V4,
+                other => return Err(Error::config("outbounds.direct.mode", format!("bad mode {other}"))),
+            };
+            let d: Arc<dyn PluggableOutbound> = Arc::new(Direct::new(mode));
+            table.insert(name, Arc::clone(&d));
+            if table.get("default").is_some() && o.name.as_deref() == Some("default") {
+                table.insert("default".into(), d);
+            }
+        }
+    }
+
+    let mut next: Arc<dyn PluggableOutbound> = if let Some(acl) = &y.acl {
+        let text = if let Some(inline) = &acl.inline {
+            inline.clone()
+        } else if let Some(file) = &acl.file {
+            std::fs::read_to_string(file).map_err(|e| Error::config("acl.file", e.to_string()))?
+        } else {
+            String::new()
+        };
+        let rules = CompiledRuleSet::compile(&text).map_err(|e| Error::config("acl", e.to_string()))?;
+        Arc::new(AclEngine::new(rules, table))
+    } else {
+        Arc::clone(&direct)
+    };
+
+    let need_resolver = y.acl.is_some()
+        || y.resolver.as_ref().and_then(|r| r.ty.as_deref()) == Some("system");
+    if need_resolver {
+        next = Arc::new(SystemResolver { next });
+    }
+    // Speedtest sits outside Resolver/ACL (pipeline: Speedtest → Resolver → ACL → Outbound).
+    if y.speed_test == Some(true) {
+        next = Arc::new(SpeedtestHandler { next });
+    }
+    Ok(Arc::new(Adapter(next)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn official_client_deserializes() {
+        let y = parse_client_yaml(
+            r#"
+server: 127.0.0.1:18443
+auth: test
+tls: { insecure: true, sni: localhost }
+socks5: { listen: 127.0.0.1:11080 }
+http: { listen: ":8080" }
+tcpForwarding: [{ listen: ":2222", remote: "1.1.1.1:22" }]
+udpForwarding: [{ listen: ":53", remote: "1.1.1.1:53", timeout: 60s }]
+bandwidth: { up: 100mbps, down: 500mbps }
+congestion: { type: bbr, bbrProfile: standard }
+obfs: { type: salamander, salamander: { password: "abcd" } }
+"#,
+        )
+        .unwrap();
+        assert_eq!(y.server.as_deref(), Some("127.0.0.1:18443"));
+        assert!(y.socks5.is_some());
+    }
+
+    #[test]
+    fn official_server_deserializes() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:18443
+tls: { cert: test.crt, key: test.key }
+auth: { type: password, password: test }
+acl: { inline: "direct(*)\n" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(y.listen.as_deref(), Some("127.0.0.1:18443"));
+    }
+
+    #[test]
+    fn disable_udp_accepts_official_casing() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+disableUDP: true
+"#,
+        )
+        .unwrap();
+        assert_eq!(y.disable_udp, Some(true));
+    }
+
+    fn client_field(extra: &str) -> &'static str {
+        let y = parse_client_yaml(&format!("server: 127.0.0.1:1\nauth: x\n{extra}\n")).unwrap();
+        match fill_client(&y) {
+            Err(Error::Config { field, .. }) => field,
+            other => panic!("expected Config, got ok-or-other-err"),
+        }
+    }
+
+    #[test]
+    fn fill_rejects_tun() {
+        assert_eq!(client_field("tun: { name: hy0 }"), "tun");
+    }
+
+    #[test]
+    fn fill_rejects_hop() {
+        let y = parse_client_yaml("server: 1.1.1.1:443,1.1.1.1:444\nauth: x\n").unwrap();
+        match fill_client(&y) {
+            Err(Error::Config { field, .. }) => assert!(field == "Server" || field == "ServerAddr"),
+            other => panic!("expected hop reject"),
+        }
+    }
+
+    #[test]
+    fn tc_cfg_03_client_rejects() {
+        assert_eq!(client_field("obfs: { gecko: {} }"), "obfs.gecko");
+        assert_eq!(client_field("obfs: { type: gecko }"), "obfs.gecko");
+        assert_eq!(
+            client_field("transport:\n  udp:\n    hopInterval: 30s"),
+            "transport.udp.hopInterval"
+        );
+        assert_eq!(client_field("realm: {}"), "realm");
+        assert_eq!(client_field("mimic: {}"), "mimic");
+        assert_eq!(client_field("tun: { name: hy0 }"), "tun");
+        assert_eq!(client_field("tcpTProxy: {}"), "tcpTProxy");
+        assert_eq!(client_field("udpTProxy: {}"), "udpTProxy");
+        assert_eq!(client_field("tcpRedirect: {}"), "tcpRedirect");
+        assert_eq!(client_field("tls: { ech: {} }"), "tls.ech");
+    }
+
+    fn server_field(extra: &str) -> String {
+        let y = parse_server_yaml(&format!(
+            "listen: 127.0.0.1:1\ntls: {{ cert: t.crt, key: t.key }}\nauth: {{ type: password, password: test }}\n{extra}\n"
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        match rt.block_on(fill_server(&y)) {
+            Err(Error::Config { field, reason }) => format!("{field}:{reason}"),
+            other => panic!("expected Config, got ok-or-other-err"),
+        }
+    }
+
+    #[test]
+    fn tc_cfg_04_server_rejects() {
+        let acme = server_field("acme: {}");
+        assert!(acme.starts_with("acme:"), "{acme}");
+        let ech = server_field("ech: {}");
+        assert!(ech.starts_with("ech:"), "{ech}");
+        let sniff = server_field("sniff: { enable: true }");
+        assert!(sniff.starts_with("sniff:"), "{sniff}");
+        let doh = server_field("resolver: { type: doh }");
+        assert!(doh.starts_with("resolver.type:"), "{doh}");
+        let s5 = server_field("outbounds:\n  - name: p\n    type: socks5");
+        assert!(s5.starts_with("outbounds:"), "{s5}");
+        let http = server_field("outbounds:\n  - name: p\n    type: http");
+        assert!(http.starts_with("outbounds:"), "{http}");
+        let mf = server_field("masquerade: { type: file }");
+        assert!(mf.starts_with("masquerade.type:"), "{mf}");
+        let mp = server_field("masquerade: { type: proxy }");
+        assert!(mp.starts_with("masquerade.type:"), "{mp}");
+        let realm = server_field("realm: {}");
+        assert!(realm.starts_with("realm:"), "{realm}");
+        let mimic = server_field("mimic: {}");
+        assert!(mimic.starts_with("mimic:"), "{mimic}");
+    }
+
+    #[test]
+    fn traffic_stats_deserializes() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+trafficStats: { listen: 127.0.0.1:19999, secret: s3cret }
+"#,
+        )
+        .unwrap();
+        let ts = y.traffic_stats.unwrap();
+        assert_eq!(ts.listen.as_deref(), Some("127.0.0.1:19999"));
+        assert_eq!(ts.secret.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn official_yaml_deserializes() {
+        let server = include_str!("/workspace/hysteria/app/cmd/server_test.yaml");
+        let y = parse_server_yaml(server).expect("official server_test.yaml");
+        let inline = y.acl.as_ref().and_then(|a| a.inline.as_deref()).unwrap_or("");
+        assert!(inline.contains("lmao(ok)"), "{inline}");
+        assert!(inline.contains("kek(cringe,boba,tea)"), "{inline}");
+        let client = include_str!("/workspace/hysteria/app/cmd/client_test.yaml");
+        let c = parse_client_yaml(client).expect("official client_test.yaml");
+        assert_eq!(c.lazy, Some(true));
+    }
+
+    #[test]
+    fn acl_inline_sequence() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+acl:
+  inline:
+    - lmao(ok)
+    - kek(cringe,boba,tea)
+"#,
+        )
+        .unwrap();
+        let inline = y.acl.unwrap().inline.unwrap();
+        assert_eq!(inline, "lmao(ok)
+kek(cringe,boba,tea)");
+    }
+
+    #[test]
+    fn tls_client_ca_and_cert_deserialize() {
+        let s = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key, clientCA: client-ca.crt }
+auth: { type: password, password: test }
+"#,
+        )
+        .unwrap();
+        assert_eq!(s.tls.unwrap().client_ca.as_deref(), Some("client-ca.crt"));
+        let c = parse_client_yaml(
+            r#"
+server: 127.0.0.1:1
+auth: x
+tls:
+  insecure: true
+  clientCertificate: client.crt
+  clientKey: client.key
+"#,
+        )
+        .unwrap();
+        let t = c.tls.unwrap();
+        assert_eq!(t.client_certificate.as_deref(), Some("client.crt"));
+        assert_eq!(t.client_key.as_deref(), Some("client.key"));
+    }
+
+    #[test]
+    fn fill_keeps_lazy() {
+        let y = parse_client_yaml("server: 127.0.0.1:1
+auth: x
+lazy: true
+").unwrap();
+        let app = fill_client(&y).unwrap();
+        assert!(app.lazy);
+    }
+
+    #[test]
+    fn masq_string_builds_handler() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+masquerade:
+  type: string
+  string:
+    content: aint nothin here
+    headers:
+      content-type: text/plain
+    statusCode: 418
+"#,
+        )
+        .unwrap();
+        let m = y.masquerade.as_ref().unwrap();
+        assert_eq!(m.ty.as_deref(), Some("string"));
+        let s = m.string.as_ref().unwrap();
+        assert_eq!(s.content.as_deref(), Some("aint nothin here"));
+        assert_eq!(s.status_code, Some(418));
+        let h = StringMasq::new(
+            s.status_code.or(s.status).unwrap_or(0),
+            s.headers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            s.content.clone().unwrap_or_default().into_bytes(),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let r = rt.block_on(hy_core::server::MasqHandler::handle(&h, "GET", "x", "/"));
+        assert_eq!(r.status, 418);
+        assert_eq!(r.body.as_ref(), b"aint nothin here");
+    }
+
+    #[tokio::test]
+    async fn speed_test_true_wraps_outbound() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+speedTest: true
+"#,
+        )
+        .unwrap();
+        assert_eq!(y.speed_test, Some(true));
+        let ob = build_outbound(&y).unwrap();
+        let mut stream = ob.tcp("@SpeedTest:0").await.unwrap();
+        let req = [0x01u8, 0x00, 0x00, 0x00, 0x40];
+        assert_eq!(stream.write(&req).await.unwrap(), 5);
+        let mut hdr = [0u8; 5];
+        let mut off = 0;
+        while off < 5 {
+            let n = stream.read(&mut hdr[off..]).await.unwrap();
+            assert!(n > 0);
+            off += n;
+        }
+        assert_eq!(hdr[0], 0);
+        assert_eq!(&hdr[3..], b"OK");
+        let mut data = [0u8; 64];
+        off = 0;
+        while off < 64 {
+            let n = stream.read(&mut data[off..]).await.unwrap();
+            assert!(n > 0);
+            off += n;
+        }
+    }
+
+    #[tokio::test]
+    async fn speed_test_absent_does_not_intercept() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+"#,
+        )
+        .unwrap();
+        assert!(y.speed_test.is_none() || y.speed_test == Some(false));
+        let ob = build_outbound(&y).unwrap();
+        // Without SpeedtestHandler, @SpeedTest goes to Direct and fails to resolve/dial.
+        let err = match ob.tcp("@SpeedTest:0").await {
+            Err(e) => e,
+            Ok(_) => panic!("expected dial failure without speedTest"),
+        };
+        match err {
+            Error::Dial(s) => assert!(!s.contains("tcp only"), "{s}"),
+            other => panic!("expected Dial, got {other:?}"),
+        }
+    }
+}

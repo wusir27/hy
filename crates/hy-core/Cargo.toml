@@ -1,0 +1,42 @@
+[package]
+name = "hy-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hysteria 2 protocol engine"
+
+[features]
+default = ["transport"]
+transport = [
+    "dep:quinn",
+    "dep:quinn-proto",
+    "dep:h3",
+    "dep:h3-quinn",
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:ring",
+    "dep:http",
+    "dep:rustls-native-certs",
+    "dep:webpki-roots",
+]
+
+[dependencies]
+thiserror = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+quinn = { workspace = true, optional = true }
+quinn-proto = { workspace = true, optional = true }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+ring = { workspace = true, optional = true }
+http = { workspace = true, optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+[dev-dependencies]
+rcgen = "0.13"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }

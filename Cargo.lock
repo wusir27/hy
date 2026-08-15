@@ -631,6 +631,7 @@ dependencies = [
  "hy-core",
  "hy-extras",
  "instant-acme",
+ "libc",
  "rcgen 0.14.7",
  "rustls",
  "rustls-pemfile",

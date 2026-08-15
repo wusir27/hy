@@ -48,7 +48,13 @@ pub struct ClientYaml {
     pub tcp_tproxy: Option<serde_yaml::Value>,
     #[serde(rename = "udpTProxy")]
     pub udp_tproxy: Option<serde_yaml::Value>,
-    pub tcp_redirect: Option<serde_yaml::Value>,
+    pub tcp_redirect: Option<TcpRedirectYaml>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpRedirectYaml {
+    pub listen: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -369,6 +375,7 @@ pub struct ClientApp {
     pub http: Option<HttpYaml>,
     pub tcp_fwd: Vec<ForwardYaml>,
     pub udp_fwd: Vec<ForwardYaml>,
+    pub tcp_redirect: Option<TcpRedirectYaml>,
     pub lazy: bool,
 }
 
@@ -388,8 +395,22 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
     if y.udp_tproxy.is_some() {
         return Err(Error::config("udpTProxy", "not implemented"));
     }
-    if y.tcp_redirect.is_some() {
-        return Err(Error::config("tcpRedirect", "not implemented"));
+    if let Some(r) = &y.tcp_redirect {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = r;
+            return Err(Error::config("tcpRedirect", "not supported"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let listen = r.listen.as_deref().unwrap_or("");
+            if listen.is_empty() {
+                return Err(Error::config(
+                    "tcpRedirect.listen",
+                    "listen address is empty",
+                ));
+            }
+        }
     }
     if let Some(t) = &y.tls {
         if t.ech.is_some() {
@@ -505,6 +526,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         http: y.http.clone(),
         tcp_fwd: y.tcp_forwarding.clone().unwrap_or_default(),
         udp_fwd: y.udp_forwarding.clone().unwrap_or_default(),
+        tcp_redirect: y.tcp_redirect.clone(),
         lazy: y.lazy.unwrap_or(false),
     })
 }
@@ -1228,8 +1250,61 @@ disableUDP: true
         assert_eq!(client_field("tun: { name: hy0 }"), "tun");
         assert_eq!(client_field("tcpTProxy: {}"), "tcpTProxy");
         assert_eq!(client_field("udpTProxy: {}"), "udpTProxy");
-        assert_eq!(client_field("tcpRedirect: {}"), "tcpRedirect");
+        // tcpRedirect empty listen is a config error, not "not implemented".
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntcpRedirect: {}\n").unwrap();
+        match fill_client(&y) {
+            Err(Error::Config { field, reason }) => {
+                assert!(
+                    field.starts_with("tcpRedirect"),
+                    "field={field} reason={reason}"
+                );
+                assert!(
+                    !reason.contains("not implemented"),
+                    "field={field} reason={reason}"
+                );
+            }
+            _ => panic!("expected empty-listen Config"),
+        }
         assert_eq!(client_field("tls: { ech: {} }"), "tls.ech");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fill_tcp_redirect_listen_ok() {
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\ntcpRedirect:\n  listen: 127.0.0.1:0\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("tcpRedirect listen should fill");
+        assert!(app.tcp_redirect.is_some());
+        assert_eq!(
+            app.tcp_redirect.as_ref().unwrap().listen.as_deref(),
+            Some("127.0.0.1:0")
+        );
+    }
+
+    #[test]
+    fn fill_tcp_redirect_empty_listen() {
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntcpRedirect: {}\n").unwrap();
+        match fill_client(&y) {
+            Err(Error::Config { field, reason }) => {
+                assert!(
+                    field.starts_with("tcpRedirect"),
+                    "field={field} reason={reason}"
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    assert_eq!(field, "tcpRedirect.listen");
+                    assert!(reason.contains("empty"), "{reason}");
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    assert_eq!(field, "tcpRedirect");
+                    assert!(reason.contains("not supported"), "{reason}");
+                }
+            }
+            _ => panic!("expected Config"),
+        }
     }
 
     #[test]

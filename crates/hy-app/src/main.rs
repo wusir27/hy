@@ -98,6 +98,14 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
             inbound::forward::run_udp(&listen, &remote, to, c).await
         }));
     }
+    #[cfg(target_os = "linux")]
+    if let Some(r) = app.tcp_redirect.take() {
+        let listen = r.listen.unwrap_or_default();
+        let c = Arc::clone(&cli);
+        tasks.push(tokio::spawn(async move {
+            inbound::redirect::run(&listen, c).await
+        }));
+    }
     if tasks.is_empty() {
         tracing::warn!("no inbound configured");
         tokio::signal::ctrl_c().await.map_err(Error::Io)?;

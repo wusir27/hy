@@ -125,7 +125,9 @@ impl UdpHop {
         }
         let sock = Arc::new(StdUdp::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?);
         let local = sock.local_addr()?;
-        let addr_index = rand::thread_rng().gen_range(0..ports.len());
+        // First dest is the declared main port so hop syntax reaches a
+        // server that only binds ports[0] (no DNAT required for the first interval).
+        let addr_index = 0usize;
         let logical_addr = SocketAddr::new(server_ip, ports[0]);
 
         // Placeholder recv handle; replaced after `hop` Arc exists.
@@ -409,7 +411,7 @@ mod tests {
         .await
         .unwrap();
         let first = hop.current_dest().port();
-        assert!(ports.contains(&first));
+        assert_eq!(first, ports[0], "initial dest must be the main/first port");
         let mut changed = false;
         for _ in 0..8 {
             tokio::time::sleep(Duration::from_millis(80)).await;

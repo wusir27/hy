@@ -189,6 +189,7 @@ pub struct ServerTlsYaml {
     pub sni_guard: Option<String>,
     #[serde(rename = "clientCA")]
     pub client_ca: Option<String>,
+    pub ech: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -976,6 +977,9 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
     }
     if y.ech.is_some() {
         return Err(Error::config("ech", "not implemented"));
+    }
+    if y.tls.as_ref().and_then(|t| t.ech.as_ref()).is_some() {
+        return Err(Error::config("tls.ech", "not implemented"));
     }
     let realm_opts = fill_realm_opts(y.realm.as_ref())?;
     // Mimic fill (no spawn) before TLS file reads so `enabled: true` without path
@@ -2039,6 +2043,29 @@ obfs:
         assert!(acme.contains("cannot set both"), "{acme}");
         let ech = server_field("ech: {}");
         assert!(ech.starts_with("ech:"), "{ech}");
+        let y = parse_server_yaml(
+            "listen: 127.0.0.1:0\ntls: { cert: t.crt, key: t.key, ech: true }\nauth: { type: password, password: test }\n",
+        )
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        match rt.block_on(fill_server(&y)) {
+            Err(Error::Config { field, reason }) => {
+                assert_eq!(field, "tls.ech", "{field}:{reason}");
+                assert!(reason.contains("not implemented"), "{reason}");
+            }
+            other => panic!("expected tls.ech reject, got {}", match &other { Ok(_) => "Ok".into(), Err(e) => format!("Err({e})") }),
+        }
+        let y = parse_server_yaml(
+            "listen: 127.0.0.1:0\ntls: { cert: t.crt, key: t.key, ech: { key: dummy } }\nauth: { type: password, password: test }\n",
+        )
+        .unwrap();
+        match rt.block_on(fill_server(&y)) {
+            Err(Error::Config { field, .. }) => assert_eq!(field, "tls.ech"),
+            other => panic!("expected tls.ech.key reject, got {}", match &other { Ok(_) => "Ok".into(), Err(e) => format!("Err({e})") }),
+        }
         // sniff.enable / resolver doh|https are implemented (P5.A1/A2) — must not reject as unimplemented.
         // P5.A3: socks5/http outbounds are implemented; bare type without addr/url may error on empty field.
         let s5 = server_field("outbounds:\n  - name: p\n    type: socks5");

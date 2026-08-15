@@ -518,9 +518,12 @@ dependencies = [
  "rand 0.8.7",
  "rcgen",
  "ring",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "tokio",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

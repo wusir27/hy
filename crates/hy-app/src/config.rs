@@ -9,7 +9,8 @@ use hy_core::Error;
 use hy_extras::auth::{CommandAuth, HttpAuth, Password, UserPass};
 use hy_extras::obfs::ObfsSalamander;
 use hy_extras::outbounds::{
-    AclEngine, Adapter, Direct, DirectMode, PluggableOutbound, SpeedtestHandler, SystemResolver,
+    AclEngine, Adapter, Direct, DirectMode, DohResolver, PluggableOutbound, SpeedtestHandler,
+    StandardResolver, SystemResolver,
 };
 use hy_extras::acl::CompiledRuleSet;
 use hy_extras::masq::StringMasq;
@@ -185,6 +186,24 @@ pub struct ForwardYaml {
 pub struct ResolverYaml {
     #[serde(rename = "type")]
     pub ty: Option<String>,
+    pub tcp: Option<ResolverEndpointYaml>,
+    pub udp: Option<ResolverEndpointYaml>,
+    pub tls: Option<ResolverTlsYaml>,
+    pub https: Option<ResolverTlsYaml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ResolverEndpointYaml {
+    pub addr: Option<String>,
+    pub timeout: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct ResolverTlsYaml {
+    pub addr: Option<String>,
+    pub timeout: Option<String>,
+    pub sni: Option<String>,
+    pub insecure: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -454,12 +473,7 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
     if y.mimic.is_some() {
         return Err(Error::config("mimic", "not implemented"));
     }
-    if let Some(r) = &y.resolver {
-        let ty = r.ty.as_deref().unwrap_or("system");
-        if ty != "system" {
-            return Err(Error::config("resolver.type", format!("{ty} not implemented")));
-        }
-    }
+    // resolver.type validated in build_outbound (P5.A2: tcp/udp/tls/https/doh).
     if let Some(m) = &y.masquerade {
         if m.listen_http.is_some() {
             return Err(Error::config("masquerade.listenHTTP", "not implemented"));
@@ -676,16 +690,101 @@ fn build_outbound(y: &ServerYaml) -> Result<Arc<dyn hy_core::server::Outbound>, 
         Arc::clone(&direct)
     };
 
-    let need_resolver = y.acl.is_some()
-        || y.resolver.as_ref().and_then(|r| r.ty.as_deref()) == Some("system");
-    if need_resolver {
-        next = Arc::new(SystemResolver { next });
-    }
+    next = wrap_resolver(y, next)?;
     // Speedtest sits outside Resolver/ACL (pipeline: Speedtest → Resolver → ACL → Outbound).
     if y.speed_test == Some(true) {
         next = Arc::new(SpeedtestHandler { next });
     }
     Ok(Arc::new(Adapter(next)))
+}
+
+fn resolver_timeout(s: Option<&str>, field: &'static str) -> Result<Duration, Error> {
+    match s {
+        None | Some("") => Ok(Duration::ZERO), // StandardResolver/DohResolver apply default
+        Some(t) => parse_dur(t, field),
+    }
+}
+
+fn wrap_resolver(
+    y: &ServerYaml,
+    next: Arc<dyn PluggableOutbound>,
+) -> Result<Arc<dyn PluggableOutbound>, Error> {
+    let r = y.resolver.as_ref();
+    let ty = r
+        .and_then(|x| x.ty.as_deref())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ty.as_str() {
+        "" => {
+            // No resolver section / empty type: wrap SystemResolver only when ACL is present.
+            if y.acl.is_some() {
+                Ok(Arc::new(SystemResolver { next }))
+            } else {
+                Ok(next)
+            }
+        }
+        "system" => {
+            // Explicit system: always wrap (same as prior need_resolver behavior).
+            Ok(Arc::new(SystemResolver { next }))
+        }
+        "tcp" => {
+            let ep = r.and_then(|x| x.tcp.as_ref());
+            let addr = ep
+                .and_then(|e| e.addr.as_deref())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::config("resolver.tcp.addr", "empty resolver address"))?;
+            let timeout = resolver_timeout(ep.and_then(|e| e.timeout.as_deref()), "resolver.tcp.timeout")?;
+            Ok(Arc::new(StandardResolver::tcp(addr.to_string(), timeout, next)))
+        }
+        "udp" => {
+            let ep = r.and_then(|x| x.udp.as_ref());
+            let addr = ep
+                .and_then(|e| e.addr.as_deref())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::config("resolver.udp.addr", "empty resolver address"))?;
+            let timeout = resolver_timeout(ep.and_then(|e| e.timeout.as_deref()), "resolver.udp.timeout")?;
+            Ok(Arc::new(StandardResolver::udp(addr.to_string(), timeout, next)))
+        }
+        "tls" | "tcp-tls" => {
+            let ep = r.and_then(|x| x.tls.as_ref());
+            let addr = ep
+                .and_then(|e| e.addr.as_deref())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::config("resolver.tls.addr", "empty resolver address"))?;
+            let timeout = resolver_timeout(ep.and_then(|e| e.timeout.as_deref()), "resolver.tls.timeout")?;
+            let sni = ep.and_then(|e| e.sni.clone()).unwrap_or_default();
+            let insecure = ep.and_then(|e| e.insecure).unwrap_or(false);
+            Ok(Arc::new(StandardResolver::tls(
+                addr.to_string(),
+                timeout,
+                sni,
+                insecure,
+                next,
+            )))
+        }
+        "https" | "http" | "doh" => {
+            let ep = r.and_then(|x| x.https.as_ref());
+            let addr = ep
+                .and_then(|e| e.addr.as_deref())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::config("resolver.https.addr", "empty resolver address"))?;
+            let timeout =
+                resolver_timeout(ep.and_then(|e| e.timeout.as_deref()), "resolver.https.timeout")?;
+            let sni = ep.and_then(|e| e.sni.clone()).unwrap_or_default();
+            let insecure = ep.and_then(|e| e.insecure).unwrap_or(false);
+            Ok(Arc::new(DohResolver::new(
+                addr.to_string(),
+                timeout,
+                sni,
+                insecure,
+                next,
+            )))
+        }
+        other => Err(Error::config(
+            "resolver.type",
+            format!("{other} not implemented"),
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -798,9 +897,7 @@ disableUDP: true
         assert!(acme.starts_with("acme:"), "{acme}");
         let ech = server_field("ech: {}");
         assert!(ech.starts_with("ech:"), "{ech}");
-        // sniff.enable is implemented (P5.A1) — must not reject.
-        let doh = server_field("resolver: { type: doh }");
-        assert!(doh.starts_with("resolver.type:"), "{doh}");
+        // sniff.enable / resolver doh|https are implemented (P5.A1/A2) — must not reject as unimplemented.
         let s5 = server_field("outbounds:\n  - name: p\n    type: socks5");
         assert!(s5.starts_with("outbounds:"), "{s5}");
         let http = server_field("outbounds:\n  - name: p\n    type: http");
@@ -813,6 +910,54 @@ disableUDP: true
         assert!(realm.starts_with("realm:"), "{realm}");
         let mimic = server_field("mimic: {}");
         assert!(mimic.starts_with("mimic:"), "{mimic}");
+    }
+
+    #[test]
+    fn resolver_udp_yaml_deserializes() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+resolver:
+  type: udp
+  udp: { addr: "8.8.8.8:53", timeout: 5s }
+"#,
+        )
+        .unwrap();
+        let r = y.resolver.as_ref().unwrap();
+        assert_eq!(r.ty.as_deref(), Some("udp"));
+        assert_eq!(r.udp.as_ref().unwrap().addr.as_deref(), Some("8.8.8.8:53"));
+        assert_eq!(r.udp.as_ref().unwrap().timeout.as_deref(), Some("5s"));
+    }
+
+    #[test]
+    fn resolver_https_doh_fill_not_unimplemented() {
+        let dir = std::env::temp_dir().join(format!("hy-res-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("t.crt");
+        let key = dir.join("t.key");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (ty, extra) in [
+            ("https", "https: { addr: \"1.1.1.1/dns-query\", sni: cloudflare-dns.com, insecure: true }"),
+            ("doh", "https: { addr: \"https://1.1.1.1/dns-query\", insecure: true }"),
+            ("udp", "udp: { addr: \"8.8.8.8:53\" }"),
+        ] {
+            let y = parse_server_yaml(&format!(
+                "listen: 127.0.0.1:0\ntls: {{ cert: {}, key: {} }}\nauth: {{ type: password, password: test }}\nresolver:\n  type: {ty}\n  {extra}\n",
+                cert.display(),
+                key.display()
+            ))
+            .unwrap();
+            let app = rt.block_on(fill_server(&y)).unwrap_or_else(|e| panic!("type {ty}: {e:?}"));
+            assert!(app.core.outbound.is_some());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

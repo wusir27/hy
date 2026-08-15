@@ -1,4 +1,4 @@
-//! Adapter + direct + reject + system DNS + speedtest.
+//! Adapter + direct + reject + system DNS + speedtest + custom resolvers.
 
 use async_trait::async_trait;
 use hy_core::error::Error;
@@ -14,10 +14,14 @@ use tokio::net::{TcpStream, UdpSocket};
 mod speedtest;
 pub use speedtest::{is_speedtest_host, SpeedtestHandler, SPEEDTEST_DEST};
 
+pub mod resolver;
+pub use resolver::{DohResolver, StandardResolver};
+
 #[derive(Debug, Clone, Default)]
 pub struct ResolveInfo {
     pub v4: Option<Ipv4Addr>,
     pub v6: Option<Ipv6Addr>,
+    pub err: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,10 +40,12 @@ pub fn split_host_port(s: &str) -> Result<AddrEx, Error> {
                 IpAddr::V4(v) => ResolveInfo {
                     v4: Some(v),
                     v6: None,
+                    err: None,
                 },
                 IpAddr::V6(v) => ResolveInfo {
                     v4: None,
                     v6: Some(v),
+                    err: None,
                 },
             }),
         });
@@ -188,10 +194,12 @@ impl AclEngine {
             IpAddr::V4(v) => ResolveInfo {
                 v4: Some(v),
                 v6: None,
+                err: None,
             },
             IpAddr::V6(v) => ResolveInfo {
                 v4: None,
                 v6: Some(v),
+                err: None,
             },
         });
     }
@@ -479,6 +487,7 @@ mod tests {
             resolve: Some(ResolveInfo {
                 v4: Some(Ipv4Addr::new(1, 2, 3, 4)),
                 v6: Some(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                err: None,
             }),
         }
     }

@@ -43,12 +43,59 @@ pub struct ClientYaml {
     pub transport: Option<serde_yaml::Value>,
     pub realm: Option<serde_yaml::Value>,
     pub mimic: Option<serde_yaml::Value>,
-    pub tun: Option<serde_yaml::Value>,
+    pub tun: Option<TunYaml>,
     #[serde(rename = "tcpTProxy")]
     pub tcp_tproxy: Option<TcpTProxyYaml>,
     #[serde(rename = "udpTProxy")]
     pub udp_tproxy: Option<UdpTProxyYaml>,
     pub tcp_redirect: Option<TcpRedirectYaml>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TunYaml {
+    pub name: Option<String>,
+    pub mtu: Option<u32>,
+    pub timeout: Option<String>,
+    pub address: Option<TunAddressYaml>,
+    pub route: Option<TunRouteYaml>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TunAddressYaml {
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TunRouteYaml {
+    pub strict: Option<bool>,
+    pub ipv4: Option<Vec<String>>,
+    pub ipv6: Option<Vec<String>>,
+    pub ipv4_exclude: Option<Vec<String>>,
+    pub ipv6_exclude: Option<Vec<String>>,
+}
+
+/// Filled TUN inbound config (device open happens at `run`).
+#[derive(Debug, Clone)]
+pub struct TunConfig {
+    pub name: String,
+    pub mtu: u32,
+    pub timeout: Duration,
+    pub ipv4: String,
+    pub ipv6: Option<String>,
+    pub route: Option<TunRouteConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TunRouteConfig {
+    pub strict: bool,
+    pub ipv4: Vec<String>,
+    pub ipv6: Vec<String>,
+    pub ipv4_exclude: Vec<String>,
+    pub ipv6_exclude: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -398,19 +445,18 @@ pub struct ClientApp {
     pub tcp_tproxy: Option<TcpTProxyYaml>,
     pub udp_tproxy: Option<UdpTProxyConfig>,
     pub tcp_redirect: Option<TcpRedirectYaml>,
+    pub tun: Option<TunConfig>,
     pub lazy: bool,
 }
 
 pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
-    if y.tun.is_some() {
-        return Err(Error::config("tun", "not implemented"));
-    }
     if y.realm.is_some() {
         return Err(Error::config("realm", "not implemented"));
     }
     if y.mimic.is_some() {
         return Err(Error::config("mimic", "not implemented"));
     }
+    let tun = fill_tun(y.tun.as_ref())?;
     let tcp_tproxy = fill_tcp_tproxy(y.tcp_tproxy.as_ref())?;
     let udp_tproxy = fill_udp_tproxy(y.udp_tproxy.as_ref())?;
     if let Some(r) = &y.tcp_redirect {
@@ -547,8 +593,134 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         tcp_tproxy,
         udp_tproxy,
         tcp_redirect: y.tcp_redirect.clone(),
+        tun,
         lazy: y.lazy.unwrap_or(false),
     })
+}
+
+fn fill_tun(y: Option<&TunYaml>) -> Result<Option<TunConfig>, Error> {
+    let Some(t) = y else {
+        return Ok(None);
+    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = t;
+        return Err(Error::config("tun", "not supported"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let name = t.name.as_deref().unwrap_or("").trim();
+        if name.is_empty() {
+            return Err(Error::config("tun.name", "name is empty"));
+        }
+        let mtu = match t.mtu {
+            Some(0) | None => 1500,
+            Some(m) => m,
+        };
+        let timeout = match &t.timeout {
+            Some(s) => {
+                let d = parse_dur(s, "tun.timeout")?;
+                if d.is_zero() {
+                    Duration::from_secs(300)
+                } else {
+                    d
+                }
+            }
+            None => Duration::from_secs(300),
+        };
+        let ipv4 = t
+            .address
+            .as_ref()
+            .and_then(|a| a.ipv4.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "100.100.100.101/30".to_string());
+        parse_ip_prefix(&ipv4, false).map_err(|e| Error::config("tun.address.ipv4", e))?;
+
+        let ipv6_raw = t
+            .address
+            .as_ref()
+            .and_then(|a| a.ipv6.clone())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "2001::ffff:ffff:ffff:fff1/126".to_string());
+        parse_ip_prefix(&ipv6_raw, true).map_err(|e| Error::config("tun.address.ipv6", e))?;
+
+        let route = match &t.route {
+            None => None,
+            Some(r) => {
+                let ipv4 = parse_route_list(r.ipv4.as_deref().unwrap_or(&[]), false, "tun.route.ipv4")?;
+                let ipv6 = parse_route_list(r.ipv6.as_deref().unwrap_or(&[]), true, "tun.route.ipv6")?;
+                let ipv4_exclude = parse_route_list(
+                    r.ipv4_exclude.as_deref().unwrap_or(&[]),
+                    false,
+                    "tun.route.ipv4Exclude",
+                )?;
+                let ipv6_exclude = parse_route_list(
+                    r.ipv6_exclude.as_deref().unwrap_or(&[]),
+                    true,
+                    "tun.route.ipv6Exclude",
+                )?;
+                Some(TunRouteConfig {
+                    strict: r.strict.unwrap_or(false),
+                    ipv4,
+                    ipv6,
+                    ipv4_exclude,
+                    ipv6_exclude,
+                })
+            }
+        };
+
+        Ok(Some(TunConfig {
+            name: name.to_string(),
+            mtu,
+            timeout,
+            ipv4,
+            ipv6: Some(ipv6_raw),
+            route,
+        }))
+    }
+}
+
+/// Parse `"addr/len"` or bare addr (full bit length). `v6` selects address family.
+fn parse_ip_prefix(s: &str, v6: bool) -> Result<(std::net::IpAddr, u8), String> {
+    let (addr_s, len) = if let Some((a, p)) = s.split_once('/') {
+        let len: u8 = p
+            .parse()
+            .map_err(|_| format!("bad prefix length in {s}"))?;
+        (a, len)
+    } else {
+        (s, if v6 { 128 } else { 32 })
+    };
+    let addr: std::net::IpAddr = addr_s
+        .parse()
+        .map_err(|_| format!("bad address in {s}"))?;
+    match (addr, v6) {
+        (std::net::IpAddr::V4(_), false) => {
+            if len > 32 {
+                return Err(format!("prefix length {len} > 32"));
+            }
+        }
+        (std::net::IpAddr::V6(_), true) => {
+            if len > 128 {
+                return Err(format!("prefix length {len} > 128"));
+            }
+        }
+        (std::net::IpAddr::V4(_), true) => return Err(format!("expected IPv6, got {s}")),
+        (std::net::IpAddr::V6(_), false) => return Err(format!("expected IPv4, got {s}")),
+    }
+    Ok((addr, len))
+}
+
+fn parse_route_list(
+    ss: &[String],
+    v6: bool,
+    field: &'static str,
+) -> Result<Vec<String>, Error> {
+    let mut out = Vec::with_capacity(ss.len());
+    for s in ss {
+        parse_ip_prefix(s, v6).map_err(|e| Error::config(field, e))?;
+        out.push(s.clone());
+    }
+    Ok(out)
 }
 
 fn fill_tcp_tproxy(y: Option<&TcpTProxyYaml>) -> Result<Option<TcpTProxyYaml>, Error> {
@@ -1287,8 +1459,52 @@ disableUDP: true
     }
 
     #[test]
-    fn fill_rejects_tun() {
-        assert_eq!(client_field("tun: { name: hy0 }"), "tun");
+    fn fill_tun_empty_name() {
+        assert_eq!(client_field("tun: { name: \"\" }"), "tun.name");
+        assert_eq!(client_field("tun: {}"), "tun.name");
+    }
+
+    #[test]
+    fn fill_tun_defaults() {
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntun: { name: hy0 }\n").unwrap();
+        let app = fill_client(&y).expect("tun: { name: hy0 } should fill");
+        let t = app.tun.expect("tun present");
+        assert_eq!(t.name, "hy0");
+        assert_eq!(t.mtu, 1500);
+        assert_eq!(t.timeout, Duration::from_secs(300));
+        assert_eq!(t.ipv4, "100.100.100.101/30");
+        assert_eq!(
+            t.ipv6.as_deref(),
+            Some("2001::ffff:ffff:ffff:fff1/126")
+        );
+    }
+
+    #[test]
+    fn fill_tun_custom_timeout_and_ipv4() {
+        let y = parse_client_yaml(
+            r#"
+server: 127.0.0.1:1
+auth: x
+tun:
+  name: hy0
+  timeout: 60s
+  address:
+    ipv4: 10.0.0.2/24
+"#,
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("custom tun should fill");
+        let t = app.tun.expect("tun");
+        assert_eq!(t.timeout, Duration::from_secs(60));
+        assert_eq!(t.ipv4, "10.0.0.2/24");
+    }
+
+    #[test]
+    fn fill_tun_bad_ipv4() {
+        assert_eq!(
+            client_field("tun:\n  name: hy0\n  address:\n    ipv4: not-an-ip\n"),
+            "tun.address.ipv4"
+        );
     }
 
     #[test]
@@ -1318,7 +1534,9 @@ disableUDP: true
         fill_client(&y).expect("hopInterval alone should fill");
         assert_eq!(client_field("realm: {}"), "realm");
         assert_eq!(client_field("mimic: {}"), "mimic");
-        assert_eq!(client_field("tun: { name: hy0 }"), "tun");
+        // tun is implemented (P5.D3); must fill, not reject as unimplemented.
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntun: { name: hy0 }\n").unwrap();
+        fill_client(&y).expect("tun: { name: hy0 } should fill");
         // tcpTProxy / udpTProxy empty listen is a config error, not "not implemented".
         for extra in ["tcpTProxy: {}", "udpTProxy: {}"] {
             let y = parse_client_yaml(&format!("server: 127.0.0.1:1\nauth: x\n{extra}\n")).unwrap();

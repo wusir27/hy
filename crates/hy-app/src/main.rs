@@ -123,6 +123,11 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
             inbound::tproxy_udp::run(&listen, timeout, c).await
         }));
     }
+    #[cfg(target_os = "linux")]
+    if let Some(t) = app.tun.take() {
+        let c = Arc::clone(&cli);
+        tasks.push(tokio::spawn(async move { inbound::tun::run(t, c).await }));
+    }
     if tasks.is_empty() {
         tracing::warn!("no inbound configured");
         tokio::signal::ctrl_c().await.map_err(Error::Io)?;

@@ -517,6 +517,7 @@ dependencies = [
  "hy-core",
  "rand 0.8.7",
  "rcgen",
+ "ring",
  "serde",
  "serde_json",
  "tokio",

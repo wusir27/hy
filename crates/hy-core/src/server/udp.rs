@@ -197,7 +197,9 @@ impl ServerUdpSm {
     ) -> Result<Box<dyn HyUdpSocket>, Error> {
         let mut addr = first.addr.clone();
         if let Some(ref hook) = self.hook {
-            hook.udp(&first.data, &mut addr).await?;
+            if hook.check(true, &addr) {
+                hook.udp(&first.data, &mut addr).await?;
+            }
         }
         let actual = addr.clone();
         if let Some(ref ev) = self.event_logger {

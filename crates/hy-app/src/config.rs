@@ -13,6 +13,7 @@ use hy_extras::outbounds::{
 };
 use hy_extras::acl::CompiledRuleSet;
 use hy_extras::masq::StringMasq;
+use hy_extras::sniff::{parse_port_union, Sniffer};
 use hy_extras::trafficlogger::TrafficStats;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -257,8 +258,13 @@ pub struct TrafficStatsYaml {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SniffYaml {
     pub enable: Option<bool>,
+    pub timeout: Option<String>,
+    pub rewrite_domain: Option<bool>,
+    pub tcp_ports: Option<String>,
+    pub udp_ports: Option<String>,
 }
 
 pub fn parse_client_yaml(s: &str) -> Result<ClientYaml, Error> {
@@ -448,9 +454,6 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
     if y.mimic.is_some() {
         return Err(Error::config("mimic", "not implemented"));
     }
-    if y.sniff.as_ref().and_then(|s| s.enable) == Some(true) {
-        return Err(Error::config("sniff", "not implemented"));
-    }
     if let Some(r) = &y.resolver {
         let ty = r.ty.as_deref().unwrap_or("system");
         if ty != "system" {
@@ -545,6 +548,32 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
 
     cfg.authenticator = Some(build_auth(y.auth.as_ref())?);
     cfg.outbound = Some(build_outbound(y)?);
+    if let Some(s) = &y.sniff {
+        if s.enable == Some(true) {
+            let mut sniffer = Sniffer::default();
+            if let Some(t) = s.timeout.as_deref() {
+                sniffer.timeout = parse_dur(t, "sniff.timeout")?;
+            }
+            sniffer.rewrite_domain = s.rewrite_domain.unwrap_or(false);
+            if let Some(p) = s.tcp_ports.as_deref() {
+                if !p.trim().is_empty() {
+                    sniffer.tcp_ports = Some(
+                        parse_port_union(p)
+                            .ok_or_else(|| Error::config("sniff.tcpPorts", "invalid port union"))?,
+                    );
+                }
+            }
+            if let Some(p) = s.udp_ports.as_deref() {
+                if !p.trim().is_empty() {
+                    sniffer.udp_ports = Some(
+                        parse_port_union(p)
+                            .ok_or_else(|| Error::config("sniff.udpPorts", "invalid port union"))?,
+                    );
+                }
+            }
+            cfg.request_hook = Some(Arc::new(sniffer));
+        }
+    }
     if let Some(m) = &y.masquerade {
         let ty = m.ty.as_deref().unwrap_or("");
         if ty == "string" {
@@ -769,8 +798,7 @@ disableUDP: true
         assert!(acme.starts_with("acme:"), "{acme}");
         let ech = server_field("ech: {}");
         assert!(ech.starts_with("ech:"), "{ech}");
-        let sniff = server_field("sniff: { enable: true }");
-        assert!(sniff.starts_with("sniff:"), "{sniff}");
+        // sniff.enable is implemented (P5.A1) — must not reject.
         let doh = server_field("resolver: { type: doh }");
         assert!(doh.starts_with("resolver.type:"), "{doh}");
         let s5 = server_field("outbounds:\n  - name: p\n    type: socks5");
@@ -964,5 +992,52 @@ auth: { type: password, password: test }
             Error::Dial(s) => assert!(!s.contains("tcp only"), "{s}"),
             other => panic!("expected Dial, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sniff_yaml_deserializes() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+sniff:
+  enable: true
+  timeout: 1s
+  rewriteDomain: true
+  tcpPorts: 80,443,1000-2000
+  udpPorts: 443
+"#,
+        )
+        .unwrap();
+        let s = y.sniff.unwrap();
+        assert_eq!(s.enable, Some(true));
+        assert_eq!(s.timeout.as_deref(), Some("1s"));
+        assert_eq!(s.rewrite_domain, Some(true));
+        assert_eq!(s.tcp_ports.as_deref(), Some("80,443,1000-2000"));
+        assert_eq!(s.udp_ports.as_deref(), Some("443"));
+    }
+
+    #[test]
+    fn sniff_enable_fill_sets_request_hook() {
+        let dir = std::env::temp_dir().join(format!("hy-sniff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("t.crt");
+        let key = dir.join("t.key");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n").unwrap();
+        let y = parse_server_yaml(&format!(
+            "listen: 127.0.0.1:0\ntls: {{ cert: {}, key: {} }}\nauth: {{ type: password, password: test }}\nsniff:\n  enable: true\n  timeout: 2s\n  rewriteDomain: true\n  tcpPorts: 80,443\n",
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let app = rt.block_on(fill_server(&y)).expect("fill_server with sniff");
+        assert!(app.core.request_hook.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

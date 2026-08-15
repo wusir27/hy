@@ -170,13 +170,14 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
                 match bi {
                     Ok((send, recv)) => {
                         let outbound = cfg.outbound.clone();
+                        let hook = cfg.request_hook.clone();
                         let auth_id = auth_id.clone();
                         let remote = remote;
                         let ev = cfg.event_logger.clone();
                         let tl = cfg.traffic_logger.clone();
                         let c = conn.clone();
                         tokio::spawn(async move {
-                            let _ = handle_tcp(send, recv, outbound, remote, &auth_id, ev, tl, c).await;
+                            let _ = handle_tcp(send, recv, outbound, hook, remote, &auth_id, ev, tl, c).await;
                         });
                     }
                     Err(_) => break,
@@ -199,8 +200,9 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
 
 async fn handle_tcp(
     mut send: SendStream,
-    mut recv: RecvStream,
+    recv: RecvStream,
     outbound: Arc<dyn Outbound>,
+    request_hook: Option<Arc<dyn super::RequestHook>>,
     remote: SocketAddr,
     auth_id: &str,
     event_logger: Option<Arc<dyn EventLogger>>,
@@ -208,7 +210,8 @@ async fn handle_tcp(
     conn: Connection,
 ) -> Result<(), Error> {
     let mut buf = Vec::with_capacity(256);
-    let (addr, after_req) = loop {
+    let mut recv = recv;
+    let (mut addr, after_req) = loop {
         let mut tmp = [0u8; 512];
         let n = recv
             .read(&mut tmp)
@@ -233,11 +236,29 @@ async fn handle_tcp(
             Err(e) => return Err(e),
         }
     };
-    let _putback = if after_req < buf.len() {
+    let leftover = if after_req < buf.len() {
         buf[after_req..].to_vec()
     } else {
         Vec::new()
     };
+
+    let mut hooked = false;
+    let mut hook_putback = Vec::new();
+    let mut client = RecvAsHyTcp {
+        leftover,
+        recv,
+    };
+
+    if let Some(ref hook) = request_hook {
+        if hook.check(false, &addr) {
+            let resp = write_tcp_response_bytes(true, "RequestHook enabled");
+            send.write_all(&resp)
+                .await
+                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            hooked = true;
+            hook_putback = hook.tcp(&mut client, &mut addr).await?;
+        }
+    }
 
     if let Some(ref ev) = event_logger {
         ev.tcp_request(remote, auth_id, &addr);
@@ -245,9 +266,11 @@ async fn handle_tcp(
 
     match outbound.tcp(&addr).await {
         Err(e) => {
-            let msg = e.to_string();
-            let resp = write_tcp_response_bytes(false, &msg);
-            let _ = send.write_all(&resp).await;
+            if !hooked {
+                let msg = e.to_string();
+                let resp = write_tcp_response_bytes(false, &msg);
+                let _ = send.write_all(&resp).await;
+            }
             let _ = send.finish();
             if let Some(ref ev) = event_logger {
                 ev.tcp_error(remote, auth_id, &addr, Some(&e));
@@ -255,16 +278,31 @@ async fn handle_tcp(
             return Ok(());
         }
         Ok(mut remote_tcp) => {
-            let resp = write_tcp_response_bytes(true, "Connected");
-            send.write_all(&resp)
-                .await
-                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-
-            if !_putback.is_empty() {
-                let _ = remote_tcp.write(&_putback).await;
+            if !hooked {
+                let resp = write_tcp_response_bytes(true, "Connected");
+                send.write_all(&resp)
+                    .await
+                    .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
             }
 
-            let err = copy_two_way(&mut send, &mut recv, remote_tcp.as_mut(), auth_id, traffic_logger.as_deref()).await;
+            // Hook putback (bytes sniffed from client) plus any unused leftover.
+            let mut to_remote = hook_putback;
+            if !client.leftover.is_empty() {
+                to_remote.extend_from_slice(&client.leftover);
+                client.leftover.clear();
+            }
+            if !to_remote.is_empty() {
+                let _ = remote_tcp.write(&to_remote).await;
+            }
+
+            let err = copy_two_way(
+                &mut send,
+                &mut client,
+                remote_tcp.as_mut(),
+                auth_id,
+                traffic_logger.as_deref(),
+            )
+            .await;
             if matches!(&err, Some(Error::Closed(Some(m))) if m == "kicked") {
                 conn.close(quinn::VarInt::from_u32(CLOSE_EXCESSIVE_LOAD as u32), b"kicked");
             }
@@ -278,10 +316,42 @@ async fn handle_tcp(
     Ok(())
 }
 
+/// Wraps a QUIC recv stream plus bytes already read after the TCP request.
+struct RecvAsHyTcp {
+    leftover: Vec<u8>,
+    recv: RecvStream,
+}
+
+#[async_trait]
+impl HyTcpStream for RecvAsHyTcp {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        if !self.leftover.is_empty() {
+            let n = std::cmp::min(buf.len(), self.leftover.len());
+            buf[..n].copy_from_slice(&self.leftover[..n]);
+            self.leftover.drain(..n);
+            return Ok(n);
+        }
+        match self.recv.read(buf).await {
+            Ok(Some(n)) => Ok(n),
+            Ok(None) => Ok(0),
+            Err(e) => Err(Error::Closed(Some(e.to_string()))),
+        }
+    }
+
+    async fn write(&mut self, _buf: &[u8]) -> Result<usize, Error> {
+        Err(Error::Protocol("RecvAsHyTcp is read-only".into()))
+    }
+
+    async fn close(&mut self) -> Result<(), Error> {
+        let _ = self.recv.stop(quinn::VarInt::from_u32(0));
+        Ok(())
+    }
+}
+
 /// Bidirectional copy. Either side finishing ends both.
 async fn copy_two_way(
     send: &mut SendStream,
-    recv: &mut RecvStream,
+    client: &mut dyn HyTcpStream,
     remote: &mut dyn HyTcpStream,
     auth_id: &str,
     traffic: Option<&dyn TrafficLogger>,
@@ -291,10 +361,10 @@ async fn copy_two_way(
 
     loop {
         tokio::select! {
-            n = recv.read(&mut c2r_buf) => {
+            n = client.read(&mut c2r_buf) => {
                 match n {
-                    Ok(Some(0)) | Ok(None) => return None,
-                    Ok(Some(n)) => {
+                    Ok(0) => return None,
+                    Ok(n) => {
                         if let Some(tl) = traffic {
                             if !tl.log_traffic(auth_id, n as u64, 0) {
                                 return Some(Error::Closed(Some("kicked".into())));
@@ -304,7 +374,7 @@ async fn copy_two_way(
                             return Some(e);
                         }
                     }
-                    Err(e) => return Some(Error::Closed(Some(e.to_string()))),
+                    Err(e) => return Some(e),
                 }
             }
             n = remote.read(&mut r2c_buf) => {

@@ -10,7 +10,7 @@ pub mod acl;
 
 pub mod outbounds;
 
-pub mod sniff {}
+pub mod sniff;
 pub mod masq;
 pub mod realm {}
 pub mod udphop {}

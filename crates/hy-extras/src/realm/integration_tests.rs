@@ -1,12 +1,14 @@
 //! Integration-style unit tests (no public STUN / realm server required).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hy_core::io::{DatagramIo, StdUdp};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
+use super::stun::{encode_binding_success, parse_binding_request_txid};
 
 #[tokio::test]
 async fn punch_packet_conn_hello_ack_and_passthrough() {
@@ -66,6 +68,45 @@ async fn punch_packet_conn_hello_ack_and_passthrough() {
     let got = a_recv.await.unwrap().unwrap();
     assert_eq!(got, b"pass");
     let _ = buf;
+}
+
+#[tokio::test]
+async fn discover_on_punch_gets_mapped_addr_when_binding_success_is_siphoned() {
+    let client = Arc::new(StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+    let peer = StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let stun_addr = peer.local_addr().unwrap();
+    let mapped: std::net::SocketAddr = "1.2.3.4:443".parse().unwrap();
+
+    let punch = PunchPacketConn::new(client, 8).unwrap();
+
+    let peer_task = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+        let txid = parse_binding_request_txid(&buf[..n]).expect("Binding Request txid");
+        let success = encode_binding_success(&txid, mapped);
+        peer.send_to(&success, from).await.unwrap();
+    });
+
+    let addrs = tokio::time::timeout(
+        Duration::from_secs(3),
+        discover_on_punch(
+            &punch,
+            STUNConfig {
+                servers: vec![stun_addr.to_string()],
+                timeout: Duration::from_secs(2),
+                family: AddrFamily::V4,
+            },
+        ),
+    )
+    .await
+    .expect("discover_on_punch timed out")
+    .unwrap_or_else(|e| panic!("discover_on_punch failed (must not be 'no STUN responses received'): {e}"));
+
+    assert!(
+        addrs.contains(&mapped),
+        "expected mapped addr {mapped}, got {addrs:?}"
+    );
+    peer_task.await.unwrap();
 }
 
 #[tokio::test]

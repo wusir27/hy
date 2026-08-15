@@ -11,9 +11,9 @@ use hy_core::io::{ConnFactory, DatagramIo, StdUdp};
 use crate::realm::addr::{is_realm_url, parse_addr, Addr};
 use crate::realm::client::{ConnectRequest, RealmClient};
 use crate::realm::punch::new_punch_metadata;
-use crate::realm::punch_conn::PunchPacketConn;
+use crate::realm::punch_conn::{discover_on_punch, PunchPacketConn};
 use crate::realm::punch_engine::{punch, PunchConfig, DEFAULT_PUNCH_TIMEOUT};
-use crate::realm::stun::{discover, AddrFamily, STUNConfig, DEFAULT_STUN_TIMEOUT};
+use crate::realm::stun::{AddrFamily, STUNConfig, DEFAULT_STUN_TIMEOUT};
 
 /// Defaults from the P5.E1 prompt (nextcloud / sip.us / cloudflare).
 pub const DEFAULT_STUN_SERVERS: &[&str] = &[
@@ -99,7 +99,7 @@ impl ConnFactory for RealmFactory {
             inj.clone()
         } else {
             let stun_servers = stun_servers_for(&self.addr, &self.opts);
-            match discover(
+            match discover_on_punch(
                 punch_conn.as_ref(),
                 STUNConfig {
                     servers: stun_servers,
@@ -193,7 +193,7 @@ pub async fn open_server_realm(
         inj.clone()
     } else {
         let stun_servers = stun_servers_for(addr, opts);
-        match discover(
+        match discover_on_punch(
             punch_conn.as_ref(),
             STUNConfig {
                 servers: stun_servers,

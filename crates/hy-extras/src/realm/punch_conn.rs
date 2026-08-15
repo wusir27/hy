@@ -9,7 +9,10 @@ use hy_core::io::DatagramIo;
 use tokio::sync::mpsc;
 
 use crate::realm::punch::{decode_punch_packet, decode_punch_metadata, PunchMetadata, PunchPacket};
-use crate::realm::stun::{is_stun_message, parse_stun_binding_response};
+use crate::realm::stun::{
+    is_stun_message, mapped_addrs_from_results, parse_stun_binding_response,
+    send_discover_requests, ErrInvalidSTUNConfig, STUNConfig,
+};
 
 const DEFAULT_EVENT_BUFFER: usize = 16;
 
@@ -95,6 +98,47 @@ impl PunchPacketConn {
     pub fn inner(&self) -> Arc<dyn DatagramIo> {
         self.inner.clone()
     }
+}
+
+/// STUN discovery on a `PunchPacketConn`.
+///
+/// Binding Success is siphoned onto the STUN event channel inside
+/// `recv_from` and is never returned to the caller. This waits on
+/// `take_stun_events` (matching txid) while pumping `recv_from` so
+/// siphoning actually runs.
+pub async fn discover_on_punch(
+    conn: &PunchPacketConn,
+    config: STUNConfig,
+) -> Result<Vec<SocketAddr>, ErrInvalidSTUNConfig> {
+    let mut stun_rx = conn.take_stun_events().ok_or_else(|| {
+        ErrInvalidSTUNConfig("STUN event receiver already taken".into())
+    })?;
+    let (mut transactions, timeout) = send_discover_requests(conn, config).await?;
+    let mut results = HashMap::new();
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut buf = vec![0u8; 1500];
+    while !transactions.is_empty() {
+        tokio::select! {
+            _ = &mut deadline => break,
+            ev = stun_rx.recv() => {
+                let Some(ev) = ev else {
+                    break;
+                };
+                if transactions.remove(&ev.txid).is_some() {
+                    results.insert(ev.addr, ());
+                }
+            }
+            recv = conn.recv_from(&mut buf) => {
+                match recv {
+                    // Non-siphoned datagrams (not Binding Success); ignore during STUN.
+                    Ok(_) => {}
+                    Err(e) => return Err(ErrInvalidSTUNConfig(e.to_string())),
+                }
+            }
+        }
+    }
+    mapped_addrs_from_results(results)
 }
 
 #[async_trait]

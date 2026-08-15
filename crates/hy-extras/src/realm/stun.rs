@@ -182,11 +182,61 @@ fn build_binding_request(txid: &[u8; 12]) -> Vec<u8> {
     msg
 }
 
-/// Discover reflexive addresses via STUN using `conn`.
-pub async fn discover(
+/// Encode a Binding Success with XOR-MAPPED-ADDRESS (RFC 5389).
+#[cfg(test)]
+pub(crate) fn encode_binding_success(txid: &[u8; 12], mapped: SocketAddr) -> Vec<u8> {
+    let (family, mut xor_addr, port): (u8, Vec<u8>, u16) = match mapped {
+        SocketAddr::V4(sa) => (0x01, sa.ip().octets().to_vec(), sa.port()),
+        SocketAddr::V6(sa) => (0x02, sa.ip().octets().to_vec(), sa.port()),
+    };
+    let xport = port ^ ((MAGIC_COOKIE >> 16) as u16);
+    let cookie = MAGIC_COOKIE.to_be_bytes();
+    for i in 0..xor_addr.len().min(4) {
+        xor_addr[i] ^= cookie[i];
+    }
+    if xor_addr.len() == 16 {
+        for i in 0..12 {
+            xor_addr[4 + i] ^= txid[i];
+        }
+    }
+    let val_len = 4 + xor_addr.len();
+    let mut attr = Vec::with_capacity(4 + val_len);
+    attr.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+    attr.extend_from_slice(&(val_len as u16).to_be_bytes());
+    attr.push(0);
+    attr.push(family);
+    attr.extend_from_slice(&xport.to_be_bytes());
+    attr.extend_from_slice(&xor_addr);
+    let pad = (4 - (attr.len() % 4)) % 4;
+    attr.extend(std::iter::repeat(0u8).take(pad));
+
+    let mut msg = vec![0u8; 20];
+    msg[0..2].copy_from_slice(&BINDING_SUCCESS.to_be_bytes());
+    msg[2..4].copy_from_slice(&(attr.len() as u16).to_be_bytes());
+    msg[4..8].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    msg[8..20].copy_from_slice(txid);
+    msg.extend_from_slice(&attr);
+    msg
+}
+
+#[cfg(test)]
+pub(crate) fn parse_binding_request_txid(packet: &[u8]) -> Option<[u8; 12]> {
+    if !is_stun_message(packet) {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes([packet[0], packet[1]]);
+    if msg_type != BINDING_REQUEST {
+        return None;
+    }
+    let mut txid = [0u8; 12];
+    txid.copy_from_slice(&packet[8..20]);
+    Some(txid)
+}
+
+pub(crate) async fn send_discover_requests(
     conn: &dyn DatagramIo,
     config: STUNConfig,
-) -> Result<Vec<SocketAddr>, ErrInvalidSTUNConfig> {
+) -> Result<(HashMap<[u8; 12], SocketAddr>, Duration), ErrInvalidSTUNConfig> {
     if config.servers.is_empty() {
         return Err(ErrInvalidSTUNConfig(
             "at least one STUN server is required".into(),
@@ -219,7 +269,32 @@ pub async fn discover(
             "failed to send STUN binding requests".into(),
         ));
     }
+    Ok((transactions, timeout))
+}
 
+pub(crate) fn mapped_addrs_from_results(
+    results: HashMap<SocketAddr, ()>,
+) -> Result<Vec<SocketAddr>, ErrInvalidSTUNConfig> {
+    if results.is_empty() {
+        return Err(ErrInvalidSTUNConfig(
+            "no STUN responses received".into(),
+        ));
+    }
+    let mut addrs: Vec<SocketAddr> = results.into_keys().collect();
+    addrs.sort_by_key(|a| a.to_string());
+    Ok(addrs)
+}
+
+/// Discover reflexive addresses via STUN using `conn.recv_from`.
+///
+/// Do **not** call this on a [`crate::realm::punch_conn::PunchPacketConn`]: that
+/// type siphons Binding Success onto its STUN event channel, so `recv_from`
+/// never returns those packets. Use [`crate::realm::punch_conn::discover_on_punch`].
+pub async fn discover(
+    conn: &dyn DatagramIo,
+    config: STUNConfig,
+) -> Result<Vec<SocketAddr>, ErrInvalidSTUNConfig> {
+    let (mut transactions, timeout) = send_discover_requests(conn, config).await?;
     let mut results: HashMap<SocketAddr, ()> = HashMap::new();
     let deadline = tokio::time::Instant::now() + timeout;
     let mut buf = vec![0u8; 1500];
@@ -240,14 +315,7 @@ pub async fn discover(
             Err(_) => break,
         }
     }
-    if results.is_empty() {
-        return Err(ErrInvalidSTUNConfig(
-            "no STUN responses received".into(),
-        ));
-    }
-    let mut addrs: Vec<SocketAddr> = results.into_keys().collect();
-    addrs.sort_by_key(|a| a.to_string());
-    Ok(addrs)
+    mapped_addrs_from_results(results)
 }
 
 fn effective_family(family: AddrFamily, local: Option<SocketAddr>) -> AddrFamily {
@@ -315,4 +383,27 @@ fn split_stun_server(server: &str) -> Result<(String, u16), ErrInvalidSTUNConfig
     Err(ErrInvalidSTUNConfig(
         "invalid STUN server address".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xor_mapped_binding_success_roundtrip() {
+        let txid = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc];
+        let mapped: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let pkt = encode_binding_success(&txid, mapped);
+        let (got_txid, got_addr) = parse_stun_binding_response(&pkt).unwrap();
+        assert_eq!(got_txid, txid);
+        assert_eq!(got_addr, mapped);
+    }
+
+    #[test]
+    fn parse_binding_request_txid_matches_builder() {
+        let txid = [9u8; 12];
+        let req = build_binding_request(&txid);
+        assert_eq!(parse_binding_request_txid(&req), Some(txid));
+        assert!(parse_binding_request_txid(&encode_binding_success(&txid, "1.2.3.4:1".parse().unwrap())).is_none());
+    }
 }

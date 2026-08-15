@@ -16,6 +16,7 @@ use hy_extras::acl::CompiledRuleSet;
 use hy_extras::masq::StringMasq;
 use hy_extras::sniff::{parse_port_union, Sniffer};
 use hy_extras::trafficlogger::TrafficStats;
+use hy_extras::udphop::{HopInterval, UdpHopFactory};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -372,25 +373,14 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
             return Err(Error::config("obfs.gecko", "not implemented"));
         }
     }
-    if let Some(tr) = &y.transport {
-        if let Some(m) = tr.as_mapping() {
-            if let Some(udp) = m.get(serde_yaml::Value::from("udp")) {
-                if let Some(um) = udp.as_mapping() {
-                    if um.contains_key(serde_yaml::Value::from("hopInterval"))
-                        || um.contains_key(serde_yaml::Value::from("minHopInterval"))
-                    {
-                        return Err(Error::config("transport.udp.hopInterval", "not implemented"));
-                    }
-                }
-            }
-        }
-    }
+
+    let hop_interval = hop_interval_from_transport(y.transport.as_ref())?;
 
     let server = y.server.as_deref().ok_or_else(|| Error::config("Server", "must be set"))?;
-    let server_addr = parse_server(server)?;
+    let parsed = parse_server(server)?;
 
     let mut cfg = core_client::Config::default();
-    cfg.server_addr = Some(server_addr);
+    cfg.server_addr = Some(parsed.addr);
     cfg.auth = match &y.auth {
         Some(v) => auth_string(v)?,
         None => String::new(),
@@ -433,6 +423,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
     }
     cfg.fast_open = y.fast_open.unwrap_or(false);
 
+    let mut salamander_psk: Option<Vec<u8>> = None;
     if let Some(o) = &y.obfs {
         let ty = o.ty.as_deref().unwrap_or("plain");
         if ty == "salamander" {
@@ -441,11 +432,20 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
                 .as_ref()
                 .and_then(|s| s.password.as_deref())
                 .ok_or_else(|| Error::config("obfs.salamander.password", "must be set"))?;
-            let psk = psk.as_bytes().to_vec();
-            cfg.conn_factory = Some(Arc::new(SalamanderFactory { psk }));
+            salamander_psk = Some(psk.as_bytes().to_vec());
         } else if ty != "plain" {
             return Err(Error::config("obfs.type", format!("{ty} not implemented")));
         }
+    }
+
+    if let Some(ports) = parsed.hop_ports {
+        let mut fac = UdpHopFactory::new(ports, hop_interval);
+        if let Some(psk) = salamander_psk.take() {
+            fac = fac.with_salamander(psk);
+        }
+        cfg.conn_factory = Some(Arc::new(fac));
+    } else if let Some(psk) = salamander_psk {
+        cfg.conn_factory = Some(Arc::new(SalamanderFactory { psk }));
     }
 
     Ok(ClientApp {
@@ -456,6 +456,73 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         udp_fwd: y.udp_forwarding.clone().unwrap_or_default(),
         lazy: y.lazy.unwrap_or(false),
     })
+}
+
+/// YAML hop interval (production ≥5s). Missing → 30s/30s.
+fn hop_interval_from_transport(transport: Option<&serde_yaml::Value>) -> Result<HopInterval, Error> {
+    let Some(tr) = transport else {
+        return Ok(HopInterval::default_30s());
+    };
+    let Some(m) = tr.as_mapping() else {
+        return Ok(HopInterval::default_30s());
+    };
+    let Some(udp) = m.get(serde_yaml::Value::from("udp")).and_then(|v| v.as_mapping()) else {
+        return Ok(HopInterval::default_30s());
+    };
+
+    let hop = udp
+        .get(serde_yaml::Value::from("hopInterval"))
+        .and_then(|v| v.as_str());
+    let min_s = udp
+        .get(serde_yaml::Value::from("minHopInterval"))
+        .and_then(|v| v.as_str());
+    let max_s = udp
+        .get(serde_yaml::Value::from("maxHopInterval"))
+        .and_then(|v| v.as_str());
+
+    if hop.is_some() && (min_s.is_some() || max_s.is_some()) {
+        return Err(Error::config(
+            "transport.udp",
+            "hopInterval cannot be used together with minHopInterval or maxHopInterval",
+        ));
+    }
+
+    let interval = if let Some(h) = hop {
+        let d = parse_dur(h, "transport.udp.hopInterval")?;
+        HopInterval::fixed(d)
+    } else if min_s.is_none() && max_s.is_none() {
+        HopInterval::default_30s()
+    } else {
+        let min_s = min_s.ok_or_else(|| {
+            Error::config(
+                "transport.udp",
+                "minHopInterval and maxHopInterval must both be set",
+            )
+        })?;
+        let max_s = max_s.ok_or_else(|| {
+            Error::config(
+                "transport.udp",
+                "minHopInterval and maxHopInterval must both be set",
+            )
+        })?;
+        let min = parse_dur(min_s, "transport.udp.minHopInterval")?;
+        let max = parse_dur(max_s, "transport.udp.maxHopInterval")?;
+        if min > max {
+            return Err(Error::config(
+                "transport.udp",
+                "min hop interval must not be greater than max hop interval",
+            ));
+        }
+        HopInterval { min, max }
+    };
+
+    if interval.min < Duration::from_secs(5) {
+        return Err(Error::config(
+            "transport.udp",
+            "hop interval must be at least 5 seconds",
+        ));
+    }
+    Ok(interval)
 }
 
 struct SalamanderFactory {
@@ -956,22 +1023,31 @@ disableUDP: true
     }
 
     #[test]
-    fn fill_rejects_hop() {
-        let y = parse_client_yaml("server: 1.1.1.1:443,1.1.1.1:444\nauth: x\n").unwrap();
-        match fill_client(&y) {
-            Err(Error::Config { field, .. }) => assert!(field == "Server" || field == "ServerAddr"),
-            other => panic!("expected hop reject"),
-        }
+    fn fill_accepts_hop() {
+        let y = parse_client_yaml("server: 1.1.1.1:443,444\nauth: x\n").unwrap();
+        let app = fill_client(&y).expect("hop server should succeed");
+        assert_eq!(app.core.server_addr.unwrap().port(), 443);
+        assert!(app.core.conn_factory.is_some());
+    }
+
+    #[test]
+    fn fill_hop_interval_ok() {
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:443,444\nauth: x\ntransport:\n  udp:\n    hopInterval: 30s\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("hopInterval should succeed");
+        assert!(app.core.conn_factory.is_some());
     }
 
     #[test]
     fn tc_cfg_03_client_rejects() {
         assert_eq!(client_field("obfs: { gecko: {} }"), "obfs.gecko");
         assert_eq!(client_field("obfs: { type: gecko }"), "obfs.gecko");
-        assert_eq!(
-            client_field("transport:\n  udp:\n    hopInterval: 30s"),
-            "transport.udp.hopInterval"
-        );
+        // hopInterval is implemented (P5.B1); must not reject.
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntransport:\n  udp:\n    hopInterval: 30s\n")
+            .unwrap();
+        fill_client(&y).expect("hopInterval alone should fill");
         assert_eq!(client_field("realm: {}"), "realm");
         assert_eq!(client_field("mimic: {}"), "mimic");
         assert_eq!(client_field("tun: { name: hy0 }"), "tun");

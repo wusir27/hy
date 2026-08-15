@@ -1,0 +1,400 @@
+//! UDP port hopping. Aligns with hysteria `extras/transport/udphop`.
+
+use async_trait::async_trait;
+use hy_core::io::{ConnFactory, DatagramIo, StdUdp};
+use hy_core::Error;
+use rand::Rng;
+use std::collections::VecDeque;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, Notify};
+use tokio::task::JoinHandle;
+
+const PACKET_QUEUE_SIZE: usize = 1024;
+const UDP_BUFFER_SIZE: usize = 2048;
+pub const DEFAULT_HOP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Min/max hop interval. Unit tests may use short durations; YAML fill enforces ≥5s.
+#[derive(Debug, Clone, Copy)]
+pub struct HopInterval {
+    pub min: Duration,
+    pub max: Duration,
+}
+
+impl HopInterval {
+    pub fn fixed(d: Duration) -> Self {
+        Self { min: d, max: d }
+    }
+
+    pub fn default_30s() -> Self {
+        Self::fixed(DEFAULT_HOP_INTERVAL)
+    }
+
+    fn next(&self) -> Duration {
+        if self.min == self.max {
+            return self.min;
+        }
+        let lo = self.min.as_nanos();
+        let hi = self.max.as_nanos();
+        let n = rand::thread_rng().gen_range(lo..=hi);
+        Duration::from_nanos(n as u64)
+    }
+}
+
+/// Parse official port-union (`443,10000-10002`) into a flat port list. `None` if invalid.
+pub fn parse_port_union(s: &str) -> Option<Vec<u16>> {
+    let ranges = crate::sniff::parse_port_union(s)?;
+    let mut ports = Vec::new();
+    for (start, end) in ranges {
+        for p in start..=end {
+            ports.push(p);
+        }
+    }
+    if ports.is_empty() {
+        None
+    } else {
+        Some(ports)
+    }
+}
+
+struct RecvPacket {
+    buf: Vec<u8>,
+    n: usize,
+    err: Option<std::io::Error>,
+}
+
+struct SockSlot {
+    sock: Arc<StdUdp>,
+    recv: JoinHandle<()>,
+}
+
+struct HopSocks {
+    current: SockSlot,
+    prev: Option<SockSlot>,
+}
+
+/// QUIC sees one `DatagramIo`; dest port rotates on interval.
+pub struct UdpHop {
+    server_ip: IpAddr,
+    ports: Vec<u16>,
+    interval: HopInterval,
+    addr_index: AtomicUsize,
+    /// Logical addr returned from recv_from (first hop port), like official `Addr`.
+    logical_addr: SocketAddr,
+    cached_local: std::sync::Mutex<SocketAddr>,
+    socks: Mutex<HopSocks>,
+    recv_queue: Mutex<VecDeque<RecvPacket>>,
+    recv_notify: Notify,
+    closed: AtomicBool,
+    close_notify: Notify,
+    read_buf: std::sync::Mutex<usize>,
+    write_buf: std::sync::Mutex<usize>,
+}
+
+impl UdpHop {
+    pub async fn new(
+        server_ip: IpAddr,
+        ports: Vec<u16>,
+        interval: HopInterval,
+    ) -> std::io::Result<Arc<Self>> {
+        if ports.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "udphop: empty port list",
+            ));
+        }
+        let sock = Arc::new(StdUdp::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?);
+        let local = sock.local_addr()?;
+        let addr_index = rand::thread_rng().gen_range(0..ports.len());
+        let logical_addr = SocketAddr::new(server_ip, ports[0]);
+
+        // Placeholder recv handle; replaced after `hop` Arc exists.
+        let dummy = tokio::spawn(async {});
+        let hop = Arc::new(Self {
+            server_ip,
+            ports,
+            interval,
+            addr_index: AtomicUsize::new(addr_index),
+            logical_addr,
+            cached_local: std::sync::Mutex::new(local),
+            socks: Mutex::new(HopSocks {
+                current: SockSlot {
+                    sock: Arc::clone(&sock),
+                    recv: dummy,
+                },
+                prev: None,
+            }),
+            recv_queue: Mutex::new(VecDeque::new()),
+            recv_notify: Notify::new(),
+            closed: AtomicBool::new(false),
+            close_notify: Notify::new(),
+            read_buf: std::sync::Mutex::new(0),
+            write_buf: std::sync::Mutex::new(0),
+        });
+        let recv = hop.spawn_recv(Arc::clone(&sock));
+        {
+            let mut socks = hop.socks.lock().await;
+            socks.current.recv = recv;
+        }
+        hop.clone().spawn_hop_loop();
+        Ok(hop)
+    }
+
+    /// Current destination used by `send_to` (test helper).
+    pub fn current_dest(&self) -> SocketAddr {
+        let idx = self.addr_index.load(Ordering::SeqCst);
+        SocketAddr::new(self.server_ip, self.ports[idx])
+    }
+
+    fn spawn_recv(self: &Arc<Self>, sock: Arc<StdUdp>) -> JoinHandle<()> {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+            loop {
+                if this.closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                match sock.recv_from(&mut buf).await {
+                    Ok((n, _addr)) => {
+                        let mut q = this.recv_queue.lock().await;
+                        if q.len() < PACKET_QUEUE_SIZE {
+                            q.push_back(RecvPacket {
+                                buf: buf[..n].to_vec(),
+                                n,
+                                err: None,
+                            });
+                            this.recv_notify.notify_one();
+                        }
+                    }
+                    Err(_e) => return,
+                }
+            }
+        })
+    }
+
+    fn spawn_hop_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                let wait = self.interval.next();
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = self.close_notify.notified() => return,
+                }
+                if self.closed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let _ = self.hop_once().await;
+            }
+        });
+    }
+
+    async fn hop_once(self: &Arc<Self>) -> std::io::Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let new_sock = match StdUdp::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
+            Ok(s) => Arc::new(s),
+            Err(_) => return Ok(()),
+        };
+        if let Ok(la) = new_sock.local_addr() {
+            *self.cached_local.lock().unwrap() = la;
+        }
+        {
+            let rb = *self.read_buf.lock().unwrap();
+            let wb = *self.write_buf.lock().unwrap();
+            if rb > 0 {
+                let _ = new_sock.set_read_buffer(rb);
+            }
+            if wb > 0 {
+                let _ = new_sock.set_write_buffer(wb);
+            }
+        }
+        let recv = self.spawn_recv(Arc::clone(&new_sock));
+        {
+            let mut socks = self.socks.lock().await;
+            // Close prev (official); keep current receiving until next hop.
+            if let Some(prev) = socks.prev.take() {
+                prev.recv.abort();
+                drop(prev.sock);
+            }
+            let old_current = std::mem::replace(
+                &mut socks.current,
+                SockSlot {
+                    sock: Arc::clone(&new_sock),
+                    recv,
+                },
+            );
+            socks.prev = Some(old_current);
+        }
+        let new_idx = rand::thread_rng().gen_range(0..self.ports.len());
+        self.addr_index.store(new_idx, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn close(&self) {
+        if self
+            .closed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.close_notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for UdpHop {
+    fn drop(&mut self) {
+        self.close();
+        if let Ok(mut socks) = self.socks.try_lock() {
+            socks.current.recv.abort();
+            if let Some(prev) = socks.prev.take() {
+                prev.recv.abort();
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl DatagramIo for UdpHop {
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "udphop closed",
+                ));
+            }
+            {
+                let mut q = self.recv_queue.lock().await;
+                if let Some(p) = q.pop_front() {
+                    if let Some(e) = p.err {
+                        return Err(e);
+                    }
+                    let n = std::cmp::min(buf.len(), p.n);
+                    buf[..n].copy_from_slice(&p.buf[..n]);
+                    return Ok((n, self.logical_addr));
+                }
+            }
+            tokio::select! {
+                _ = self.recv_notify.notified() => {}
+                _ = self.close_notify.notified() => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "udphop closed",
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn send_to(&self, buf: &[u8], _dest: SocketAddr) -> std::io::Result<usize> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "udphop closed",
+            ));
+        }
+        let dest = self.current_dest();
+        let socks = self.socks.lock().await;
+        socks.current.sock.send_to(buf, dest).await
+    }
+
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        Ok(*self.cached_local.lock().unwrap())
+    }
+
+    fn set_read_buffer(&self, n: usize) -> std::io::Result<()> {
+        *self.read_buf.lock().unwrap() = n;
+        Ok(())
+    }
+
+    fn set_write_buffer(&self, n: usize) -> std::io::Result<()> {
+        *self.write_buf.lock().unwrap() = n;
+        Ok(())
+    }
+}
+
+/// `ConnFactory` that builds a fresh `UdpHop` per reconnect.
+///
+/// Compose with salamander like official: hop first, then wrap via
+/// [`UdpHopFactory::with_salamander`]. `inner` is reserved for optional chaining.
+pub struct UdpHopFactory {
+    pub ports: Vec<u16>,
+    pub interval: HopInterval,
+    /// Optional next (`ConnFactory`); unused for listen — salamander uses
+    /// [`UdpHopFactory::with_salamander`].
+    pub inner: Option<Arc<dyn ConnFactory>>,
+    salamander_psk: Option<Vec<u8>>,
+}
+
+impl UdpHopFactory {
+    pub fn new(ports: Vec<u16>, interval: HopInterval) -> Self {
+        Self {
+            ports,
+            interval,
+            inner: None,
+            salamander_psk: None,
+        }
+    }
+
+    pub fn with_salamander(mut self, psk: Vec<u8>) -> Self {
+        self.salamander_psk = Some(psk);
+        self
+    }
+}
+
+#[async_trait]
+impl ConnFactory for UdpHopFactory {
+    async fn open(&self, server: SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
+        let hop = UdpHop::new(server.ip(), self.ports.clone(), self.interval)
+            .await
+            .map_err(Error::Io)?;
+        let io: Arc<dyn DatagramIo> = hop;
+        if let Some(psk) = &self.salamander_psk {
+            let wrapped = crate::obfs::ObfsSalamander::new(io, psk)?;
+            return Ok(Arc::new(wrapped));
+        }
+        let _ = &self.inner;
+        Ok(io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_port_union_flat() {
+        assert_eq!(
+            parse_port_union("443,10000-10002").unwrap(),
+            vec![443, 10000, 10001, 10002]
+        );
+    }
+
+    #[tokio::test]
+    async fn dest_changes_after_interval() {
+        let ports = vec![41000u16, 41001];
+        let hop = UdpHop::new(
+            "127.0.0.1".parse().unwrap(),
+            ports.clone(),
+            HopInterval::fixed(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap();
+        let first = hop.current_dest().port();
+        assert!(ports.contains(&first));
+        let mut changed = false;
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let now = hop.current_dest().port();
+            if now != first {
+                changed = true;
+                break;
+            }
+        }
+        assert!(changed, "dest port should change after hop interval");
+        drop(hop);
+    }
+}

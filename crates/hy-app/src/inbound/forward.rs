@@ -85,22 +85,39 @@ pub async fn run_udp(
         let remote = remote.to_string();
         let sock2 = Arc::clone(&sock);
         tokio::spawn(async move {
+            // Uplink and downlink must run concurrently. Waiting for receive()
+            // before the next send stalls the session after the first packet
+            // (perf: 20×150ms only echoed pkt 1).
             while let Some(pkt) = rx.recv().await {
-                let _ = udp.send(&pkt, &remote).await;
+                if udp.send(&pkt, &remote).await.is_err() {
+                    break;
+                }
                 loop {
-                    match tokio::time::timeout(timeout, udp.receive()).await {
-                        Ok(Ok((payload, _))) => {
-                            let _ = sock2.send_to(&payload, src).await;
-                        }
-                        Ok(Err(_)) => return,
-                        Err(_) => {
-                            if rx.is_empty() {
-                                break;
+                    tokio::select! {
+                        biased;
+                        Some(more) = rx.recv() => {
+                            if udp.send(&more, &remote).await.is_err() {
+                                let _ = udp.close().await;
+                                return;
                             }
                         }
-                    }
-                    while let Ok(more) = rx.try_recv() {
-                        let _ = udp.send(&more, &remote).await;
+                        r = tokio::time::timeout(timeout, udp.receive()) => {
+                            match r {
+                                Ok(Ok((payload, _))) => {
+                                    let _ = sock2.send_to(&payload, src).await;
+                                }
+                                Ok(Err(_)) => {
+                                    let _ = udp.close().await;
+                                    return;
+                                }
+                                Err(_) => {
+                                    if rx.is_empty() {
+                                        let _ = udp.close().await;
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -108,3 +125,112 @@ pub async fn run_udp(
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use hy_core::client::{HyTcpConn, HyUdpConn};
+
+    struct EchoUdp {
+        q: tokio::sync::Mutex<std::collections::VecDeque<(Vec<u8>, String)>>,
+        notify: tokio::sync::Notify,
+        closed: std::sync::atomic::AtomicBool,
+    }
+
+    impl EchoUdp {
+        fn new() -> Self {
+            Self {
+                q: tokio::sync::Mutex::new(std::collections::VecDeque::new()),
+                notify: tokio::sync::Notify::new(),
+                closed: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HyUdpConn for EchoUdp {
+        async fn receive(&self) -> Result<(Vec<u8>, String), Error> {
+            loop {
+                if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(Error::Closed(None));
+                }
+                if let Some(v) = self.q.lock().await.pop_front() {
+                    return Ok(v);
+                }
+                self.notify.notified().await;
+            }
+        }
+        async fn send(&self, data: &[u8], addr: &str) -> Result<(), Error> {
+            self.q
+                .lock()
+                .await
+                .push_back((data.to_vec(), addr.to_string()));
+            self.notify.notify_waiters();
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.notify.notify_waiters();
+            Ok(())
+        }
+    }
+
+    struct EchoClient;
+
+    #[async_trait]
+    impl Client for EchoClient {
+        async fn tcp(&self, _addr: &str) -> Result<Box<dyn HyTcpConn>, Error> {
+            Err(Error::Closed(None))
+        }
+        async fn udp(&self) -> Result<Box<dyn HyUdpConn>, Error> {
+            Ok(Box::new(EchoUdp::new()))
+        }
+        async fn close(&self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_forward_echoes_more_than_first_packet() {
+        let ln = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let listen = ln.local_addr().unwrap();
+        drop(ln);
+        let listen_s = listen.to_string();
+        let client: Arc<dyn Client> = Arc::new(EchoClient);
+        tokio::spawn(async move {
+            let _ = run_udp(&listen_s, "1.1.1.1:9", Duration::from_secs(2), client).await;
+        });
+        let probe = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut buf = [0u8; 2048];
+        let mut ready = false;
+        for i in 0..50 {
+            let msg = format!("p{i}").into_bytes();
+            let _ = probe.send_to(&msg, listen).await;
+            if tokio::time::timeout(Duration::from_millis(50), probe.recv_from(&mut buf))
+                .await
+                .is_ok()
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready, "forwarder did not come up");
+        let mut got = 0usize;
+        for i in 0..8 {
+            let msg = format!("pkt-{i}").into_bytes();
+            probe.send_to(&msg, listen).await.unwrap();
+            match tokio::time::timeout(Duration::from_millis(400), probe.recv_from(&mut buf)).await {
+                Ok(Ok((n, _))) => {
+                    assert_eq!(&buf[..n], msg.as_slice());
+                    got += 1;
+                }
+                _ => {}
+            }
+        }
+        assert!(got >= 6, "expected most packets echoed, got {got}");
+    }
+}
+

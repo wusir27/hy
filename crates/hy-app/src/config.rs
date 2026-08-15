@@ -9,8 +9,8 @@ use hy_core::Error;
 use hy_extras::auth::{CommandAuth, HttpAuth, Password, UserPass};
 use hy_extras::obfs::ObfsSalamander;
 use hy_extras::outbounds::{
-    AclEngine, Adapter, Direct, DirectMode, DohResolver, PluggableOutbound, SpeedtestHandler,
-    StandardResolver, SystemResolver,
+    AclEngine, Adapter, Direct, DirectMode, DohResolver, HttpOutbound, PluggableOutbound,
+    Socks5Outbound, SpeedtestHandler, StandardResolver, SystemResolver,
 };
 use hy_extras::acl::CompiledRuleSet;
 use hy_extras::masq::StringMasq;
@@ -243,6 +243,21 @@ pub struct OutboundYaml {
     #[serde(rename = "type")]
     pub ty: Option<String>,
     pub direct: Option<DirectYaml>,
+    pub socks5: Option<OutboundSocks5Yaml>,
+    pub http: Option<OutboundHttpYaml>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct OutboundSocks5Yaml {
+    pub addr: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct OutboundHttpYaml {
+    pub url: Option<String>,
+    pub insecure: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -502,11 +517,40 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
             return Err(Error::config("masquerade.type", format!("{ty} not implemented")));
         }
     }
+    // Validate outbound types early (before bind/TLS) so bare YAML fails as Config.
     if let Some(list) = &y.outbounds {
         for o in list {
-            let ty = o.ty.as_deref().unwrap_or("direct");
-            if ty == "socks5" || ty == "http" {
-                return Err(Error::config("outbounds", format!("{ty} not implemented")));
+            let ty = o.ty.as_deref().unwrap_or("direct").to_ascii_lowercase();
+            match ty.as_str() {
+                "direct" => {}
+                "socks5" => {
+                    let addr = o
+                        .socks5
+                        .as_ref()
+                        .and_then(|s| s.addr.as_deref())
+                        .unwrap_or("");
+                    if addr.is_empty() {
+                        return Err(Error::config(
+                            "outbounds.socks5.addr",
+                            "empty socks5 address",
+                        ));
+                    }
+                }
+                "http" => {
+                    let url = o.http.as_ref().and_then(|h| h.url.as_deref()).unwrap_or("");
+                    if url.is_empty() {
+                        return Err(Error::config("outbounds.http.url", "empty http address"));
+                    }
+                    // Reject unsupported schemes early with a stable Config/Dial path.
+                    let insecure = o.http.as_ref().and_then(|h| h.insecure).unwrap_or(false);
+                    let _ = HttpOutbound::new(url, insecure)?;
+                }
+                other => {
+                    return Err(Error::config(
+                        "outbounds",
+                        format!("{other} not implemented"),
+                    ));
+                }
             }
         }
     }
@@ -651,30 +695,88 @@ fn build_outbound(y: &ServerYaml) -> Result<Arc<dyn hy_core::server::Outbound>, 
     let direct: Arc<dyn PluggableOutbound> = Arc::new(Direct::new(DirectMode::Auto));
     let mut table: HashMap<String, Arc<dyn PluggableOutbound>> = HashMap::new();
     table.insert("direct".into(), Arc::clone(&direct));
-    table.insert("default".into(), Arc::clone(&direct));
+
+    let mut first_ob: Option<Arc<dyn PluggableOutbound>> = None;
+    let mut has_explicit_default = false;
 
     if let Some(list) = &y.outbounds {
         for o in list {
-            let name = o.name.clone().unwrap_or_else(|| "default".into()).to_ascii_lowercase();
-            let ty = o.ty.as_deref().unwrap_or("direct");
-            if ty != "direct" {
-                return Err(Error::config("outbounds", format!("{ty} not implemented")));
-            }
-            let mode = match o.direct.as_ref().and_then(|d| d.mode.as_deref()).unwrap_or("auto") {
-                "auto" => DirectMode::Auto,
-                "64" => DirectMode::Prefer64,
-                "46" => DirectMode::Prefer46,
-                "6" => DirectMode::V6,
-                "4" => DirectMode::V4,
-                other => return Err(Error::config("outbounds.direct.mode", format!("bad mode {other}"))),
+            let name = o
+                .name
+                .clone()
+                .unwrap_or_else(|| "default".into())
+                .to_ascii_lowercase();
+            let ty = o.ty.as_deref().unwrap_or("direct").to_ascii_lowercase();
+            let d: Arc<dyn PluggableOutbound> = match ty.as_str() {
+                "direct" => {
+                    let mode = match o.direct.as_ref().and_then(|d| d.mode.as_deref()).unwrap_or("auto")
+                    {
+                        "auto" => DirectMode::Auto,
+                        "64" => DirectMode::Prefer64,
+                        "46" => DirectMode::Prefer46,
+                        "6" => DirectMode::V6,
+                        "4" => DirectMode::V4,
+                        other => {
+                            return Err(Error::config(
+                                "outbounds.direct.mode",
+                                format!("bad mode {other}"),
+                            ))
+                        }
+                    };
+                    Arc::new(Direct::new(mode))
+                }
+                "socks5" => {
+                    let s = o.socks5.as_ref();
+                    let addr = s.and_then(|x| x.addr.as_deref()).unwrap_or("");
+                    if addr.is_empty() {
+                        return Err(Error::config(
+                            "outbounds.socks5.addr",
+                            "empty socks5 address",
+                        ));
+                    }
+                    let username = s
+                        .and_then(|x| x.username.clone())
+                        .unwrap_or_default();
+                    let password = s
+                        .and_then(|x| x.password.clone())
+                        .unwrap_or_default();
+                    Arc::new(Socks5Outbound::new(addr.to_string(), username, password))
+                }
+                "http" => {
+                    let h = o.http.as_ref();
+                    let url = h.and_then(|x| x.url.as_deref()).unwrap_or("");
+                    if url.is_empty() {
+                        return Err(Error::config("outbounds.http.url", "empty http address"));
+                    }
+                    let insecure = h.and_then(|x| x.insecure).unwrap_or(false);
+                    Arc::new(HttpOutbound::new(url, insecure)?)
+                }
+                other => {
+                    return Err(Error::config(
+                        "outbounds",
+                        format!("{other} not implemented"),
+                    ))
+                }
             };
-            let d: Arc<dyn PluggableOutbound> = Arc::new(Direct::new(mode));
-            table.insert(name, Arc::clone(&d));
-            if table.get("default").is_some() && o.name.as_deref() == Some("default") {
-                table.insert("default".into(), d);
+            if first_ob.is_none() {
+                first_ob = Some(Arc::clone(&d));
             }
+            if name == "default" {
+                has_explicit_default = true;
+            }
+            table.insert(name, d);
         }
     }
+
+    if !has_explicit_default {
+        if let Some(f) = first_ob {
+            table.insert("default".into(), f);
+        } else {
+            table.insert("default".into(), Arc::clone(&direct));
+        }
+    }
+
+    let default_ob = Arc::clone(table.get("default").unwrap_or(&direct));
 
     let mut next: Arc<dyn PluggableOutbound> = if let Some(acl) = &y.acl {
         let text = if let Some(inline) = &acl.inline {
@@ -687,7 +789,7 @@ fn build_outbound(y: &ServerYaml) -> Result<Arc<dyn hy_core::server::Outbound>, 
         let rules = CompiledRuleSet::compile(&text).map_err(|e| Error::config("acl", e.to_string()))?;
         Arc::new(AclEngine::new(rules, table))
     } else {
-        Arc::clone(&direct)
+        default_ob
     };
 
     next = wrap_resolver(y, next)?;
@@ -898,10 +1000,13 @@ disableUDP: true
         let ech = server_field("ech: {}");
         assert!(ech.starts_with("ech:"), "{ech}");
         // sniff.enable / resolver doh|https are implemented (P5.A1/A2) — must not reject as unimplemented.
+        // P5.A3: socks5/http outbounds are implemented; bare type without addr/url may error on empty field.
         let s5 = server_field("outbounds:\n  - name: p\n    type: socks5");
-        assert!(s5.starts_with("outbounds:"), "{s5}");
+        assert!(!s5.contains("not implemented"), "{s5}");
+        assert!(s5.starts_with("outbounds.socks5.addr:"), "{s5}");
         let http = server_field("outbounds:\n  - name: p\n    type: http");
-        assert!(http.starts_with("outbounds:"), "{http}");
+        assert!(!http.contains("not implemented"), "{http}");
+        assert!(http.starts_with("outbounds.http.url:"), "{http}");
         let mf = server_field("masquerade: { type: file }");
         assert!(mf.starts_with("masquerade.type:"), "{mf}");
         let mp = server_field("masquerade: { type: proxy }");
@@ -1183,6 +1288,61 @@ sniff:
             .unwrap();
         let app = rt.block_on(fill_server(&y)).expect("fill_server with sniff");
         assert!(app.core.request_hook.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn outbounds_socks5_http_fill_succeeds() {
+        let dir = std::env::temp_dir().join(format!("hy-ob-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("t.crt");
+        let key = dir.join("t.key");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n").unwrap();
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+outbounds:
+  - name: p
+    type: socks5
+    socks5: {{ addr: "127.0.0.1:1080" }}
+  - name: h
+    type: http
+    http: {{ url: "http://127.0.0.1:8080" }}
+"#,
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        assert_eq!(y.outbounds.as_ref().unwrap().len(), 2);
+        assert_eq!(
+            y.outbounds.as_ref().unwrap()[0]
+                .socks5
+                .as_ref()
+                .unwrap()
+                .addr
+                .as_deref(),
+            Some("127.0.0.1:1080")
+        );
+        assert_eq!(
+            y.outbounds.as_ref().unwrap()[1]
+                .http
+                .as_ref()
+                .unwrap()
+                .url
+                .as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let app = rt
+            .block_on(fill_server(&y))
+            .unwrap_or_else(|e| panic!("fill socks5/http: {e:?}"));
+        assert!(app.core.outbound.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

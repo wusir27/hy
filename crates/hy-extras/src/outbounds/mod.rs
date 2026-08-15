@@ -17,6 +17,12 @@ pub use speedtest::{is_speedtest_host, SpeedtestHandler, SPEEDTEST_DEST};
 pub mod resolver;
 pub use resolver::{DohResolver, StandardResolver};
 
+mod socks5;
+pub use socks5::Socks5Outbound;
+
+mod http;
+pub use http::HttpOutbound;
+
 #[derive(Debug, Clone, Default)]
 pub struct ResolveInfo {
     pub v4: Option<Ipv4Addr>,
@@ -335,7 +341,7 @@ async fn candidates(addr: &AddrEx, mode: DirectMode) -> Result<Vec<SocketAddr>, 
     }
 }
 
-struct TokioTcp(TcpStream);
+pub(crate) struct TokioTcp(pub(crate) TcpStream);
 #[async_trait]
 impl HyTcpStream for TokioTcp {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {

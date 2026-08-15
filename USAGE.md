@@ -46,7 +46,7 @@ hy version
 | `:443` | 全接口（服务端 listen 常用） |
 | `example.com:443` | 域名（客户端 `server`） |
 | `host:443,10000-20000` | 端口跳跃：逗号**第一项是主端口**，后面是 hop 集合 |
-| `https://realm.example/id` | Realm 模式（需信令服务） |
+| `https://TOKEN@realm.example/id` | Realm：userinfo 是 **token**（必填），path 是 realm id |
 
 ### 3.2 带宽
 
@@ -137,7 +137,7 @@ outbound(address, protoPort, hijackIP)
 | `tcpRedirect` / `tcpTProxy` / `udpTProxy` | Linux 透明入口 |
 | `tun` | 虚拟网卡入口 |
 
-`tls.ech` **拒绝**。
+`tls.ech` **拒绝**（客户端顶层或 `tls.ech`；服务端 `tls.ech` / `tls.ech.key` 同样拒，不能吞掉）。
 
 ---
 
@@ -304,7 +304,7 @@ masquerade:
     status: 200
     headers:
       Content-Type: text/plain
-    body: "hello"
+    content: "hello"
 ```
 
 ```yaml
@@ -364,8 +364,13 @@ outbounds:
       addr: 127.0.0.1:1080
       username: ""
       password: ""
+  # HTTP 出站用 url，不是 addr：
+  # - name: proxy
+  #   type: http
+  #   http: { url: http://127.0.0.1:8080, insecure: false }
 ```
 
+- SOCKS5 出站字段是 `socks5.addr`；HTTP 出站字段是 `http.url`（写 `addr` 会拒）。
 - SOCKS5/HTTP **出站**把 hostname 交给上游，不强制本地解析。
 - HTTP 出站不能做 UDP（`http outbound is tcp only`）。
 - 有 ACL 时必须包一层 Resolver（system 或上面的 udp/tcp/tls/https）。
@@ -398,7 +403,8 @@ masquerade:
 
 ### 场景 8 — 端口跳跃 + Gecko
 
-服务端只绑**主端口**（第一项）。其余端口靠 iptables/nft DNAT 到主端口（本进程不做 iptables）。
+服务端只绑**主端口**（逗号第一项）。其余端口靠 iptables/nft DNAT 到主端口（本进程不做 iptables）。
+客户端 hop **从主端口起跳**；没有 DNAT 时只有打到第一项才能通，随机打到 hop 口会丢。本机试验可以只写主端口、或 hop 集合但保证第一项就是实际监听口。
 
 ```yaml
 # server.yaml
@@ -501,8 +507,8 @@ tun:
 `server` / `listen` 写成 Realm URL。本实现**不自带**信令服务，只做 hy 侧 STUN → 官方 `/v1/{id}` → punch。
 
 ```yaml
-# 客户端
-server: https://realm.example/your-id
+# 客户端。token 写在 userinfo，缺了会报 realm token is required
+server: https://your-token@realm.example/your-id
 auth: secret
 realm:
   stunServers: ["stun.l.google.com:19302"]

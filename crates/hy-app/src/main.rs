@@ -3,6 +3,7 @@ mod bps;
 mod config;
 mod inbound;
 mod listen;
+mod mimic;
 
 use clap::{Parser, Subcommand};
 use config::{fill_client, fill_server, parse_client_yaml, parse_server_yaml};
@@ -57,9 +58,27 @@ fn read_cfg(path: Option<&PathBuf>) -> Result<String, Error> {
     std::fs::read_to_string(p).map_err(|e| Error::config("config", e.to_string()))
 }
 
+async fn shutdown_signal() -> Result<(), Error> {
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(Error::Io)?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r.map_err(Error::Io)?,
+            _ = term.recv() => {}
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.map_err(Error::Io)
+    }
+}
+
 async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
     let y = parse_client_yaml(&read_cfg(path)?)?;
     let mut app = fill_client(&y)?;
+    let _mimic = app.start()?;
     let lazy = app.lazy;
     let cli = client::connect_reconnectable(app.core, lazy).await?;
     if lazy {
@@ -130,7 +149,7 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
     }
     if tasks.is_empty() {
         tracing::warn!("no inbound configured");
-        tokio::signal::ctrl_c().await.map_err(Error::Io)?;
+        shutdown_signal().await?;
         return cli.close().await;
     }
     tokio::select! {
@@ -138,7 +157,7 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
             let _ = cli.close().await;
             r.0
         }
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown_signal() => {
             tracing::info!("SIGINT, closing client");
             for t in &tasks {
                 t.abort();
@@ -151,6 +170,7 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
 async fn run_server(path: Option<&PathBuf>) -> Result<(), Error> {
     let y = parse_server_yaml(&read_cfg(path)?)?;
     let mut app = fill_server(&y).await?;
+    let _mimic = app.start()?;
     app.core.fill()?;
     if let Some((addr, ts)) = app.traffic.clone() {
         tracing::info!("trafficStats listen {addr}");
@@ -184,7 +204,7 @@ async fn run_server(path: Option<&PathBuf>) -> Result<(), Error> {
     tracing::info!("server listening");
     tokio::select! {
         r = srv.serve() => r,
-        _ = tokio::signal::ctrl_c() => srv.close().await,
+        _ = shutdown_signal() => srv.close().await,
     }
 }
 

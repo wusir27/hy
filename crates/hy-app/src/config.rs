@@ -3,6 +3,7 @@
 use crate::acme::{self, AcmeYaml};
 use crate::bps::parse_bps;
 use crate::listen::{parse_listen, parse_server};
+use crate::mimic::{fill_mimic, MimicHandle, MimicSpec, MimicYaml, Role};
 use hy_core::client::{self as core_client};
 use hy_core::congestion::{normalize_bbr_profile, normalize_type, CongestionType};
 use hy_core::io::{DatagramIo, StdUdp, StdUdpFactory};
@@ -46,7 +47,7 @@ pub struct ClientYaml {
     pub udp_forwarding: Option<Vec<ForwardYaml>>,
     pub transport: Option<serde_yaml::Value>,
     pub realm: Option<RealmYaml>,
-    pub mimic: Option<serde_yaml::Value>,
+    pub mimic: Option<MimicYaml>,
     pub tun: Option<TunYaml>,
     #[serde(rename = "tcpTProxy")]
     pub tcp_tproxy: Option<TcpTProxyYaml>,
@@ -176,7 +177,7 @@ pub struct ServerYaml {
     pub ech: Option<serde_yaml::Value>,
     pub sniff: Option<SniffYaml>,
     pub realm: Option<RealmYaml>,
-    pub mimic: Option<serde_yaml::Value>,
+    pub mimic: Option<MimicYaml>,
     pub quic: Option<QuicYaml>,
 }
 
@@ -465,12 +466,18 @@ pub struct ClientApp {
     pub tcp_redirect: Option<TcpRedirectYaml>,
     pub tun: Option<TunConfig>,
     pub lazy: bool,
+    /// Present only when `mimic.enabled: true` passed fill. Spawn via [`ClientApp::start`].
+    pub mimic: Option<MimicSpec>,
+}
+
+impl ClientApp {
+    /// Spawn mimic (if enabled) before the first QUIC packet / `connect`.
+    pub fn start(&self) -> Result<Option<MimicHandle>, Error> {
+        crate::mimic::start(self.mimic.as_ref())
+    }
 }
 
 pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
-    if y.mimic.is_some() {
-        return Err(Error::config("mimic", "not implemented"));
-    }
     let realm_opts = fill_realm_opts(y.realm.as_ref())?;
     let tun = fill_tun(y.tun.as_ref())?;
     let tcp_tproxy = fill_tcp_tproxy(y.tcp_tproxy.as_ref())?;
@@ -593,6 +600,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         }
     }
 
+    let mimic;
     if let Some(raddr) = realm_addr {
         if cfg.tls.server_name.is_empty() {
             cfg.tls.server_name = raddr.host.clone();
@@ -603,9 +611,21 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         cfg.server_addr_slot = Some(slot);
         cfg.conn_factory = Some(std::sync::Arc::new(fac));
         let _ = (salamander_psk, gecko_opts); // obfs on realm path: wrap later if needed
+        mimic = fill_mimic(
+            y.mimic.as_ref(),
+            false,
+            cfg.server_addr.unwrap(),
+            Role::Client,
+        )?;
     } else {
         let parsed = parse_server(server)?;
         cfg.server_addr = Some(parsed.addr);
+        mimic = fill_mimic(
+            y.mimic.as_ref(),
+            parsed.hop_ports.is_some(),
+            parsed.addr,
+            Role::Client,
+        )?;
 
         if let Some((psk, min, max)) = gecko_opts {
             let mut fac = GeckoFactory::new(psk, min, max);
@@ -623,6 +643,9 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
             cfg.conn_factory = Some(std::sync::Arc::new(SalamanderFactory { psk }));
         }
     }
+    if mimic.is_some() {
+        cfg.quic.disable_gso = true;
+    }
 
     Ok(ClientApp {
         core: cfg,
@@ -635,6 +658,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         tcp_redirect: y.tcp_redirect.clone(),
         tun,
         lazy: y.lazy.unwrap_or(false),
+        mimic,
     })
 }
 
@@ -925,6 +949,16 @@ pub struct ServerApp {
     pub masq_tcp: Option<Arc<MasqTcpServer>>,
     pub masq_listen_http: Option<std::net::SocketAddr>,
     pub masq_listen_https: Option<std::net::SocketAddr>,
+    /// Present only when `mimic.enabled: true` passed fill. Spawn via [`ServerApp::start`].
+    pub mimic: Option<MimicSpec>,
+}
+
+impl ServerApp {
+    /// Spawn mimic (if enabled) before `serve` (first QUIC packet). UDP may already
+    /// be bound by fill; XDP attaches on the iface, not the socket.
+    pub fn start(&self) -> Result<Option<MimicHandle>, Error> {
+        crate::mimic::start(self.mimic.as_ref())
+    }
 }
 
 pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
@@ -944,9 +978,24 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
         return Err(Error::config("ech", "not implemented"));
     }
     let realm_opts = fill_realm_opts(y.realm.as_ref())?;
-    if y.mimic.is_some() {
-        return Err(Error::config("mimic", "not implemented"));
-    }
+    // Mimic fill (no spawn) before TLS file reads so `enabled: true` without path
+    // is still a Config error in isolation, not a missing cert path.
+    let mimic_addr = if y
+        .mimic
+        .as_ref()
+        .map(|m| m.enabled.unwrap_or(false))
+        .unwrap_or(false)
+    {
+        let listen = y.listen.as_deref().unwrap_or(":443");
+        if try_parse_realm_url(listen, "listen")?.is_some() {
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            parse_listen(listen, "listen")?
+        }
+    } else {
+        std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+    };
+    let mimic = fill_mimic(y.mimic.as_ref(), false, mimic_addr, Role::Server)?;
     // resolver.type validated in build_outbound (P5.A2: tcp/udp/tls/https/doh).
     if let Some(m) = &y.masquerade {
         let ty = m.ty.as_deref().unwrap_or("");
@@ -1241,12 +1290,16 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
         (None, None, None)
     };
 
+    if mimic.is_some() {
+        cfg.quic.disable_gso = true;
+    }
     Ok(ServerApp {
         core: cfg,
         traffic,
         masq_tcp,
         masq_listen_http,
         masq_listen_https,
+        mimic,
     })
 }
 
@@ -1739,7 +1792,9 @@ tun:
         let app = fill_client(&y).expect("realm URL should fill");
         assert!(app.core.conn_factory.is_some());
         assert!(app.core.server_addr_slot.is_some());
-        assert_eq!(client_field("mimic: {}"), "mimic");
+        // mimic is implemented (P5.E4); disabled/empty must fill, not "not implemented".
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\nmimic: {}\n").unwrap();
+        fill_client(&y).expect("mimic: {} should fill");
         // tun is implemented (P5.D3); must fill, not reject as unimplemented.
         let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntun: { name: hy0 }\n").unwrap();
         fill_client(&y).expect("tun: { name: hy0 } should fill");
@@ -2005,8 +2060,13 @@ obfs:
         let realm = server_field("realm: {}");
         assert!(realm.starts_with("realm:"), "{realm}");
         assert!(!realm.contains("not implemented"), "{realm}");
-        let mimic = server_field("mimic: {}");
-        assert!(mimic.starts_with("mimic:"), "{mimic}");
+        // mimic is implemented (P5.E4); fill of empty/disabled is covered in mimic.rs.
+        // enabled without path still errors on mimic.path *before* TLS file reads.
+        let mimic = server_field("mimic: { enabled: true }");
+        assert!(
+            mimic.contains("path") && !mimic.contains("not implemented"),
+            "{mimic}"
+        );
     }
 
     #[test]
@@ -2188,6 +2248,14 @@ trafficStats: { listen: 127.0.0.1:19999, secret: s3cret }
         let client = include_str!("/workspace/hysteria/app/cmd/client_test.yaml");
         let c = parse_client_yaml(client).expect("official client_test.yaml");
         assert_eq!(c.lazy, Some(true));
+        let m = c.mimic.expect("official client mimic block");
+        assert_eq!(m.enabled, Some(true));
+        assert_eq!(m.xdp_mode.as_deref(), Some("skb"));
+        assert_eq!(m.path.as_deref(), Some("/usr/bin/mimic"));
+        assert_eq!(
+            m.extra_args.as_deref(),
+            Some(["--padding".to_string(), "random".to_string()].as_slice())
+        );
     }
 
     #[test]

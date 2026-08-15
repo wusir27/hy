@@ -106,6 +106,9 @@ pub struct BandwidthConfig {
 pub struct Config {
     pub conn_factory: Option<Arc<dyn ConnFactory>>,
     pub server_addr: Option<SocketAddr>,
+    /// When set, `connect` reads the peer address written by the factory after `open`
+    /// (realm punch). Falls back to `server_addr` if still empty.
+    pub server_addr_slot: Option<Arc<std::sync::Mutex<Option<SocketAddr>>>>,
     pub auth: String,
     pub tls: TlsConfig,
     pub quic: QuicConfig,
@@ -120,6 +123,7 @@ impl Default for Config {
         Self {
             conn_factory: None,
             server_addr: None,
+            server_addr_slot: None,
             auth: String::new(),
             tls: TlsConfig::default(),
             quic: QuicConfig::default(),

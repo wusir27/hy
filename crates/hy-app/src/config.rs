@@ -17,6 +17,9 @@ use hy_extras::acl::CompiledRuleSet;
 use hy_extras::masq::{FileMasq, MasqTcpServer, NotFoundMasq, ProxyMasq, StringMasq};
 use hy_extras::sniff::{parse_port_union, Sniffer};
 use hy_extras::trafficlogger::TrafficStats;
+use hy_extras::realm::{
+    open_server_realm, try_parse_realm_url, AddrFamily, RealmFactory, RealmOptions,
+};
 use hy_extras::udphop::{HopInterval, UdpHopFactory};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -41,7 +44,7 @@ pub struct ClientYaml {
     pub tcp_forwarding: Option<Vec<ForwardYaml>>,
     pub udp_forwarding: Option<Vec<ForwardYaml>>,
     pub transport: Option<serde_yaml::Value>,
-    pub realm: Option<serde_yaml::Value>,
+    pub realm: Option<RealmYaml>,
     pub mimic: Option<serde_yaml::Value>,
     pub tun: Option<TunYaml>,
     #[serde(rename = "tcpTProxy")]
@@ -49,6 +52,18 @@ pub struct ClientYaml {
     #[serde(rename = "udpTProxy")]
     pub udp_tproxy: Option<UdpTProxyYaml>,
     pub tcp_redirect: Option<TcpRedirectYaml>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RealmYaml {
+    pub stun_servers: Option<Vec<String>>,
+    pub stun_timeout: Option<String>,
+    pub punch_timeout: Option<String>,
+    pub insecure: Option<bool>,
+    pub ip_mode: Option<String>,
+    /// Accepted for YAML compatibility; UPnP/NAT-PMP apply is a no-op this gate.
+    pub port_mapping: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -159,7 +174,7 @@ pub struct ServerYaml {
     pub acme: Option<AcmeYaml>,
     pub ech: Option<serde_yaml::Value>,
     pub sniff: Option<SniffYaml>,
-    pub realm: Option<serde_yaml::Value>,
+    pub realm: Option<RealmYaml>,
     pub mimic: Option<serde_yaml::Value>,
     pub quic: Option<QuicYaml>,
 }
@@ -450,12 +465,10 @@ pub struct ClientApp {
 }
 
 pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
-    if y.realm.is_some() {
-        return Err(Error::config("realm", "not implemented"));
-    }
     if y.mimic.is_some() {
         return Err(Error::config("mimic", "not implemented"));
     }
+    let realm_opts = fill_realm_opts(y.realm.as_ref())?;
     let tun = fill_tun(y.tun.as_ref())?;
     let tcp_tproxy = fill_tcp_tproxy(y.tcp_tproxy.as_ref())?;
     let udp_tproxy = fill_udp_tproxy(y.udp_tproxy.as_ref())?;
@@ -484,10 +497,15 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
     let hop_interval = hop_interval_from_transport(y.transport.as_ref())?;
 
     let server = y.server.as_deref().ok_or_else(|| Error::config("Server", "must be set"))?;
-    let parsed = parse_server(server)?;
+    let realm_addr = try_parse_realm_url(server, "server")?;
+    if y.realm.is_some() && realm_addr.is_none() {
+        return Err(Error::config(
+            "realm",
+            "realm URL required in server (realm://, realm+http://, or https://…)",
+        ));
+    }
 
     let mut cfg = core_client::Config::default();
-    cfg.server_addr = Some(parsed.addr);
     cfg.auth = match &y.auth {
         Some(v) => auth_string(v)?,
         None => String::new(),
@@ -553,7 +571,6 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
                 .ok_or_else(|| Error::config("obfs.gecko", "password is required"))?;
             let min = g.min_packet_size.unwrap_or(0);
             let max = g.max_packet_size.unwrap_or(0);
-            // Apply defaults then validate (same rules as ObfsGecko::new).
             let min_pkt = if min == 0 { 512 } else { min };
             let max_pkt = if max == 0 { 1200 } else { max };
             if min_pkt == 0 || min_pkt > max_pkt || max_pkt > 2048 {
@@ -568,20 +585,35 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         }
     }
 
-    if let Some((psk, min, max)) = gecko_opts {
-        let mut fac = GeckoFactory::new(psk, min, max);
-        if let Some(ports) = parsed.hop_ports {
-            fac = fac.with_hop(ports, hop_interval);
+    if let Some(raddr) = realm_addr {
+        if cfg.tls.server_name.is_empty() {
+            cfg.tls.server_name = raddr.host.clone();
         }
-        cfg.conn_factory = Some(Arc::new(fac));
-    } else if let Some(ports) = parsed.hop_ports {
-        let mut fac = UdpHopFactory::new(ports, hop_interval);
-        if let Some(psk) = salamander_psk.take() {
-            fac = fac.with_salamander(psk);
+        // Placeholder; RealmFactory.open writes the punched peer into server_addr_slot.
+        cfg.server_addr = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+        let (fac, slot) = RealmFactory::new(raddr, realm_opts);
+        cfg.server_addr_slot = Some(slot);
+        cfg.conn_factory = Some(std::sync::Arc::new(fac));
+        let _ = (salamander_psk, gecko_opts); // obfs on realm path: wrap later if needed
+    } else {
+        let parsed = parse_server(server)?;
+        cfg.server_addr = Some(parsed.addr);
+
+        if let Some((psk, min, max)) = gecko_opts {
+            let mut fac = GeckoFactory::new(psk, min, max);
+            if let Some(ports) = parsed.hop_ports {
+                fac = fac.with_hop(ports, hop_interval);
+            }
+            cfg.conn_factory = Some(std::sync::Arc::new(fac));
+        } else if let Some(ports) = parsed.hop_ports {
+            let mut fac = UdpHopFactory::new(ports, hop_interval);
+            if let Some(psk) = salamander_psk.take() {
+                fac = fac.with_salamander(psk);
+            }
+            cfg.conn_factory = Some(std::sync::Arc::new(fac));
+        } else if let Some(psk) = salamander_psk {
+            cfg.conn_factory = Some(std::sync::Arc::new(SalamanderFactory { psk }));
         }
-        cfg.conn_factory = Some(Arc::new(fac));
-    } else if let Some(psk) = salamander_psk {
-        cfg.conn_factory = Some(Arc::new(SalamanderFactory { psk }));
     }
 
     Ok(ClientApp {
@@ -775,6 +807,31 @@ fn fill_udp_tproxy(y: Option<&UdpTProxyYaml>) -> Result<Option<UdpTProxyConfig>,
 }
 
 /// YAML hop interval (production ≥5s). Missing → 30s/30s.
+fn fill_realm_opts(y: Option<&RealmYaml>) -> Result<RealmOptions, Error> {
+    let mut opts = RealmOptions::default();
+    let Some(y) = y else {
+        return Ok(opts);
+    };
+    if let Some(s) = &y.stun_servers {
+        if !s.is_empty() {
+            opts.stun_servers = s.clone();
+        }
+    }
+    if let Some(s) = &y.stun_timeout {
+        opts.stun_timeout = parse_dur(s, "realm.stunTimeout")?;
+    }
+    if let Some(s) = &y.punch_timeout {
+        opts.punch_timeout = parse_dur(s, "realm.punchTimeout")?;
+    }
+    opts.insecure = y.insecure.unwrap_or(false);
+    let mode = y.ip_mode.as_deref().unwrap_or("dual");
+    opts.family =
+        AddrFamily::from_ip_mode(mode).map_err(|e| Error::config("realm.ipMode", e))?;
+    // port_mapping: parse accepted; apply is a no-op this gate (official UPnP/NAT-PMP).
+    let _ = &y.port_mapping;
+    Ok(opts)
+}
+
 fn hop_interval_from_transport(transport: Option<&serde_yaml::Value>) -> Result<HopInterval, Error> {
     let Some(tr) = transport else {
         return Ok(HopInterval::default_30s());
@@ -878,9 +935,7 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
     if y.ech.is_some() {
         return Err(Error::config("ech", "not implemented"));
     }
-    if y.realm.is_some() {
-        return Err(Error::config("realm", "not implemented"));
-    }
+    let realm_opts = fill_realm_opts(y.realm.as_ref())?;
     if y.mimic.is_some() {
         return Err(Error::config("mimic", "not implemented"));
     }
@@ -982,8 +1037,19 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
         }
     }
     let listen = y.listen.as_deref().unwrap_or(":443");
-    let bind = parse_listen(listen, "listen")?;
-    let mut io: Arc<dyn DatagramIo> = Arc::new(StdUdp::bind(bind).await.map_err(Error::Io)?);
+    let realm_addr = try_parse_realm_url(listen, "listen")?;
+    if y.realm.is_some() && realm_addr.is_none() {
+        return Err(Error::config(
+            "realm",
+            "realm URL required in listen (realm://, realm+http://, or https://…)",
+        ));
+    }
+    let mut io: Arc<dyn DatagramIo> = if let Some(raddr) = realm_addr {
+        open_server_realm(&raddr, &realm_opts).await?
+    } else {
+        let bind = parse_listen(listen, "listen")?;
+        Arc::new(StdUdp::bind(bind).await.map_err(Error::Io)?)
+    };
     if let Some(o) = &y.obfs {
         if o.ty.as_deref() == Some("salamander") {
             let psk = o
@@ -1533,6 +1599,32 @@ tun:
             .unwrap();
         fill_client(&y).expect("hopInterval alone should fill");
         assert_eq!(client_field("realm: {}"), "realm");
+        match fill_client(
+            &parse_client_yaml("server: 127.0.0.1:1\nauth: x\nrealm: {}\n").unwrap(),
+        ) {
+            Err(Error::Config { field, reason }) => {
+                assert_eq!(field, "realm");
+                assert!(
+                    !reason.contains("not implemented"),
+                    "reason={reason}"
+                );
+            }
+            other => panic!(
+                "expected realm URL missing Config, got {}",
+                match &other {
+                    Ok(_) => "Ok".into(),
+                    Err(e) => format!("Err({e})"),
+                }
+            ),
+        }
+        // realm URL + realm yaml must not reject as "not implemented"
+        let y = parse_client_yaml(
+            "server: realm://t@127.0.0.1:9/id\nauth: x\nrealm: { stunTimeout: 5s }\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("realm URL should fill");
+        assert!(app.core.conn_factory.is_some());
+        assert!(app.core.server_addr_slot.is_some());
         assert_eq!(client_field("mimic: {}"), "mimic");
         // tun is implemented (P5.D3); must fill, not reject as unimplemented.
         let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntun: { name: hy0 }\n").unwrap();
@@ -1798,8 +1890,21 @@ obfs:
         assert!(!lhs.contains("not implemented"), "{lhs}");
         let realm = server_field("realm: {}");
         assert!(realm.starts_with("realm:"), "{realm}");
+        assert!(!realm.contains("not implemented"), "{realm}");
         let mimic = server_field("mimic: {}");
         assert!(mimic.starts_with("mimic:"), "{mimic}");
+    }
+
+    #[test]
+    fn fill_client_realm_url_wires_factory() {
+        let y = parse_client_yaml(
+            "server: realm://t@127.0.0.1:9/id\nauth: x\nrealm: { stunTimeout: 1s, punchTimeout: 1s }\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("realm URL should fill without STUN");
+        assert!(app.core.conn_factory.is_some());
+        assert!(app.core.server_addr_slot.is_some());
+        assert_eq!(app.core.tls.server_name, "127.0.0.1");
     }
 
     fn server_field_no_tls(extra: &str) -> String {

@@ -37,6 +37,15 @@ pub async fn connect(mut cfg: Config) -> Result<(Arc<dyn Client>, HandshakeInfo)
         .unwrap_or_else(|| Arc::new(StdUdpFactory));
     let io = factory.open(server_addr).await?;
 
+    let server_addr = if let Some(slot) = &cfg.server_addr_slot {
+        slot.lock()
+            .ok()
+            .and_then(|g| *g)
+            .unwrap_or(server_addr)
+    } else {
+        server_addr
+    };
+
     let (endpoint, _client_cfg) = quic::build_client_endpoint(
         io,
         &cfg.tls,

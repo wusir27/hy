@@ -1,6 +1,6 @@
 //! Server interface and config. Transport impl is P1.
 
-use crate::congestion::normalize_type;
+use crate::congestion::{normalize_bbr_profile, normalize_type, CongestionType};
 use crate::error::Error;
 use crate::io::DatagramIo;
 use async_trait::async_trait;
@@ -233,7 +233,10 @@ impl Config {
                 "must be at least 8",
             ));
         }
-        let _ = normalize_type(&self.congestion.ty)?;
+        let ty = normalize_type(&self.congestion.ty)?;
+        if ty == CongestionType::Bbr {
+            let _ = normalize_bbr_profile(&self.congestion.bbr_profile)?;
+        }
         if self.conn.is_none() {
             return Err(Error::config("Conn", "must be set"));
         }
@@ -297,5 +300,24 @@ mod tests {
         c.fill().unwrap();
         assert_eq!(c.quic.max_incoming_streams, DEFAULT_MAX_INCOMING_STREAMS);
         assert_eq!(c.udp_idle_timeout, DEFAULT_UDP_IDLE);
+    }
+
+    #[tokio::test]
+    async fn fill_normalizes_bbr_profile() {
+        let mut c = Config::default();
+        c.tls.cert_pem = b"dummy".to_vec();
+        let udp = StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        c.conn = Some(Arc::new(udp));
+        c.authenticator = Some(Arc::new(DummyAuth));
+        c.congestion.ty = "bbr".into();
+        c.congestion.bbr_profile = "conservative".into();
+        c.fill().unwrap();
+        c.congestion.bbr_profile = "aggressive".into();
+        c.fill().unwrap();
+        c.congestion.bbr_profile = "turbo".into();
+        assert!(matches!(
+            c.fill(),
+            Err(Error::Config { field, .. }) if field.contains("BBRProfile") || field.contains("bbrProfile")
+        ));
     }
 }

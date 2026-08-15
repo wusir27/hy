@@ -4,6 +4,7 @@ use crate::acme::{self, AcmeYaml};
 use crate::bps::parse_bps;
 use crate::listen::{parse_listen, parse_server};
 use hy_core::client::{self as core_client};
+use hy_core::congestion::{normalize_bbr_profile, normalize_type, CongestionType};
 use hy_core::io::{DatagramIo, StdUdp, StdUdpFactory};
 use hy_core::server::{self as core_server};
 use hy_core::Error;
@@ -545,6 +546,10 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
     if let Some(c) = &y.congestion {
         cfg.congestion.ty = c.ty.clone().unwrap_or_default();
         cfg.congestion.bbr_profile = c.bbr_profile.clone().unwrap_or_default();
+    }
+    let cong_ty = normalize_type(&cfg.congestion.ty)?;
+    if cong_ty == CongestionType::Bbr {
+        let _ = normalize_bbr_profile(&cfg.congestion.bbr_profile)?;
     }
     cfg.fast_open = y.fast_open.unwrap_or(false);
 
@@ -1117,6 +1122,10 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
         cfg.congestion.ty = c.ty.clone().unwrap_or_default();
         cfg.congestion.bbr_profile = c.bbr_profile.clone().unwrap_or_default();
     }
+    let cong_ty = normalize_type(&cfg.congestion.ty)?;
+    if cong_ty == CongestionType::Bbr {
+        let _ = normalize_bbr_profile(&cfg.congestion.bbr_profile)?;
+    }
 
     cfg.authenticator = Some(build_auth(y.auth.as_ref())?);
     cfg.outbound = Some(build_outbound(y)?);
@@ -1489,6 +1498,24 @@ obfs: { type: salamander, salamander: { password: "abcd" } }
     }
 
     #[test]
+    fn fill_client_bbr_profiles() {
+        for profile in ["conservative", "aggressive"] {
+            let y = parse_client_yaml(&format!(
+                "server: 127.0.0.1:1\nauth: x\ncongestion: {{ type: bbr, bbrProfile: {profile} }}\n"
+            ))
+            .unwrap();
+            let app = fill_client(&y).unwrap_or_else(|e| panic!("bbrProfile {profile}: {e:?}"));
+            assert_eq!(app.core.congestion.ty, "bbr");
+            assert_eq!(app.core.congestion.bbr_profile, profile);
+        }
+        let field = client_field("congestion: { type: bbr, bbrProfile: turbo }");
+        assert!(
+            field.contains("bbrProfile") || field.contains("BBRProfile"),
+            "turbo field={field}"
+        );
+    }
+
+    #[test]
     fn official_server_deserializes() {
         let y = parse_server_yaml(
             r#"
@@ -1514,6 +1541,68 @@ disableUDP: true
         )
         .unwrap();
         assert_eq!(y.disable_udp, Some(true));
+    }
+
+    #[test]
+    fn fill_server_bbr_profiles() {
+        let dir = std::env::temp_dir().join(format!("hy-bbr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("t.crt");
+        let key = dir.join("t.key");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")
+            .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for profile in ["conservative", "aggressive"] {
+            let y = parse_server_yaml(&format!(
+                r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+congestion: {{ type: bbr, bbrProfile: {} }}
+"#,
+                cert.display(),
+                key.display(),
+                profile
+            ))
+            .unwrap();
+            let app = rt
+                .block_on(fill_server(&y))
+                .unwrap_or_else(|e| panic!("bbrProfile {profile}: {e:?}"));
+            assert_eq!(app.core.congestion.ty, "bbr");
+            assert_eq!(app.core.congestion.bbr_profile, profile);
+        }
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+congestion: {{ type: bbr, bbrProfile: turbo }}
+"#,
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        match rt.block_on(fill_server(&y)) {
+            Err(Error::Config { field, .. }) => {
+                assert!(
+                    field.contains("bbrProfile") || field.contains("BBRProfile"),
+                    "turbo field={field}"
+                );
+            }
+            other => panic!(
+                "expected Config for turbo, got {}",
+                match &other {
+                    Ok(_) => "Ok(ServerApp)".into(),
+                    Err(e) => format!("Err({e})"),
+                }
+            ),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn client_field(extra: &str) -> &'static str {

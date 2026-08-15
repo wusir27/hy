@@ -49,6 +49,10 @@ impl Default for SwitchableFactory {
 
 impl SwitchableController {
     fn new_bbr(configured: CongestionType, disable_loss_comp: bool, mtu: u16) -> Self {
+        // Same stock quinn BBR for every bbrProfile. `BbrConfig` only has
+        // `initial_window` (no highGain / STARTUP). We do NOT claim profile
+        // differentiation (report §4.8: standard 2.885, conservative 2.25,
+        // aggressive 3.0). Handshake stays BBR; `set_mode` after HTTP 233.
         let bbr = Bbr::new(Arc::new(BbrConfig::default()), mtu);
         Self {
             inner: Arc::new(Mutex::new(SwitchableInner {

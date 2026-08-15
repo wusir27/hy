@@ -55,7 +55,10 @@ pub fn normalize_bbr_profile(s: &str) -> Result<BbrProfile, Error> {
     }
 }
 
-// v1: all BBR profiles map to quinn's stock BBR; profile-specific tuning is TODO.
+// quinn BBR cannot change highGain / STARTUP: `BbrConfig` only has `initial_window`.
+// ALL official bbrProfile values therefore use the same stock quinn BBR.
+// We do NOT claim profile differentiation (report §4.8: standard highGain=2.885,
+// conservative 2.25, aggressive 3.0). Do not wire fake per-profile highGain.
 
 /// `actual_tx = min(a, b)` treating 0 as unlimited/unknown.
 pub fn min_bandwidth(a: u64, b: u64) -> u64 {
@@ -132,6 +135,7 @@ pub fn brutal_pacing_and_cwnd(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     #[test]
     fn types() {
@@ -141,8 +145,21 @@ mod tests {
         assert!(normalize_type("cubic").is_err());
         assert_eq!(normalize_bbr_profile("").unwrap(), BbrProfile::Standard);
         assert_eq!(
+            normalize_bbr_profile("standard").unwrap(),
+            BbrProfile::Standard
+        );
+        assert_eq!(
             normalize_bbr_profile("conservative").unwrap(),
             BbrProfile::Conservative
+        );
+        assert_eq!(
+            normalize_bbr_profile("aggressive").unwrap(),
+            BbrProfile::Aggressive
+        );
+        let turbo = normalize_bbr_profile("turbo");
+        assert!(turbo.is_err());
+        assert!(
+            matches!(turbo, Err(Error::Config { field, .. }) if field.contains("BBRProfile") || field.contains("bbrProfile"))
         );
     }
 

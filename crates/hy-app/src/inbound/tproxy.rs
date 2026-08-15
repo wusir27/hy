@@ -4,12 +4,16 @@ use crate::inbound::redirect::decode_sock_addr;
 use hy_core::Error;
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
+#[cfg(target_os = "linux")]
 /// Linux `IP_TRANSPARENT` (SOL_IP).
 pub const IP_TRANSPARENT: libc::c_int = 19;
+#[cfg(target_os = "linux")]
 /// Linux `IPV6_TRANSPARENT` (SOL_IPV6).
 pub const IPV6_TRANSPARENT: libc::c_int = 75;
+#[cfg(target_os = "linux")]
 /// Linux `IP_RECVORIGDSTADDR` / `IP_ORIGDSTADDR` (SOL_IP).
 pub const IP_ORIGDSTADDR: libc::c_int = 20;
+#[cfg(target_os = "linux")]
 /// Linux `IPV6_RECVORIGDSTADDR` / `IPV6_ORIGDSTADDR` (SOL_IPV6).
 pub const IPV6_ORIGDSTADDR: libc::c_int = 74;
 

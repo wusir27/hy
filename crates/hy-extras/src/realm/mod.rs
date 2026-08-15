@@ -27,9 +27,7 @@ pub use punch::{
     decode_punch_packet, encode_punch_packet, new_punch_metadata, PunchMetadata, PunchPacket,
     PunchPacketType, ErrInvalidPunchPacket, MAX_PUNCH_PADDING,
 };
-pub use punch_conn::{
-    discover_on_punch, ErrInvalidPunchAttempt, PunchPacketConn, PunchPacketEvent, STUNPacketEvent,
-};
+pub use punch_conn::{ErrInvalidPunchAttempt, PunchPacketConn, PunchPacketEvent};
 pub use punch_engine::{
     candidate_punch_addrs, expand_symmetric_nat_candidates, punch, punch_via_events, PunchConfig,
     PunchResult, DEFAULT_PUNCH_TIMEOUT, ErrInvalidPunchConfig, ErrPunchTimeout,

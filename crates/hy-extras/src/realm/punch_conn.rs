@@ -1,4 +1,7 @@
-//! `PunchPacketConn` — demux punch/STUN from QUIC on one UDP socket.
+//! `PunchPacketConn` — demux registered punch packets from QUIC/STUN on one UDP socket.
+//!
+//! Only registered attempts (magic+nonce match) are siphoned. STUN Binding
+//! Success, QUIC, and unrecognized packets are returned as-is from `recv_from`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -9,10 +12,6 @@ use hy_core::io::DatagramIo;
 use tokio::sync::mpsc;
 
 use crate::realm::punch::{decode_punch_packet, decode_punch_metadata, PunchMetadata, PunchPacket};
-use crate::realm::stun::{
-    is_stun_message, mapped_addrs_from_results, parse_stun_binding_response,
-    send_discover_requests, ErrInvalidSTUNConfig, STUNConfig,
-};
 
 const DEFAULT_EVENT_BUFFER: usize = 16;
 
@@ -33,22 +32,13 @@ pub struct PunchPacketEvent {
     pub packet: PunchPacket,
 }
 
-#[derive(Debug, Clone)]
-pub struct STUNPacketEvent {
-    pub txid: [u8; 12],
-    pub addr: SocketAddr,
-    pub raw: Vec<u8>,
-}
-
-/// Routes registered punch packets (and STUN) to event channels; other packets
-/// pass through for QUIC.
+/// Routes registered punch packets to an event channel; other packets
+/// (STUN, QUIC, unrecognized) pass through for `recv_from` callers.
 pub struct PunchPacketConn {
     inner: Arc<dyn DatagramIo>,
     attempts: Mutex<HashMap<String, PunchMetadata>>,
     events_tx: mpsc::Sender<PunchPacketEvent>,
     events_rx: Mutex<Option<mpsc::Receiver<PunchPacketEvent>>>,
-    stun_tx: mpsc::Sender<STUNPacketEvent>,
-    stun_rx: Mutex<Option<mpsc::Receiver<STUNPacketEvent>>>,
 }
 
 impl PunchPacketConn {
@@ -59,23 +49,16 @@ impl PunchPacketConn {
             event_buffer
         };
         let (events_tx, events_rx) = mpsc::channel(buf);
-        let (stun_tx, stun_rx) = mpsc::channel(buf);
         Ok(Self {
             inner,
             attempts: Mutex::new(HashMap::new()),
             events_tx,
             events_rx: Mutex::new(Some(events_rx)),
-            stun_tx,
-            stun_rx: Mutex::new(Some(stun_rx)),
         })
     }
 
     pub fn take_events(&self) -> Option<mpsc::Receiver<PunchPacketEvent>> {
         self.events_rx.lock().unwrap().take()
-    }
-
-    pub fn take_stun_events(&self) -> Option<mpsc::Receiver<STUNPacketEvent>> {
-        self.stun_rx.lock().unwrap().take()
     }
 
     pub fn add_punch_attempt(
@@ -100,63 +83,12 @@ impl PunchPacketConn {
     }
 }
 
-/// STUN discovery on a `PunchPacketConn`.
-///
-/// Binding Success is siphoned onto the STUN event channel inside
-/// `recv_from` and is never returned to the caller. This waits on
-/// `take_stun_events` (matching txid) while pumping `recv_from` so
-/// siphoning actually runs.
-pub async fn discover_on_punch(
-    conn: &PunchPacketConn,
-    config: STUNConfig,
-) -> Result<Vec<SocketAddr>, ErrInvalidSTUNConfig> {
-    let mut stun_rx = conn.take_stun_events().ok_or_else(|| {
-        ErrInvalidSTUNConfig("STUN event receiver already taken".into())
-    })?;
-    let (mut transactions, timeout) = send_discover_requests(conn, config).await?;
-    let mut results = HashMap::new();
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    let mut buf = vec![0u8; 1500];
-    while !transactions.is_empty() {
-        tokio::select! {
-            _ = &mut deadline => break,
-            ev = stun_rx.recv() => {
-                let Some(ev) = ev else {
-                    break;
-                };
-                if transactions.remove(&ev.txid).is_some() {
-                    results.insert(ev.addr, ());
-                }
-            }
-            recv = conn.recv_from(&mut buf) => {
-                match recv {
-                    // Non-siphoned datagrams (not Binding Success); ignore during STUN.
-                    Ok(_) => {}
-                    Err(e) => return Err(ErrInvalidSTUNConfig(e.to_string())),
-                }
-            }
-        }
-    }
-    mapped_addrs_from_results(results)
-}
-
 #[async_trait]
 impl DatagramIo for PunchPacketConn {
     async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         loop {
             let (n, addr) = self.inner.recv_from(buf).await?;
             let packet = &buf[..n];
-            if is_stun_message(packet) {
-                if let Ok((txid, mapped)) = parse_stun_binding_response(packet) {
-                    let _ = self.stun_tx.try_send(STUNPacketEvent {
-                        txid,
-                        addr: mapped,
-                        raw: packet.to_vec(),
-                    });
-                    continue;
-                }
-            }
             let attempts = self.attempts.lock().unwrap().clone();
             let mut matched = None;
             for (id, meta) in &attempts {

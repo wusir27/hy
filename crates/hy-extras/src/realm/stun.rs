@@ -173,7 +173,7 @@ fn parse_xor_mapped(val: &[u8], txid: &[u8; 12]) -> Result<SocketAddr, ()> {
     }
 }
 
-fn build_binding_request(txid: &[u8; 12]) -> Vec<u8> {
+pub(crate) fn build_binding_request(txid: &[u8; 12]) -> Vec<u8> {
     let mut msg = vec![0u8; 20];
     msg[0..2].copy_from_slice(&BINDING_REQUEST.to_be_bytes());
     msg[2..4].copy_from_slice(&0u16.to_be_bytes());
@@ -287,9 +287,8 @@ pub(crate) fn mapped_addrs_from_results(
 
 /// Discover reflexive addresses via STUN using `conn.recv_from`.
 ///
-/// Do **not** call this on a [`crate::realm::punch_conn::PunchPacketConn`]: that
-/// type siphons Binding Success onto its STUN event channel, so `recv_from`
-/// never returns those packets. Use [`crate::realm::punch_conn::discover_on_punch`].
+/// Works on [`crate::realm::punch_conn::PunchPacketConn`]: Binding Success is
+/// not siphoned, so `discover` and QUIC share the same `recv_from`.
 pub async fn discover(
     conn: &dyn DatagramIo,
     config: STUNConfig,

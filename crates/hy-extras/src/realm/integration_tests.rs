@@ -8,7 +8,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::*;
-use super::stun::{encode_binding_success, parse_binding_request_txid};
+use super::stun::{
+    build_binding_request, encode_binding_success, parse_binding_request_txid,
+};
 
 #[tokio::test]
 async fn punch_packet_conn_hello_ack_and_passthrough() {
@@ -70,8 +72,50 @@ async fn punch_packet_conn_hello_ack_and_passthrough() {
     let _ = buf;
 }
 
+/// A: Binding Success is returned as-is from PunchPacketConn::recv_from (not siphoned).
 #[tokio::test]
-async fn discover_on_punch_gets_mapped_addr_when_binding_success_is_siphoned() {
+async fn punch_packet_conn_recv_from_returns_binding_success_bytes() {
+    let client = Arc::new(StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
+    let peer = StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let stun_addr = peer.local_addr().unwrap();
+    let mapped: std::net::SocketAddr = "1.2.3.4:443".parse().unwrap();
+
+    let punch = Arc::new(PunchPacketConn::new(client, 8).unwrap());
+    let punch_recv = punch.clone();
+
+    let peer_task = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        let (n, from) = peer.recv_from(&mut buf).await.unwrap();
+        let txid = parse_binding_request_txid(&buf[..n]).expect("Binding Request txid");
+        let success = encode_binding_success(&txid, mapped);
+        peer.send_to(&success, from).await.unwrap();
+        success
+    });
+
+    let recv_task = tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        punch_recv
+            .recv_from(&mut buf)
+            .await
+            .map(|(n, _)| buf[..n].to_vec())
+    });
+
+    let txid = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc];
+    let req = build_binding_request(&txid);
+    punch.send_to(&req, stun_addr).await.unwrap();
+
+    let got = tokio::time::timeout(Duration::from_secs(3), recv_task)
+        .await
+        .expect("recv_from timed out waiting for Binding Success")
+        .unwrap()
+        .expect("recv_from failed");
+    let expected = peer_task.await.unwrap();
+    assert_eq!(got, expected, "Binding Success must be returned as-is from recv_from, not siphoned");
+}
+
+/// B: discover() on PunchPacketConn gets XOR-MAPPED-ADDRESS via the same recv_from.
+#[tokio::test]
+async fn discover_on_punch_packet_conn_gets_mapped_addr() {
     let client = Arc::new(StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap());
     let peer = StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let stun_addr = peer.local_addr().unwrap();
@@ -89,7 +133,7 @@ async fn discover_on_punch_gets_mapped_addr_when_binding_success_is_siphoned() {
 
     let addrs = tokio::time::timeout(
         Duration::from_secs(3),
-        discover_on_punch(
+        discover(
             &punch,
             STUNConfig {
                 servers: vec![stun_addr.to_string()],
@@ -99,8 +143,8 @@ async fn discover_on_punch_gets_mapped_addr_when_binding_success_is_siphoned() {
         ),
     )
     .await
-    .expect("discover_on_punch timed out")
-    .unwrap_or_else(|e| panic!("discover_on_punch failed (must not be 'no STUN responses received'): {e}"));
+    .expect("discover timed out")
+    .unwrap_or_else(|e| panic!("discover failed (must not be 'no STUN responses received'): {e}"));
 
     assert!(
         addrs.contains(&mapped),

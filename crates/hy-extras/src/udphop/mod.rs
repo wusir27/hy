@@ -43,12 +43,30 @@ impl HopInterval {
     }
 }
 
-/// Parse official port-union (`443,10000-10002`) into a flat port list. `None` if invalid.
+/// Parse hop port-union (`18530,10000-10002`) into a flat list in **declaration order**.
+/// Unlike sniff's sorted union, the first written port stays first (`ports[0]` = bind/main).
 pub fn parse_port_union(s: &str) -> Option<Vec<u16>> {
-    let ranges = crate::sniff::parse_port_union(s)?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
     let mut ports = Vec::new();
-    for (start, end) in ranges {
-        for p in start..=end {
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return None;
+        }
+        if let Some((a, b)) = part.split_once('-') {
+            let mut start: u16 = a.trim().parse().ok()?;
+            let mut end: u16 = b.trim().parse().ok()?;
+            if start > end {
+                std::mem::swap(&mut start, &mut end);
+            }
+            for p in start..=end {
+                ports.push(p);
+            }
+        } else {
+            let p: u16 = part.parse().ok()?;
             ports.push(p);
         }
     }
@@ -371,6 +389,13 @@ mod tests {
             parse_port_union("443,10000-10002").unwrap(),
             vec![443, 10000, 10001, 10002]
         );
+    }
+
+    #[test]
+    fn parse_port_union_preserves_declaration_order() {
+        let ports = parse_port_union("18530,10000-10002").unwrap();
+        assert_eq!(ports[0], 18530);
+        assert_eq!(ports, vec![18530, 10000, 10001, 10002]);
     }
 
     #[tokio::test]

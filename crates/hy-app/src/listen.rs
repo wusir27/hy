@@ -121,6 +121,8 @@ mod tests {
         assert_eq!(a, "0.0.0.0:443".parse().unwrap());
         let b = parse_listen("127.0.0.1:443,10000-20000", "listen").unwrap();
         assert_eq!(b.port(), 443);
+        let c = parse_listen("127.0.0.1:18530,10000-10002", "listen").unwrap();
+        assert_eq!(c.port(), 18530);
     }
 
     #[test]

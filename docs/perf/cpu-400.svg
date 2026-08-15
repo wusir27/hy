@@ -1,31 +1,31 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" font-family="sans-serif">
 <rect width="100%" height="100%" fill="#fff"/>
-<text x="360.0" y="24" text-anchor="middle" font-size="15" font-weight="600">CPU at same 400 Mbps UDP (TLS+Salamander)</text>
+<text x="360.0" y="24" text-anchor="middle" font-size="15" font-weight="600">CPU at same 400 Mbps UDP (TLS+Salamander, 6fa6a40)</text>
 <line x1="56" y1="40" x2="56" y2="290" stroke="#333"/>
 <line x1="56" y1="290" x2="696" y2="290" stroke="#333"/>
 <line x1="56" y1="290.0" x2="696" y2="290.0" stroke="#eee"/>
 <text x="48" y="294.0" text-anchor="end" font-size="11" fill="#555">0</text>
 <line x1="56" y1="227.5" x2="696" y2="227.5" stroke="#eee"/>
-<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">88</text>
+<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">86</text>
 <line x1="56" y1="165.0" x2="696" y2="165.0" stroke="#eee"/>
-<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">176</text>
+<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">171</text>
 <line x1="56" y1="102.5" x2="696" y2="102.5" stroke="#eee"/>
-<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">263</text>
+<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">257</text>
 <line x1="56" y1="40.0" x2="696" y2="40.0" stroke="#eee"/>
-<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">351</text>
+<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">342</text>
 <text x="14" y="165.0" text-anchor="middle" font-size="11" fill="#555" transform="rotate(-90 14 165.0)">CPU %</text>
-<rect x="98.7" y="220.0" width="80.1" height="70.0" fill="#2563eb" rx="2"/>
-<text x="138.7" y="216.0" text-anchor="middle" font-size="10" fill="#333">98</text>
-<rect x="312.0" y="256.3" width="80.1" height="33.7" fill="#2563eb" rx="2"/>
-<text x="352.0" y="252.3" text-anchor="middle" font-size="10" fill="#333">47</text>
-<rect x="525.3" y="186.3" width="80.1" height="103.7" fill="#2563eb" rx="2"/>
-<text x="565.4" y="182.3" text-anchor="middle" font-size="10" fill="#333">146</text>
-<rect x="180.7" y="178.9" width="80.1" height="111.1" fill="#f59e0b" rx="2"/>
-<text x="220.7" y="174.9" text-anchor="middle" font-size="10" fill="#333">156</text>
-<rect x="394.1" y="183.7" width="80.1" height="106.3" fill="#f59e0b" rx="2"/>
-<text x="434.1" y="179.7" text-anchor="middle" font-size="10" fill="#333">149</text>
+<rect x="98.7" y="227.6" width="80.1" height="62.4" fill="#2563eb" rx="2"/>
+<text x="138.7" y="223.6" text-anchor="middle" font-size="10" fill="#333">85</text>
+<rect x="312.0" y="259.7" width="80.1" height="30.3" fill="#2563eb" rx="2"/>
+<text x="352.0" y="255.7" text-anchor="middle" font-size="10" fill="#333">41</text>
+<rect x="525.3" y="197.3" width="80.1" height="92.7" fill="#2563eb" rx="2"/>
+<text x="565.4" y="193.3" text-anchor="middle" font-size="10" fill="#333">127</text>
+<rect x="180.7" y="177.8" width="80.1" height="112.2" fill="#f59e0b" rx="2"/>
+<text x="220.7" y="173.8" text-anchor="middle" font-size="10" fill="#333">154</text>
+<rect x="394.1" y="184.8" width="80.1" height="105.2" fill="#f59e0b" rx="2"/>
+<text x="434.1" y="180.8" text-anchor="middle" font-size="10" fill="#333">144</text>
 <rect x="607.4" y="72.6" width="80.1" height="217.4" fill="#f59e0b" rx="2"/>
-<text x="647.4" y="68.6" text-anchor="middle" font-size="10" fill="#333">305</text>
+<text x="647.4" y="68.6" text-anchor="middle" font-size="10" fill="#333">297</text>
 <text x="162.7" y="322" text-anchor="middle" font-size="11">server</text>
 <text x="376.0" y="322" text-anchor="middle" font-size="11">client</text>
 <text x="589.3" y="322" text-anchor="middle" font-size="11">server+client</text>

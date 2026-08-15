@@ -45,10 +45,30 @@ pub struct ClientYaml {
     pub mimic: Option<serde_yaml::Value>,
     pub tun: Option<serde_yaml::Value>,
     #[serde(rename = "tcpTProxy")]
-    pub tcp_tproxy: Option<serde_yaml::Value>,
+    pub tcp_tproxy: Option<TcpTProxyYaml>,
     #[serde(rename = "udpTProxy")]
-    pub udp_tproxy: Option<serde_yaml::Value>,
+    pub udp_tproxy: Option<UdpTProxyYaml>,
     pub tcp_redirect: Option<TcpRedirectYaml>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpTProxyYaml {
+    pub listen: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct UdpTProxyYaml {
+    pub listen: Option<String>,
+    pub timeout: Option<String>,
+}
+
+/// Filled `udpTProxy` with resolved idle timeout (default 60s).
+#[derive(Debug, Clone)]
+pub struct UdpTProxyConfig {
+    pub listen: String,
+    pub timeout: Duration,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -375,6 +395,8 @@ pub struct ClientApp {
     pub http: Option<HttpYaml>,
     pub tcp_fwd: Vec<ForwardYaml>,
     pub udp_fwd: Vec<ForwardYaml>,
+    pub tcp_tproxy: Option<TcpTProxyYaml>,
+    pub udp_tproxy: Option<UdpTProxyConfig>,
     pub tcp_redirect: Option<TcpRedirectYaml>,
     pub lazy: bool,
 }
@@ -389,12 +411,8 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
     if y.mimic.is_some() {
         return Err(Error::config("mimic", "not implemented"));
     }
-    if y.tcp_tproxy.is_some() {
-        return Err(Error::config("tcpTProxy", "not implemented"));
-    }
-    if y.udp_tproxy.is_some() {
-        return Err(Error::config("udpTProxy", "not implemented"));
-    }
+    let tcp_tproxy = fill_tcp_tproxy(y.tcp_tproxy.as_ref())?;
+    let udp_tproxy = fill_udp_tproxy(y.udp_tproxy.as_ref())?;
     if let Some(r) = &y.tcp_redirect {
         #[cfg(not(target_os = "linux"))]
         {
@@ -526,9 +544,62 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         http: y.http.clone(),
         tcp_fwd: y.tcp_forwarding.clone().unwrap_or_default(),
         udp_fwd: y.udp_forwarding.clone().unwrap_or_default(),
+        tcp_tproxy,
+        udp_tproxy,
         tcp_redirect: y.tcp_redirect.clone(),
         lazy: y.lazy.unwrap_or(false),
     })
+}
+
+fn fill_tcp_tproxy(y: Option<&TcpTProxyYaml>) -> Result<Option<TcpTProxyYaml>, Error> {
+    let Some(t) = y else {
+        return Ok(None);
+    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = t;
+        return Err(Error::config("tcpTProxy", "not supported"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let listen = t.listen.as_deref().unwrap_or("");
+        if listen.is_empty() {
+            return Err(Error::config(
+                "tcpTProxy.listen",
+                "listen address is empty",
+            ));
+        }
+        Ok(Some(t.clone()))
+    }
+}
+
+fn fill_udp_tproxy(y: Option<&UdpTProxyYaml>) -> Result<Option<UdpTProxyConfig>, Error> {
+    let Some(t) = y else {
+        return Ok(None);
+    };
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = t;
+        return Err(Error::config("udpTProxy", "not supported"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let listen = t.listen.as_deref().unwrap_or("");
+        if listen.is_empty() {
+            return Err(Error::config(
+                "udpTProxy.listen",
+                "listen address is empty",
+            ));
+        }
+        let timeout = match &t.timeout {
+            Some(s) => parse_dur(s, "udpTProxy.timeout")?,
+            None => Duration::from_secs(60),
+        };
+        Ok(Some(UdpTProxyConfig {
+            listen: listen.to_string(),
+            timeout,
+        }))
+    }
 }
 
 /// YAML hop interval (production ≥5s). Missing → 30s/30s.
@@ -1248,8 +1319,23 @@ disableUDP: true
         assert_eq!(client_field("realm: {}"), "realm");
         assert_eq!(client_field("mimic: {}"), "mimic");
         assert_eq!(client_field("tun: { name: hy0 }"), "tun");
-        assert_eq!(client_field("tcpTProxy: {}"), "tcpTProxy");
-        assert_eq!(client_field("udpTProxy: {}"), "udpTProxy");
+        // tcpTProxy / udpTProxy empty listen is a config error, not "not implemented".
+        for extra in ["tcpTProxy: {}", "udpTProxy: {}"] {
+            let y = parse_client_yaml(&format!("server: 127.0.0.1:1\nauth: x\n{extra}\n")).unwrap();
+            match fill_client(&y) {
+                Err(Error::Config { field, reason }) => {
+                    assert!(
+                        field.starts_with("tcpTProxy") || field.starts_with("udpTProxy"),
+                        "field={field} reason={reason}"
+                    );
+                    assert!(
+                        !reason.contains("not implemented"),
+                        "field={field} reason={reason}"
+                    );
+                }
+                _ => panic!("expected empty-listen Config for {extra}"),
+            }
+        }
         // tcpRedirect empty listen is a config error, not "not implemented".
         let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntcpRedirect: {}\n").unwrap();
         match fill_client(&y) {
@@ -1266,6 +1352,92 @@ disableUDP: true
             _ => panic!("expected empty-listen Config"),
         }
         assert_eq!(client_field("tls: { ech: {} }"), "tls.ech");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fill_tcp_tproxy_listen_ok() {
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\ntcpTProxy:\n  listen: 127.0.0.1:0\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("tcpTProxy listen should fill");
+        assert!(app.tcp_tproxy.is_some());
+        assert_eq!(
+            app.tcp_tproxy.as_ref().unwrap().listen.as_deref(),
+            Some("127.0.0.1:0")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fill_udp_tproxy_listen_and_timeout() {
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\nudpTProxy:\n  listen: 127.0.0.1:0\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("udpTProxy listen should fill");
+        let u = app.udp_tproxy.as_ref().expect("udp_tproxy");
+        assert_eq!(u.listen, "127.0.0.1:0");
+        assert_eq!(u.timeout, Duration::from_secs(60));
+
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\nudpTProxy:\n  listen: 127.0.0.1:0\n  timeout: 30s\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("udpTProxy timeout should fill");
+        assert_eq!(
+            app.udp_tproxy.as_ref().unwrap().timeout,
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn fill_tcp_tproxy_empty_listen() {
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntcpTProxy: {}\n").unwrap();
+        match fill_client(&y) {
+            Err(Error::Config { field, reason }) => {
+                assert!(
+                    field.starts_with("tcpTProxy"),
+                    "field={field} reason={reason}"
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    assert_eq!(field, "tcpTProxy.listen");
+                    assert!(reason.contains("empty"), "{reason}");
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    assert_eq!(field, "tcpTProxy");
+                    assert!(reason.contains("not supported"), "{reason}");
+                }
+            }
+            _ => panic!("expected Config"),
+        }
+    }
+
+    #[test]
+    fn fill_udp_tproxy_empty_listen() {
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\nudpTProxy: {}\n").unwrap();
+        match fill_client(&y) {
+            Err(Error::Config { field, reason }) => {
+                assert!(
+                    field.starts_with("udpTProxy"),
+                    "field={field} reason={reason}"
+                );
+                #[cfg(target_os = "linux")]
+                {
+                    assert_eq!(field, "udpTProxy.listen");
+                    assert!(reason.contains("empty"), "{reason}");
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    assert_eq!(field, "udpTProxy");
+                    assert!(reason.contains("not supported"), "{reason}");
+                }
+            }
+            _ => panic!("expected Config"),
+        }
     }
 
     #[cfg(target_os = "linux")]

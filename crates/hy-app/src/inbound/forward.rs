@@ -57,6 +57,11 @@ pub async fn relay_tcp(mut local: tokio::net::TcpStream, remote: Box<dyn HyTcpCo
     }
 }
 
+/// Kernel UDP buffer for burst (4 MiB). OS may clamp; ignore failure.
+const UDP_SOCK_BUF: u32 = 4 * 1024 * 1024;
+/// Per-session uplink / local-downlink queues. Full → drop, never block sendto.
+const UDP_SESS_Q: usize = 256;
+
 pub async fn run_udp(
     listen: &str,
     remote: &str,
@@ -64,7 +69,13 @@ pub async fn run_udp(
     client: Arc<dyn Client>,
 ) -> Result<(), Error> {
     let addr = parse_listen(listen, "udpForwarding.listen")?;
-    let sock = Arc::new(UdpSocket::bind(addr).await.map_err(Error::Io)?);
+    let sock = UdpSocket::bind(addr).await.map_err(Error::Io)?;
+    {
+        let sref = socket2::SockRef::from(&sock);
+        let _ = sref.set_recv_buffer_size(UDP_SOCK_BUF as usize);
+        let _ = sref.set_send_buffer_size(UDP_SOCK_BUF as usize);
+    }
+    let sock = Arc::new(sock);
     tracing::info!("udpForwarding listen {addr} -> {remote}");
     let mut txs: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut buf = vec![0u8; 65535];
@@ -75,7 +86,7 @@ pub async fn run_udp(
             let _ = tx.try_send(buf[..n].to_vec());
             continue;
         }
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(UDP_SESS_Q);
         let _ = tx.try_send(buf[..n].to_vec());
         txs.insert(src, tx);
         let mut udp = match client.udp().await {
@@ -85,34 +96,45 @@ pub async fn run_udp(
         let remote = remote.to_string();
         let sock2 = Arc::clone(&sock);
         tokio::spawn(async move {
-            // Uplink and downlink must run concurrently. Waiting for receive()
-            // before the next send stalls the session after the first packet
-            // (perf: 20×150ms only echoed pkt 1).
+            let (down_tx, mut down_rx) = mpsc::channel::<Vec<u8>>(UDP_SESS_Q);
+            let writer = {
+                let sock_w = Arc::clone(&sock2);
+                tokio::spawn(async move {
+                    while let Some(payload) = down_rx.recv().await {
+                        if sock_w.send_to(&payload, src).await.is_err() {
+                            break;
+                        }
+                    }
+                })
+            };
+            // Fair select: do not starve downlink under uplink flood.
             while let Some(pkt) = rx.recv().await {
                 if udp.send(&pkt, &remote).await.is_err() {
                     break;
                 }
                 loop {
                     tokio::select! {
-                        biased;
                         Some(more) = rx.recv() => {
                             if udp.send(&more, &remote).await.is_err() {
                                 let _ = udp.close().await;
+                                writer.abort();
                                 return;
                             }
                         }
                         r = tokio::time::timeout(timeout, udp.receive()) => {
                             match r {
                                 Ok(Ok((payload, _))) => {
-                                    let _ = sock2.send_to(&payload, src).await;
+                                    let _ = down_tx.try_send(payload);
                                 }
                                 Ok(Err(_)) => {
                                     let _ = udp.close().await;
+                                    writer.abort();
                                     return;
                                 }
                                 Err(_) => {
                                     if rx.is_empty() {
                                         let _ = udp.close().await;
+                                        writer.abort();
                                         return;
                                     }
                                 }
@@ -122,6 +144,8 @@ pub async fn run_udp(
                 }
             }
             let _ = udp.close().await;
+            drop(down_tx);
+            let _ = writer.await;
         });
     }
 }

@@ -25,6 +25,7 @@ rustls.workspace = true
 rcgen = "=0.14.7"
 rustls-pemfile.workspace = true
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+socket2 = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

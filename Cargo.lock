@@ -637,6 +637,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_yaml",
+ "socket2",
  "tokio",
  "tokio-rustls",
  "tracing",

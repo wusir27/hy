@@ -3,12 +3,17 @@
 //! After accept, `LocalAddr` is the original destination (we masquerade as the remote)
 //! and `RemoteAddr` is the client — same as official go-tproxy / hysteria.
 
+#[cfg(target_os = "linux")]
 use crate::inbound::forward::relay_tcp;
+#[cfg(target_os = "linux")]
 use crate::inbound::tproxy::{set_ip_transparent, set_reuseaddr, sockaddr_storage};
+#[cfg(target_os = "linux")]
 use crate::listen::parse_listen;
 use hy_core::client::Client;
 use hy_core::Error;
+#[cfg(target_os = "linux")]
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
 use std::sync::Arc;
 

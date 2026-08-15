@@ -10,19 +10,26 @@
 //! demuxed on the listen socket by `(src,dst)` so sessions work without full TPROXY
 //! divert (subsequent packets may still hit the listen fd).
 
+#[cfg(target_os = "linux")]
 use crate::inbound::tproxy::{
     decode_origdst_cmsg, set_ip_transparent, set_recv_origdstaddr, set_reuseaddr,
     sockaddr_storage, IP_ORIGDSTADDR, IPV6_ORIGDSTADDR,
 };
+#[cfg(target_os = "linux")]
 use crate::listen::parse_listen;
 use hy_core::client::Client;
 use hy_core::Error;
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::net::SocketAddr;
+#[cfg(target_os = "linux")]
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 use std::time::Duration;
+#[cfg(target_os = "linux")]
 use tokio::net::UdpSocket;
+#[cfg(target_os = "linux")]
 use tokio::sync::mpsc;
 
 const UDP_BUF: usize = 4096;

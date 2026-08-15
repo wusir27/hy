@@ -12,6 +12,7 @@ use quinn::{
     AsyncUdpSocket, ClientConfig, Endpoint, EndpointConfig, ServerConfig, TokioRuntime,
     TransportConfig, UdpPoller, VarInt,
 };
+use quinn_proto::RandomConnectionIdGenerator;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::{ClientConfig as RustlsClientConfig, DigitallySignedStruct, ServerConfig as RustlsServerConfig, SignatureScheme};
@@ -246,6 +247,16 @@ fn endpoint_config() -> EndpointConfig {
     cfg
 }
 
+/// Client endpoint: zero-length local CID unless `disableChromeParrot`.
+/// Server keeps the hashed 8-byte generator (official parrot is client-only).
+fn client_endpoint_config(quic: &ClientQuicConfig) -> EndpointConfig {
+    let mut cfg = endpoint_config();
+    if !quic.disable_chrome_parrot {
+        cfg.cid_generator(|| Box::new(RandomConnectionIdGenerator::new(0)));
+    }
+    cfg
+}
+
 /// Official client `MaxDatagramFrameSize` is 1200 and it drops larger datagrams.
 /// Quinn advertises `datagram_receive_buffer_size` (38400) as the TP, so we must
 /// cap sends ourselves — `send_datagram` succeeding is not enough.
@@ -342,7 +353,7 @@ pub fn build_client_endpoint(
     )?));
 
     let mut endpoint = Endpoint::new_with_abstract_socket(
-        endpoint_config(),
+        client_endpoint_config(quic),
         None,
         adapter,
         Arc::new(TokioRuntime),

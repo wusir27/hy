@@ -85,7 +85,8 @@ pub struct QuicConfig {
     pub keep_alive_period: Duration,
     pub disable_path_mtu_discovery: bool,
     pub disable_gso: bool,
-    /// v1 no-op: quinn cannot do Chrome zero-length CID.
+    /// When false (official default), client Initial SCID length is 0 (Chrome parrot).
+    /// `true` keeps quinn's default hashed 8-byte CID.
     pub disable_chrome_parrot: bool,
 }
 

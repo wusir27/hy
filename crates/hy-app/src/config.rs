@@ -255,6 +255,8 @@ pub struct QuicYaml {
     pub max_idle_timeout: Option<String>,
     pub keep_alive_period: Option<String>,
     pub disable_path_mtu_discovery: Option<bool>,
+    /// Official camelCase `disableChromeParrot`. Client-only; default false = parrot ON.
+    pub disable_chrome_parrot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -533,6 +535,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
             cfg.quic.keep_alive_period = parse_dur(s, "quic.keepAlivePeriod")?;
         }
         cfg.quic.disable_path_mtu_discovery = q.disable_path_mtu_discovery.unwrap_or(false);
+        cfg.quic.disable_chrome_parrot = q.disable_chrome_parrot.unwrap_or(false);
     }
     if let Some(b) = &y.bandwidth {
         if let Some(u) = &b.up {
@@ -1513,6 +1516,28 @@ obfs: { type: salamander, salamander: { password: "abcd" } }
             field.contains("bbrProfile") || field.contains("BBRProfile"),
             "turbo field={field}"
         );
+    }
+
+    #[test]
+    fn fill_client_disable_chrome_parrot_true_and_false() {
+        for (yaml_val, want) in [(true, true), (false, false)] {
+            let y = parse_client_yaml(&format!(
+                "server: 127.0.0.1:1\nauth: x\nquic: {{ disableChromeParrot: {yaml_val} }}\n"
+            ))
+            .unwrap();
+            let app = match fill_client(&y) {
+                Ok(app) => app,
+                Err(e) => {
+                    let s = format!("{e:?}");
+                    assert!(!s.contains("not implemented"), "{s}");
+                    panic!("disableChromeParrot {yaml_val} must fill, got {e:?}");
+                }
+            };
+            assert_eq!(
+                app.core.quic.disable_chrome_parrot, want,
+                "disableChromeParrot {yaml_val}"
+            );
+        }
     }
 
     #[test]

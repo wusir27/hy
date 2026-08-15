@@ -21,3 +21,6 @@ mod p1_tests;
 
 #[cfg(all(test, feature = "transport"))]
 mod p2_tests;
+
+#[cfg(all(test, feature = "transport"))]
+mod p5_tests;

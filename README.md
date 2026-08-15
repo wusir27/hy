@@ -2,12 +2,18 @@
 
 Protocol-compatible rewrite of [apernet/hysteria](https://github.com/apernet/hysteria) (v4 / Hysteria 2).
 
+**使用说明（参数、场景示例）：[USAGE.md](USAGE.md)**
+
 | Crate | Role |
 |---|---|
-| `hy-core` | Protocol codec, QUIC/CC hooks, Client/Server interfaces |
-| `hy-extras` | Auth / ACL / outbound / sniff / masq / obfs (depends on hy-core) |
-| `hy-app` | CLI + YAML + inbounds (not started) |
+| `hy-core` | Protocol, QUIC, Client/Server |
+| `hy-extras` | Auth / ACL / outbound / sniff / masq / obfs / realm |
+| `hy-app` | CLI `hy` + YAML + inbounds |
 
-Dependency direction: `hy-app` → `hy-extras` → `hy-core`.
+Dependency: `hy-app` → `hy-extras` → `hy-core`.
 
-See `/workspace/hysteria-analysis-report.md` §8 for the rewrite blueprint.
+```
+hy client -c client.yaml
+hy server -c server.yaml
+hy version
+```

@@ -1,4 +1,12 @@
-//! `masquerade.type: string` — fixed status / headers / body.
+//! Masquerade handlers: string / file / proxy + optional TCP HTTP(S) façade.
+
+mod file;
+mod proxy;
+mod tcp;
+
+pub use file::FileMasq;
+pub use proxy::ProxyMasq;
+pub use tcp::MasqTcpServer;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -28,6 +36,20 @@ impl MasqHandler for StringMasq {
             status: self.status,
             headers: self.headers.clone(),
             body: self.body.clone(),
+        }
+    }
+}
+
+/// 404 empty body — used when listenHTTP is set without a typed masq handler.
+pub struct NotFoundMasq;
+
+#[async_trait]
+impl MasqHandler for NotFoundMasq {
+    async fn handle(&self, _method: &str, _host: &str, _path: &str) -> MasqResponse {
+        MasqResponse {
+            status: 404,
+            headers: vec![],
+            body: Bytes::new(),
         }
     }
 }

@@ -129,6 +129,26 @@ async fn run_server(path: Option<&PathBuf>) -> Result<(), Error> {
             }
         });
     }
+    if let Some(masq) = app.masq_tcp.clone() {
+        if let Some(addr) = app.masq_listen_http {
+            tracing::info!("masquerade listenHTTP {addr}");
+            let m = Arc::clone(&masq);
+            tokio::spawn(async move {
+                if let Err(e) = m.listen_http(addr).await {
+                    tracing::error!("masquerade listenHTTP: {e}");
+                }
+            });
+        }
+        if let Some(addr) = app.masq_listen_https {
+            tracing::info!("masquerade listenHTTPS {addr}");
+            let m = Arc::clone(&masq);
+            tokio::spawn(async move {
+                if let Err(e) = m.listen_https(addr).await {
+                    tracing::error!("masquerade listenHTTPS: {e}");
+                }
+            });
+        }
+    }
     let srv = server::serve(app.core).await?;
     tracing::info!("server listening");
     tokio::select! {

@@ -13,7 +13,7 @@ use hy_extras::outbounds::{
     Socks5Outbound, SpeedtestHandler, StandardResolver, SystemResolver,
 };
 use hy_extras::acl::CompiledRuleSet;
-use hy_extras::masq::StringMasq;
+use hy_extras::masq::{FileMasq, MasqTcpServer, NotFoundMasq, ProxyMasq, StringMasq};
 use hy_extras::sniff::{parse_port_union, Sniffer};
 use hy_extras::trafficlogger::TrafficStats;
 use hy_extras::udphop::{HopInterval, UdpHopFactory};
@@ -279,10 +279,14 @@ pub struct MasqYaml {
     #[serde(rename = "type")]
     pub ty: Option<String>,
     pub string: Option<MasqStringYaml>,
+    pub file: Option<MasqFileYaml>,
+    pub proxy: Option<MasqProxyYaml>,
     #[serde(rename = "listenHTTP")]
     pub listen_http: Option<String>,
     #[serde(rename = "listenHTTPS")]
     pub listen_https: Option<String>,
+    #[serde(rename = "forceHTTPS")]
+    pub force_https: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -292,6 +296,21 @@ pub struct MasqStringYaml {
     pub status_code: Option<u16>,
     pub content: Option<String>,
     pub headers: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MasqFileYaml {
+    pub dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct MasqProxyYaml {
+    pub url: Option<String>,
+    #[serde(rename = "rewriteHost")]
+    pub rewrite_host: Option<bool>,
+    #[serde(rename = "xForwarded")]
+    pub x_forwarded: Option<bool>,
+    pub insecure: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -571,6 +590,10 @@ impl hy_core::io::ConnFactory for SalamanderFactory {
 pub struct ServerApp {
     pub core: core_server::Config,
     pub traffic: Option<(std::net::SocketAddr, std::sync::Arc<TrafficStats>)>,
+    /// TCP HTTP(S) masquerade façade (listenHTTP / listenHTTPS).
+    pub masq_tcp: Option<Arc<MasqTcpServer>>,
+    pub masq_listen_http: Option<std::net::SocketAddr>,
+    pub masq_listen_https: Option<std::net::SocketAddr>,
 }
 
 pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
@@ -588,31 +611,62 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
     }
     // resolver.type validated in build_outbound (P5.A2: tcp/udp/tls/https/doh).
     if let Some(m) = &y.masquerade {
-        if m.listen_http.is_some() {
-            return Err(Error::config("masquerade.listenHTTP", "not implemented"));
-        }
-        if m.listen_https.is_some() {
-            return Err(Error::config("masquerade.listenHTTPS", "not implemented"));
-        }
         let ty = m.ty.as_deref().unwrap_or("");
-        if matches!(ty, "file" | "proxy" | "listenHTTP") {
-            return Err(Error::config("masquerade.type", format!("{ty} not implemented")));
-        }
-        if ty == "string" {
-            let s = m.string.as_ref().ok_or_else(|| Error::config("masquerade.string", "must be set"))?;
-            let content = s.content.clone().unwrap_or_default();
-            if content.is_empty() {
-                return Err(Error::config("masquerade.string.content", "empty string content"));
+        match ty {
+            "" | "404" => {}
+            "string" => {
+                let s = m
+                    .string
+                    .as_ref()
+                    .ok_or_else(|| Error::config("masquerade.string", "must be set"))?;
+                let content = s.content.clone().unwrap_or_default();
+                if content.is_empty() {
+                    return Err(Error::config(
+                        "masquerade.string.content",
+                        "empty string content",
+                    ));
+                }
+                let status = s.status_code.or(s.status).unwrap_or(200);
+                if status == 233 || !(200..=599).contains(&status) {
+                    return Err(Error::config(
+                        "masquerade.string.statusCode",
+                        "invalid status code (must be 200-599, except 233)",
+                    ));
+                }
             }
-            let status = s.status_code.or(s.status).unwrap_or(200);
-            if status == 233 || !(200..=599).contains(&status) {
+            "file" => {
+                let dir = m
+                    .file
+                    .as_ref()
+                    .and_then(|f| f.dir.as_deref())
+                    .unwrap_or("");
+                if dir.is_empty() {
+                    return Err(Error::config(
+                        "masquerade.file.dir",
+                        "empty file directory",
+                    ));
+                }
+            }
+            "proxy" => {
+                let url = m
+                    .proxy
+                    .as_ref()
+                    .and_then(|p| p.url.as_deref())
+                    .unwrap_or("");
+                if url.is_empty() {
+                    return Err(Error::config("masquerade.proxy.url", "empty proxy url"));
+                }
+                let rewrite = m.proxy.as_ref().and_then(|p| p.rewrite_host).unwrap_or(false);
+                let xf = m.proxy.as_ref().and_then(|p| p.x_forwarded).unwrap_or(false);
+                let insecure = m.proxy.as_ref().and_then(|p| p.insecure).unwrap_or(false);
+                let _ = ProxyMasq::new(url, rewrite, xf, insecure)?;
+            }
+            other => {
                 return Err(Error::config(
-                    "masquerade.string.statusCode",
-                    "invalid status code (must be 200-599, except 233)",
+                    "masquerade.type",
+                    format!("{other} not implemented"),
                 ));
             }
-        } else if !ty.is_empty() && ty != "404" {
-            return Err(Error::config("masquerade.type", format!("{ty} not implemented")));
         }
     }
     // Validate outbound types early (before bind/TLS) so bare YAML fails as Config.
@@ -737,6 +791,7 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
             cfg.request_hook = Some(Arc::new(sniffer));
         }
     }
+    let mut masq_proxy: Option<Arc<ProxyMasq>> = None;
     if let Some(m) = &y.masquerade {
         let ty = m.ty.as_deref().unwrap_or("");
         if ty == "string" {
@@ -752,6 +807,18 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
                 headers,
                 s.content.clone().unwrap_or_default().into_bytes(),
             )));
+        } else if ty == "file" {
+            let dir = m.file.as_ref().unwrap().dir.as_deref().unwrap();
+            cfg.masq_handler = Some(Arc::new(FileMasq::new(dir)));
+        } else if ty == "proxy" {
+            let p = m.proxy.as_ref().unwrap();
+            let url = p.url.as_deref().unwrap();
+            let rewrite = p.rewrite_host.unwrap_or(false);
+            let xf = p.x_forwarded.unwrap_or(false);
+            let insecure = p.insecure.unwrap_or(false);
+            let proxy = Arc::new(ProxyMasq::new(url, rewrite, xf, insecure)?);
+            masq_proxy = Some(Arc::clone(&proxy));
+            cfg.masq_handler = Some(proxy);
         }
     }
     let traffic = if let Some(ts) = &y.traffic_stats {
@@ -766,7 +833,54 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
     } else {
         None
     };
-    Ok(ServerApp { core: cfg, traffic })
+
+    let (masq_tcp, masq_listen_http, masq_listen_https) = if let Some(m) = &y.masquerade {
+        let want_http = m.listen_http.as_deref().filter(|s| !s.is_empty());
+        let want_https = m.listen_https.as_deref().filter(|s| !s.is_empty());
+        if want_http.is_none() && want_https.is_none() {
+            (None, None, None)
+        } else {
+            let http_addr = match want_http {
+                Some(s) => Some(parse_listen(s, "masquerade.listenHTTP")?),
+                None => None,
+            };
+            let https_addr = match want_https {
+                Some(s) => Some(parse_listen(s, "masquerade.listenHTTPS")?),
+                None => None,
+            };
+            let quic_port = cfg
+                .conn
+                .as_ref()
+                .and_then(|c| c.local_addr().ok())
+                .map(|a| a.port())
+                .unwrap_or(0);
+            let https_port = https_addr.map(|a| a.port()).unwrap_or(443);
+            let handler: Arc<dyn hy_core::server::MasqHandler> = cfg
+                .masq_handler
+                .clone()
+                .unwrap_or_else(|| Arc::new(NotFoundMasq));
+            let srv = Arc::new(MasqTcpServer {
+                quic_port,
+                https_port,
+                handler,
+                force_https: m.force_https.unwrap_or(false),
+                proxy: masq_proxy,
+                tls_cert_pem: cfg.tls.cert_pem.clone(),
+                tls_key_pem: cfg.tls.key_pem.clone(),
+            });
+            (Some(srv), http_addr, https_addr)
+        }
+    } else {
+        (None, None, None)
+    };
+
+    Ok(ServerApp {
+        core: cfg,
+        traffic,
+        masq_tcp,
+        masq_listen_http,
+        masq_listen_https,
+    })
 }
 
 fn build_auth(a: Option<&ServerAuthYaml>) -> Result<Arc<dyn hy_core::server::Authenticator>, Error> {
@@ -1151,13 +1265,19 @@ obfs:
 
     fn server_field(extra: &str) -> String {
         let y = parse_server_yaml(&format!(
-            "listen: 127.0.0.1:1\ntls: {{ cert: t.crt, key: t.key }}\nauth: {{ type: password, password: test }}\n{extra}\n"
+            "listen: 127.0.0.1:0\ntls: {{ cert: t.crt, key: t.key }}\nauth: {{ type: password, password: test }}\n{extra}\n"
         ))
         .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         match rt.block_on(fill_server(&y)) {
             Err(Error::Config { field, reason }) => format!("{field}:{reason}"),
-            other => panic!("expected Config, got ok-or-other-err"),
+            other => panic!(
+                "expected Config for extra={extra:?}, got {}",
+                match &other {
+                    Ok(_) => "Ok(ServerApp)".into(),
+                    Err(e) => format!("Err({e})"),
+                }
+            ),
         }
     }
 
@@ -1176,9 +1296,15 @@ obfs:
         assert!(!http.contains("not implemented"), "{http}");
         assert!(http.starts_with("outbounds.http.url:"), "{http}");
         let mf = server_field("masquerade: { type: file }");
-        assert!(mf.starts_with("masquerade.type:"), "{mf}");
+        assert!(!mf.contains("not implemented"), "{mf}");
+        assert!(mf.starts_with("masquerade.file.dir:"), "{mf}");
         let mp = server_field("masquerade: { type: proxy }");
-        assert!(mp.starts_with("masquerade.type:"), "{mp}");
+        assert!(!mp.contains("not implemented"), "{mp}");
+        assert!(mp.starts_with("masquerade.proxy.url:"), "{mp}");
+        let lh = server_field("masquerade: { listenHTTP: ':80' }");
+        assert!(!lh.contains("not implemented"), "{lh}");
+        let lhs = server_field("masquerade: { listenHTTPS: ':443' }");
+        assert!(!lhs.contains("not implemented"), "{lhs}");
         let realm = server_field("realm: {}");
         assert!(realm.starts_with("realm:"), "{realm}");
         let mimic = server_field("mimic: {}");
@@ -1353,6 +1479,92 @@ masquerade:
         let r = rt.block_on(hy_core::server::MasqHandler::handle(&h, "GET", "x", "/"));
         assert_eq!(r.status, 418);
         assert_eq!(r.body.as_ref(), b"aint nothin here");
+    }
+
+    #[test]
+    fn masq_yaml_file_proxy_listen_http_force_https() {
+        let y = parse_server_yaml(
+            r#"
+listen: 127.0.0.1:1
+tls: { cert: t.crt, key: t.key }
+auth: { type: password, password: test }
+masquerade:
+  type: file
+  file:
+    dir: /var/www
+  proxy:
+    url: https://example.com
+    rewriteHost: true
+    xForwarded: true
+    insecure: true
+  listenHTTP: 127.0.0.1:8080
+  listenHTTPS: 127.0.0.1:8443
+  forceHTTPS: true
+"#,
+        )
+        .unwrap();
+        let m = y.masquerade.as_ref().unwrap();
+        assert_eq!(m.ty.as_deref(), Some("file"));
+        assert_eq!(m.file.as_ref().unwrap().dir.as_deref(), Some("/var/www"));
+        let p = m.proxy.as_ref().unwrap();
+        assert_eq!(p.url.as_deref(), Some("https://example.com"));
+        assert_eq!(p.rewrite_host, Some(true));
+        assert_eq!(p.x_forwarded, Some(true));
+        assert_eq!(p.insecure, Some(true));
+        assert_eq!(m.listen_http.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(m.listen_https.as_deref(), Some("127.0.0.1:8443"));
+        assert_eq!(m.force_https, Some(true));
+    }
+
+    #[tokio::test]
+    async fn fill_file_masq_and_listen_http_alt_svc() {
+        let dir = std::env::temp_dir().join(format!("hy-masq-fill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"fill-body").unwrap();
+        let cert = dir.join("t.crt");
+        let key = dir.join("t.key");
+        // Minimal placeholders — fill only reads bytes; listenHTTP does not need valid TLS.
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")
+            .unwrap();
+
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+masquerade:
+  type: file
+  file:
+    dir: {}
+  listenHTTP: 127.0.0.1:0
+"#,
+            cert.display(),
+            key.display(),
+            dir.display()
+        ))
+        .unwrap();
+        let app = fill_server(&y).await.expect("fill_server masq file");
+        assert!(app.core.masq_handler.is_some());
+        let masq = app.masq_tcp.expect("masq_tcp");
+        let http_addr = app.masq_listen_http.expect("listenHTTP");
+        let bound = masq.listen_http(http_addr).await.unwrap();
+
+        let mut c = tokio::net::TcpStream::connect(bound).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        c.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        c.read_to_end(&mut resp).await.unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.contains("fill-body"), "{text}");
+        assert!(text.contains("h3=\":"), "{text}");
+        assert!(text.contains("ma=2592000"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

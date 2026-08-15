@@ -520,6 +520,7 @@ dependencies = [
  "ring",
  "rustls",
  "rustls-native-certs",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tokio",

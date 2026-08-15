@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use crate::listen::parse_listen;
 use hy_core::client::{Client, HyTcpConn};
 use hy_core::Error;
@@ -77,26 +78,27 @@ pub async fn run_udp(
     }
     let sock = Arc::new(sock);
     tracing::info!("udpForwarding listen {addr} -> {remote}");
-    let mut txs: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut txs: HashMap<SocketAddr, mpsc::Sender<Bytes>> = HashMap::new();
     let mut buf = vec![0u8; 65535];
     loop {
         let (n, src) = sock.recv_from(&mut buf).await.map_err(Error::Io)?;
         txs.retain(|_, tx| !tx.is_closed());
+        let pkt = Bytes::copy_from_slice(&buf[..n]);
         if let Some(tx) = txs.get(&src) {
-            let _ = tx.try_send(buf[..n].to_vec());
+            let _ = tx.try_send(pkt);
             continue;
         }
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(UDP_SESS_Q);
-        let _ = tx.try_send(buf[..n].to_vec());
+        let (tx, mut rx) = mpsc::channel::<Bytes>(UDP_SESS_Q);
+        let _ = tx.try_send(pkt);
         txs.insert(src, tx);
-        let mut udp = match client.udp().await {
+        let udp = match client.udp().await {
             Ok(u) => u,
             Err(_) => continue,
         };
         let remote = remote.to_string();
         let sock2 = Arc::clone(&sock);
         tokio::spawn(async move {
-            let (down_tx, mut down_rx) = mpsc::channel::<Vec<u8>>(UDP_SESS_Q);
+            let (down_tx, mut down_rx) = mpsc::channel::<Bytes>(UDP_SESS_Q);
             let writer = {
                 let sock_w = Arc::clone(&sock2);
                 tokio::spawn(async move {
@@ -107,15 +109,31 @@ pub async fn run_udp(
                     }
                 })
             };
-            // Fair select: do not starve downlink under uplink flood.
+            // Drain queued uplink with try_recv so one wakeup ships a burst.
+            async fn send_all(
+                udp: &dyn hy_core::client::HyUdpConn,
+                first: Bytes,
+                rx: &mut mpsc::Receiver<Bytes>,
+                remote: &str,
+            ) -> bool {
+                if udp.send(&first, remote).await.is_err() {
+                    return false;
+                }
+                while let Ok(more) = rx.try_recv() {
+                    if udp.send(&more, remote).await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            }
             while let Some(pkt) = rx.recv().await {
-                if udp.send(&pkt, &remote).await.is_err() {
+                if !send_all(&*udp, pkt, &mut rx, &remote).await {
                     break;
                 }
                 loop {
                     tokio::select! {
                         Some(more) = rx.recv() => {
-                            if udp.send(&more, &remote).await.is_err() {
+                            if !send_all(&*udp, more, &mut rx, &remote).await {
                                 let _ = udp.close().await;
                                 writer.abort();
                                 return;
@@ -124,7 +142,7 @@ pub async fn run_udp(
                         r = tokio::time::timeout(timeout, udp.receive()) => {
                             match r {
                                 Ok(Ok((payload, _))) => {
-                                    let _ = down_tx.try_send(payload);
+                                    let _ = down_tx.try_send(Bytes::from(payload));
                                 }
                                 Ok(Err(_)) => {
                                     let _ = udp.close().await;

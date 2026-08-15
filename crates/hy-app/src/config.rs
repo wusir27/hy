@@ -7,7 +7,7 @@ use hy_core::io::{DatagramIo, StdUdp, StdUdpFactory};
 use hy_core::server::{self as core_server};
 use hy_core::Error;
 use hy_extras::auth::{CommandAuth, HttpAuth, Password, UserPass};
-use hy_extras::obfs::ObfsSalamander;
+use hy_extras::obfs::{GeckoFactory, ObfsGecko, ObfsSalamander};
 use hy_extras::outbounds::{
     AclEngine, Adapter, Direct, DirectMode, DohResolver, HttpOutbound, PluggableOutbound,
     Socks5Outbound, SpeedtestHandler, StandardResolver, SystemResolver,
@@ -123,12 +123,20 @@ pub struct ObfsYaml {
     #[serde(rename = "type")]
     pub ty: Option<String>,
     pub salamander: Option<SalamanderYaml>,
-    pub gecko: Option<serde_yaml::Value>,
+    pub gecko: Option<GeckoYaml>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 pub struct SalamanderYaml {
     pub password: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct GeckoYaml {
+    pub password: Option<String>,
+    pub min_packet_size: Option<usize>,
+    pub max_packet_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -368,12 +376,6 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
             return Err(Error::config("tls.ech", "not implemented"));
         }
     }
-    if let Some(o) = &y.obfs {
-        if o.gecko.is_some() || o.ty.as_deref() == Some("gecko") {
-            return Err(Error::config("obfs.gecko", "not implemented"));
-        }
-    }
-
     let hop_interval = hop_interval_from_transport(y.transport.as_ref())?;
 
     let server = y.server.as_deref().ok_or_else(|| Error::config("Server", "must be set"))?;
@@ -424,6 +426,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
     cfg.fast_open = y.fast_open.unwrap_or(false);
 
     let mut salamander_psk: Option<Vec<u8>> = None;
+    let mut gecko_opts: Option<(Vec<u8>, usize, usize)> = None;
     if let Some(o) = &y.obfs {
         let ty = o.ty.as_deref().unwrap_or("plain");
         if ty == "salamander" {
@@ -433,12 +436,40 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
                 .and_then(|s| s.password.as_deref())
                 .ok_or_else(|| Error::config("obfs.salamander.password", "must be set"))?;
             salamander_psk = Some(psk.as_bytes().to_vec());
+        } else if ty == "gecko" {
+            let g = o
+                .gecko
+                .as_ref()
+                .ok_or_else(|| Error::config("obfs.gecko", "password is required"))?;
+            let psk = g
+                .password
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| Error::config("obfs.gecko", "password is required"))?;
+            let min = g.min_packet_size.unwrap_or(0);
+            let max = g.max_packet_size.unwrap_or(0);
+            // Apply defaults then validate (same rules as ObfsGecko::new).
+            let min_pkt = if min == 0 { 512 } else { min };
+            let max_pkt = if max == 0 { 1200 } else { max };
+            if min_pkt == 0 || min_pkt > max_pkt || max_pkt > 2048 {
+                return Err(Error::config("obfs.gecko", "invalid min/max packet size"));
+            }
+            if psk.as_bytes().len() < 4 {
+                return Err(Error::config("obfs.gecko", "must be at least 4 bytes"));
+            }
+            gecko_opts = Some((psk.as_bytes().to_vec(), min, max));
         } else if ty != "plain" {
             return Err(Error::config("obfs.type", format!("{ty} not implemented")));
         }
     }
 
-    if let Some(ports) = parsed.hop_ports {
+    if let Some((psk, min, max)) = gecko_opts {
+        let mut fac = GeckoFactory::new(psk, min, max);
+        if let Some(ports) = parsed.hop_ports {
+            fac = fac.with_hop(ports, hop_interval);
+        }
+        cfg.conn_factory = Some(Arc::new(fac));
+    } else if let Some(ports) = parsed.hop_ports {
         let mut fac = UdpHopFactory::new(ports, hop_interval);
         if let Some(psk) = salamander_psk.take() {
             fac = fac.with_salamander(psk);
@@ -621,12 +652,6 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
             }
         }
     }
-    if let Some(o) = &y.obfs {
-        if o.gecko.is_some() || o.ty.as_deref() == Some("gecko") {
-            return Err(Error::config("obfs.gecko", "not implemented"));
-        }
-    }
-
     let listen = y.listen.as_deref().unwrap_or(":443");
     let bind = parse_listen(listen, "listen")?;
     let mut io: Arc<dyn DatagramIo> = Arc::new(StdUdp::bind(bind).await.map_err(Error::Io)?);
@@ -638,6 +663,19 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
                 .and_then(|s| s.password.as_deref())
                 .ok_or_else(|| Error::config("obfs.salamander.password", "must be set"))?;
             io = Arc::new(ObfsSalamander::new(io, psk.as_bytes())?);
+        } else if o.ty.as_deref() == Some("gecko") {
+            let g = o
+                .gecko
+                .as_ref()
+                .ok_or_else(|| Error::config("obfs.gecko", "password is required"))?;
+            let psk = g
+                .password
+                .as_deref()
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| Error::config("obfs.gecko", "password is required"))?;
+            let min = g.min_packet_size.unwrap_or(0);
+            let max = g.max_packet_size.unwrap_or(0);
+            io = Arc::new(ObfsGecko::wrap(io, psk.as_bytes(), min, max)?);
         }
     }
 
@@ -1042,8 +1080,7 @@ disableUDP: true
 
     #[test]
     fn tc_cfg_03_client_rejects() {
-        assert_eq!(client_field("obfs: { gecko: {} }"), "obfs.gecko");
-        assert_eq!(client_field("obfs: { type: gecko }"), "obfs.gecko");
+        // gecko is implemented (P5.B2); must not reject as unimplemented.
         // hopInterval is implemented (P5.B1); must not reject.
         let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntransport:\n  udp:\n    hopInterval: 30s\n")
             .unwrap();
@@ -1055,6 +1092,61 @@ disableUDP: true
         assert_eq!(client_field("udpTProxy: {}"), "udpTProxy");
         assert_eq!(client_field("tcpRedirect: {}"), "tcpRedirect");
         assert_eq!(client_field("tls: { ech: {} }"), "tls.ech");
+    }
+
+    #[test]
+    fn fill_gecko_client_and_server() {
+        let y = parse_client_yaml(
+            r#"
+server: 127.0.0.1:18443
+auth: x
+obfs:
+  type: gecko
+  gecko:
+    password: secret
+"#,
+        )
+        .unwrap();
+        let app = fill_client(&y).expect("gecko client should fill");
+        assert!(app.core.conn_factory.is_some());
+
+        let dir = std::env::temp_dir().join(format!("hy-gecko-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("t.crt");
+        let key = dir.join("t.key");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n").unwrap();
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n").unwrap();
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+obfs:
+  type: gecko
+  gecko:
+    password: secret
+"#,
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let app = rt.block_on(fill_server(&y)).expect("gecko server should fill");
+        assert!(app.core.conn.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fill_gecko_invalid_minmax() {
+        assert_eq!(
+            client_field(
+                "obfs:\n  type: gecko\n  gecko:\n    password: secret\n    minPacketSize: 100\n    maxPacketSize: 50\n"
+            ),
+            "obfs.gecko"
+        );
     }
 
     fn server_field(extra: &str) -> String {

@@ -1,3 +1,4 @@
+mod acme;
 mod bps;
 mod config;
 mod inbound;

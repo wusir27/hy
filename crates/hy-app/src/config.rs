@@ -1,5 +1,6 @@
 //! Official camelCase YAML. Parse is loose; fill rejects v1-unimplemented keys.
 
+use crate::acme::{self, AcmeYaml};
 use crate::bps::parse_bps;
 use crate::listen::{parse_listen, parse_server};
 use hy_core::client::{self as core_client};
@@ -82,7 +83,7 @@ pub struct ServerYaml {
     pub speed_test: Option<bool>,
     pub traffic_stats: Option<TrafficStatsYaml>,
     pub masquerade: Option<MasqYaml>,
-    pub acme: Option<serde_yaml::Value>,
+    pub acme: Option<AcmeYaml>,
     pub ech: Option<serde_yaml::Value>,
     pub sniff: Option<SniffYaml>,
     pub realm: Option<serde_yaml::Value>,
@@ -597,8 +598,17 @@ pub struct ServerApp {
 }
 
 pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
-    if y.acme.is_some() {
-        return Err(Error::config("acme", "not implemented"));
+    match (&y.tls, &y.acme) {
+        (None, None) => {
+            return Err(Error::config("tls", "must set either tls or acme"));
+        }
+        (Some(_), Some(_)) => {
+            return Err(Error::config("tls", "cannot set both tls and acme"));
+        }
+        (None, Some(acme)) => {
+            acme::validate(acme)?;
+        }
+        (Some(_), None) => {}
     }
     if y.ech.is_some() {
         return Err(Error::config("ech", "not implemented"));
@@ -733,15 +743,29 @@ pub async fn fill_server(y: &ServerYaml) -> Result<ServerApp, Error> {
         }
     }
 
-    let tls = y.tls.as_ref().ok_or_else(|| Error::config("tls", "must be set"))?;
-    let cert = tls.cert.as_deref().ok_or_else(|| Error::config("tls.cert", "must be set"))?;
-    let key = tls.key.as_deref().ok_or_else(|| Error::config("tls.key", "must be set"))?;
-
     let mut cfg = core_server::Config::default();
-    cfg.tls.cert_pem = std::fs::read(cert).map_err(|e| Error::config("tls.cert", e.to_string()))?;
-    cfg.tls.key_pem = std::fs::read(key).map_err(|e| Error::config("tls.key", e.to_string()))?;
-    if let Some(ca) = tls.client_ca.as_deref() {
-        cfg.tls.client_ca_pem = std::fs::read(ca).map_err(|e| Error::config("tls.clientCA", e.to_string()))?;
+    if let Some(tls) = y.tls.as_ref() {
+        let cert = tls
+            .cert
+            .as_deref()
+            .ok_or_else(|| Error::config("tls.cert", "must be set"))?;
+        let key = tls
+            .key
+            .as_deref()
+            .ok_or_else(|| Error::config("tls.key", "must be set"))?;
+        cfg.tls.cert_pem =
+            std::fs::read(cert).map_err(|e| Error::config("tls.cert", e.to_string()))?;
+        cfg.tls.key_pem =
+            std::fs::read(key).map_err(|e| Error::config("tls.key", e.to_string()))?;
+        if let Some(ca) = tls.client_ca.as_deref() {
+            cfg.tls.client_ca_pem =
+                std::fs::read(ca).map_err(|e| Error::config("tls.clientCA", e.to_string()))?;
+        }
+    } else {
+        let acme = y.acme.as_ref().expect("acme Some after mutual-exclusion");
+        let (cert_pem, key_pem) = acme::obtain(acme).await?;
+        cfg.tls.cert_pem = cert_pem;
+        cfg.tls.key_pem = key_pem;
     }
     cfg.conn = Some(io);
     cfg.disable_udp = y.disable_udp.unwrap_or(false);
@@ -1283,8 +1307,10 @@ obfs:
 
     #[test]
     fn tc_cfg_04_server_rejects() {
+        // Helper also sets tls → mutual exclusion with acme.
         let acme = server_field("acme: {}");
-        assert!(acme.starts_with("acme:"), "{acme}");
+        assert!(acme.starts_with("tls:"), "{acme}");
+        assert!(acme.contains("cannot set both"), "{acme}");
         let ech = server_field("ech: {}");
         assert!(ech.starts_with("ech:"), "{ech}");
         // sniff.enable / resolver doh|https are implemented (P5.A1/A2) — must not reject as unimplemented.
@@ -1309,6 +1335,99 @@ obfs:
         assert!(realm.starts_with("realm:"), "{realm}");
         let mimic = server_field("mimic: {}");
         assert!(mimic.starts_with("mimic:"), "{mimic}");
+    }
+
+    fn server_field_no_tls(extra: &str) -> String {
+        let y = parse_server_yaml(&format!(
+            "listen: 127.0.0.1:0\nauth: {{ type: password, password: test }}\n{extra}\n"
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        match rt.block_on(fill_server(&y)) {
+            Err(Error::Config { field, reason }) => format!("{field}:{reason}"),
+            other => panic!(
+                "expected Config for extra={extra:?}, got {}",
+                match &other {
+                    Ok(_) => "Ok(ServerApp)".into(),
+                    Err(e) => format!("Err({e})"),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn acme_mutual_exclusion_and_validation() {
+        // both tls + acme
+        let both = server_field(
+            "acme:\n  domains: [example.com]\n  email: a@b.c\n  type: http\n",
+        );
+        assert!(both.starts_with("tls:"), "{both}");
+        assert!(both.contains("cannot set both"), "{both}");
+
+        // neither
+        let neither = server_field_no_tls("");
+        assert!(neither.starts_with("tls:"), "{neither}");
+        assert!(neither.contains("must set either"), "{neither}");
+
+        // dns type
+        let dns = server_field_no_tls(
+            "acme:\n  domains: [example.com]\n  email: a@b.c\n  type: dns\n  dns: { name: cloudflare, config: { cloudflare_api_token: x } }\n",
+        );
+        assert!(
+            dns.starts_with("acme.dns:") || dns.contains("unimplemented"),
+            "{dns}"
+        );
+
+        // empty domains
+        let empty = server_field_no_tls("acme:\n  domains: []\n  email: a@b.c\n  type: http\n");
+        assert!(empty.starts_with("acme.domains:"), "{empty}");
+        assert!(empty.contains("empty domains"), "{empty}");
+
+        let missing = server_field_no_tls("acme:\n  email: a@b.c\n  type: http\n");
+        assert!(missing.starts_with("acme.domains:"), "{missing}");
+        assert!(missing.contains("empty domains"), "{missing}");
+    }
+
+    #[test]
+    fn acme_cache_first_fill() {
+        let dir = std::env::temp_dir().join(format!(
+            "hy-acme-fill-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_bytes =
+            b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let key_bytes = b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n";
+        std::fs::write(dir.join("cert.pem"), cert_bytes).unwrap();
+        std::fs::write(dir.join("key.pem"), key_bytes).unwrap();
+
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+auth: {{ type: password, password: test }}
+acme:
+  domains: [example.com]
+  email: a@b.c
+  type: http
+  dir: {}
+"#,
+            dir.display()
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let app = rt.block_on(fill_server(&y)).expect("acme cache fill");
+        assert_eq!(app.core.tls.cert_pem, cert_bytes);
+        assert_eq!(app.core.tls.key_pem, key_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

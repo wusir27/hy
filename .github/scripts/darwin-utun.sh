@@ -152,21 +152,27 @@ start_client() {
   local cfg="$1" ifc="$2"
   wait_iface_gone "$ifc"
   : >"$CLIENT_LOG"
-  sudo -n env HYSTERIA_LOG_LEVEL=debug "$HY" client -c "$cfg" >"$CLIENT_LOG" 2>&1 &
+  sudo -n env HYSTERIA_LOG_LEVEL=debug "$HY" client -c "$cfg" 2>&1 | tee "$CLIENT_LOG" &
   CLIENT_PID=$!
   for _ in $(seq 1 60); do
     if grep -q "TUN listening" "$CLIENT_LOG"; then
       return 0
     fi
     if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
-      echo "client died ($ifc):"
+      echo "client died ($ifc). log:"
       cat "$CLIENT_LOG"
       ifconfig "$ifc" || true
+      echo "===== $cfg foreground 8s ====="
+      sudo -n env HYSTERIA_LOG_LEVEL=debug "$HY" client -c "$cfg" 2>&1 &
+      local fp=$!
+      sleep 8
+      sudo -n pkill -f "$HY client" 2>/dev/null || true
+      wait "$fp" 2>/dev/null || true
       return 1
     fi
     sleep 0.25
   done
-  echo "no TUN listening ($ifc):"
+  echo "no TUN listening ($ifc). log:"
   cat "$CLIENT_LOG"
   return 1
 }

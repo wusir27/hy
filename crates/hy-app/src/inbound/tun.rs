@@ -1116,6 +1116,14 @@ mod tests {
     }
 
     #[test]
+    fn darwin_v6_p2p_dst_official() {
+        let a: Ipv6Addr = "2001::ffff:ffff:ffff:fff1".parse().unwrap();
+        assert!(crate::inbound::tun_plan::darwin_v6_p2p_dst(a, 126).is_none());
+        let p = crate::inbound::tun_plan::darwin_v6_p2p_dst(a, 128).unwrap();
+        assert_eq!(p, Ipv6Addr::from(u128::from(a).wrapping_add(1)));
+    }
+
+    #[test]
     fn family_header_roundtrip_ipv4() {
         let mut ip = vec![0u8; 20];
         ip[0] = 0x45;

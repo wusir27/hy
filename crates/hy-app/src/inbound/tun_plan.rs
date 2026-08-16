@@ -199,6 +199,16 @@ pub fn parse_v4_prefix(s: &str) -> Result<(Ipv4Addr, u8), String> {
     Ok((a, bits))
 }
 
+
+/// Official sing-tun Darwin IPv6 dest: `/128` → addr+1, otherwise leave dest zeroed.
+pub fn darwin_v6_p2p_dst(addr: Ipv6Addr, bits: u8) -> Option<Ipv6Addr> {
+    if bits == 128 {
+        Some(Ipv6Addr::from(u128::from(addr).wrapping_add(1)))
+    } else {
+        None
+    }
+}
+
 pub fn parse_v6_prefix(s: &str) -> Result<(Ipv6Addr, u8), String> {
     let (a, bits) = if let Some((h, t)) = s.split_once('/') {
         (h.parse::<Ipv6Addr>().map_err(|e| e.to_string())?, t.parse::<u8>().map_err(|e| e.to_string())?)

@@ -2,8 +2,8 @@
 
 use crate::config::TunConfig;
 use crate::inbound::tun_plan::{
-    darwin_ipv4_install_list, darwin_ipv6_install_list, parse_utun_unit, parse_v4_prefix,
-    parse_v6_prefix,
+    darwin_ipv4_install_list, darwin_ipv6_install_list, darwin_v6_p2p_dst, parse_utun_unit,
+    parse_v4_prefix, parse_v6_prefix,
 };
 use std::io;
 use std::mem;
@@ -208,11 +208,10 @@ fn add_v6(name: &str, addr: Ipv6Addr, bits: u8) -> io::Result<()> {
         let mut nb = [0u8; 16];
         let raw = name.as_bytes();
         nb[..raw.len()].copy_from_slice(raw);
-        let mut dst = sockaddr_in6(addr);
-        if bits == 128 {
-            let next = Ipv6Addr::from(u128::from(addr).wrapping_add(1));
-            dst = sockaddr_in6(next);
-        }
+        let dst = match darwin_v6_p2p_dst(addr, bits) {
+            Some(p) => sockaddr_in6(p),
+            None => unsafe { mem::zeroed() },
+        };
         let mut req = IfAliasReq6 {
             name: nb,
             addr: sockaddr_in6(addr),

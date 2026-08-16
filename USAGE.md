@@ -93,7 +93,7 @@ outbound(address, protoPort, hijackIP)
 - 内置名：`direct`、`reject`、`default`
 - `address`：`*`、域名、`suffix:example.com`、CIDR、单 IP、通配
 - `protoPort`：`tcp`、`udp`、`tcp/443`、`udp/1000-2000`、`*`
-- `geoip:` / `geosite:` **未加载实库**，编译报错，不要写
+- `geoip:` / `geosite:` 吃 V2Ray `.dat`（`acl.geoip` / `acl.geosite`）。空路径按需下 Loyalsoldier（默认 7 天）。未知码启动失败，不会空匹配
 - `#` 注释；`file` 与 `inline` 互斥
 
 管道顺序锁死：**Speedtest → Resolver → ACL → (direct \| socks5 \| http)**。
@@ -583,7 +583,6 @@ socks5: { listen: 127.0.0.1:1080 }
 |---|---|
 | `tls.ech` / `ech` | 拒绝 |
 | ACME `type: dns` | `unimplemented` |
-| `geoip:` / `geosite:` 实库 | 编译失败，不要空匹配 |
 | 出站链式多跳 | 只有单跳 socks5/http |
 | Chrome 以外的 QUIC 指纹 | 不做 |
 
@@ -597,6 +596,7 @@ socks5: { listen: 127.0.0.1:1080 }
 | 只转一个端口 | `tcpForwarding` / `udpForwarding` |
 | 抗探测 | `obfs.salamander` 或 `gecko` + `masquerade` |
 | 限制网站 | `acl.inline` + `resolver` + 可选 `sniff` |
+| 按国家/站点分流 | 服务端 `acl.geoip` / `geosite` + `reject(geoip:cn)` / `direct(geosite:google)` |
 | 看用量 / 踢人 | `trafficStats` |
 | 测速 | `speedTest: true`，连 `@speedtest` |
 | 证书自动签 | `acme.type: http` 或 `tls`（要公网域名） |

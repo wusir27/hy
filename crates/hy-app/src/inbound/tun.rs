@@ -515,6 +515,79 @@ fn run_ip(args: &[&str]) -> std::io::Result<()> {
     Ok(())
 }
 
+
+#[cfg(target_os = "macos")]
+struct TunDev {
+    fd: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+}
+
+#[cfg(target_os = "macos")]
+impl TunDev {
+    fn new(fd: RawFd) -> std::io::Result<Self> {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(Self {
+            fd: tokio::io::unix::AsyncFd::new(owned)?,
+        })
+    }
+
+    async fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        loop {
+            let mut guard = self.fd.readable().await?;
+            match guard.try_io(|inner| {
+                let n = unsafe {
+                    libc::read(
+                        inner.get_ref().as_raw_fd(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(r) => return r,
+                Err(_would_block) => continue,
+            }
+        }
+    }
+
+    async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        while !data.is_empty() {
+            let mut guard = self.fd.writable().await?;
+            match guard.try_io(|inner| {
+                let n = unsafe {
+                    libc::write(
+                        inner.get_ref().as_raw_fd(),
+                        data.as_ptr() as *const libc::c_void,
+                        data.len(),
+                    )
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(0)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "tun write zero",
+                    ));
+                }
+                Ok(Ok(n)) => data = &data[n..],
+                Ok(Err(e)) => return Err(e),
+                Err(_would_block) => continue,
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 async fn run_dataplane(
     fd: RawFd,
@@ -530,8 +603,20 @@ async fn run_dataplane(
         unsafe { libc::close(fd) };
         return Err(Error::Io(e));
     }
-    let mut reader = unsafe { tokio::fs::File::from_raw_fd(fd) };
-    let writer = Arc::new(Mutex::new(unsafe { tokio::fs::File::from_raw_fd(write_fd) }));
+    #[cfg(target_os = "linux")]
+    let (mut reader, writer) = {
+        (
+            unsafe { tokio::fs::File::from_raw_fd(fd) },
+            Arc::new(Mutex::new(unsafe { tokio::fs::File::from_raw_fd(write_fd) })),
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let (reader, writer) = {
+        (
+            TunDev::new(fd).map_err(Error::Io)?,
+            Arc::new(Mutex::new(TunDev::new(write_fd).map_err(Error::Io)?)),
+        )
+    };
 
     let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(512);
     let writer_task = Arc::clone(&writer);

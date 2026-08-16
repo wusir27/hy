@@ -406,7 +406,7 @@ pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
 
 #[cfg(target_os = "macos")]
 pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
-    let fd = match tun_darwin::open_and_configure(&cfg) {
+    let fd = match crate::inbound::tun_darwin::open_and_configure(&cfg) {
         Ok(fd) => fd,
         Err(e) => {
             tracing::error!(error = %e, "failed to create tun interface");

@@ -6,10 +6,13 @@
 //! and returned — never swallowed.
 
 use crate::config::TunConfig;
+use crate::inbound::tun_plan::{prepend_family, strip_family};
+pub use crate::inbound::tun_plan::parse_utun_unit;
 use hy_core::client::{Client, HyTcpConn};
 use hy_core::Error;
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -201,7 +204,15 @@ fn build_ipv4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, payload: &[u8]) -> Vec<u8
     pkt
 }
 
-fn build_udp_packet(
+fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    match (src, dst) {
+        (SocketAddr::V4(s), SocketAddr::V4(d)) => build_udp_v4(s, d, payload),
+        (SocketAddr::V6(s), SocketAddr::V6(d)) => build_udp_v6(s, d, payload),
+        _ => Vec::new(),
+    }
+}
+
+fn build_udp_v4(
     src: SocketAddrV4,
     dst: SocketAddrV4,
     payload: &[u8],
@@ -218,6 +229,21 @@ fn build_udp_packet(
 }
 
 fn build_tcp_segment(
+    src: SocketAddr,
+    dst: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    match (src, dst) {
+        (SocketAddr::V4(s), SocketAddr::V4(d)) => build_tcp_v4(s, d, seq, ack, flags, payload),
+        (SocketAddr::V6(s), SocketAddr::V6(d)) => build_tcp_v6(s, d, seq, ack, flags, payload),
+        _ => Vec::new(),
+    }
+}
+
+fn build_tcp_v4(
     src: SocketAddrV4,
     dst: SocketAddrV4,
     seq: u32,
@@ -239,6 +265,118 @@ fn build_tcp_segment(
     build_ipv4(*src.ip(), *dst.ip(), IP_PROTO_TCP, &tcp)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ipv6Info {
+    pub src: Ipv6Addr,
+    pub dst: Ipv6Addr,
+    pub next: u8,
+    pub header_len: usize,
+    pub total_len: usize,
+}
+
+pub fn parse_ipv6(pkt: &[u8]) -> Option<Ipv6Info> {
+    if pkt.len() < 40 || pkt[0] >> 4 != 6 {
+        return None;
+    }
+    let plen = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+    let total = 40 + plen;
+    if pkt.len() < total {
+        return None;
+    }
+    let src = Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[8..24]).ok()?);
+    let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&pkt[24..40]).ok()?);
+    Some(Ipv6Info {
+        src,
+        dst,
+        next: pkt[6],
+        header_len: 40,
+        total_len: total,
+    })
+}
+
+pub fn parse_udp6(pkt: &[u8], ip: &Ipv6Info) -> Option<UdpInfo> {
+    parse_udp(
+        pkt,
+        &Ipv4Info {
+            src: Ipv4Addr::UNSPECIFIED,
+            dst: Ipv4Addr::UNSPECIFIED,
+            proto: IP_PROTO_UDP,
+            header_len: ip.header_len,
+            total_len: ip.total_len,
+        },
+    )
+}
+
+pub fn parse_tcp6(pkt: &[u8], ip: &Ipv6Info) -> Option<TcpInfo> {
+    parse_tcp(
+        pkt,
+        &Ipv4Info {
+            src: Ipv4Addr::UNSPECIFIED,
+            dst: Ipv4Addr::UNSPECIFIED,
+            proto: IP_PROTO_TCP,
+            header_len: ip.header_len,
+            total_len: ip.total_len,
+        },
+    )
+}
+
+fn ip6_pseudo(src: Ipv6Addr, dst: Ipv6Addr, next: u8, payload: &[u8]) -> u16 {
+    let mut p = Vec::with_capacity(40 + payload.len());
+    p.extend_from_slice(&src.octets());
+    p.extend_from_slice(&dst.octets());
+    p.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    p.extend_from_slice(&[0, 0, 0, next]);
+    p.extend_from_slice(payload);
+    internet_checksum(&p)
+}
+
+fn build_ipv6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, payload: &[u8]) -> Vec<u8> {
+    let mut pkt = vec![0u8; 40 + payload.len()];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+    pkt[6] = next;
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    pkt[40..].copy_from_slice(payload);
+    pkt
+}
+
+fn build_udp_v6(src: SocketAddrV6, dst: SocketAddrV6, payload: &[u8]) -> Vec<u8> {
+    let mut udp = vec![0u8; 8 + payload.len()];
+    udp[0..2].copy_from_slice(&src.port().to_be_bytes());
+    udp[2..4].copy_from_slice(&dst.port().to_be_bytes());
+    let ulen = (8 + payload.len()) as u16;
+    udp[4..6].copy_from_slice(&ulen.to_be_bytes());
+    udp[8..].copy_from_slice(payload);
+    let c = ip6_pseudo(*src.ip(), *dst.ip(), IP_PROTO_UDP, &udp);
+    let c = if c == 0 { 0xffff } else { c };
+    udp[6..8].copy_from_slice(&c.to_be_bytes());
+    build_ipv6(*src.ip(), *dst.ip(), IP_PROTO_UDP, &udp)
+}
+
+fn build_tcp_v6(
+    src: SocketAddrV6,
+    dst: SocketAddrV6,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut tcp = vec![0u8; 20 + payload.len()];
+    tcp[0..2].copy_from_slice(&src.port().to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst.port().to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    tcp[12] = 0x50;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&65535u16.to_be_bytes());
+    tcp[20..].copy_from_slice(payload);
+    let c = ip6_pseudo(*src.ip(), *dst.ip(), IP_PROTO_TCP, &tcp);
+    tcp[16..18].copy_from_slice(&c.to_be_bytes());
+    build_ipv6(*src.ip(), *dst.ip(), IP_PROTO_TCP, &tcp)
+}
+
 type PacketTx = mpsc::Sender<Vec<u8>>;
 
 #[cfg(target_os = "linux")]
@@ -254,7 +392,6 @@ pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
         }
     };
     if let Err(e) = configure_device(&cfg) {
-        // close fd
         let _ = unsafe { libc::close(fd) };
         tracing::error!(error = %e, "failed to create tun interface");
         return Err(Error::config(
@@ -264,10 +401,26 @@ pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
     }
 
     tracing::info!(iface = %cfg.name, "TUN listening");
-    run_dataplane(fd, cfg, client).await
+    run_dataplane(fd, cfg, client, false, false).await
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
+    let fd = match tun_darwin::open_and_configure(&cfg) {
+        Ok(fd) => fd,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to create tun interface");
+            return Err(Error::config(
+                "tun",
+                format!("failed to create tun interface: {e}"),
+            ));
+        }
+    };
+    tracing::info!(iface = %cfg.name, "TUN listening");
+    run_dataplane(fd, cfg, client, true, true).await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub async fn run(_cfg: TunConfig, _client: Arc<dyn Client>) -> Result<(), Error> {
     Err(Error::config("tun", "not supported"))
 }
@@ -362,8 +515,14 @@ fn run_ip(args: &[&str]) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-async fn run_dataplane(fd: RawFd, cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn run_dataplane(
+    fd: RawFd,
+    cfg: TunConfig,
+    client: Arc<dyn Client>,
+    family_hdr: bool,
+    enable_v6: bool,
+) -> Result<(), Error> {
     // Split into owned read/write via dup so concurrent writer task works.
     let write_fd = unsafe { libc::dup(fd) };
     if write_fd < 0 {
@@ -378,8 +537,9 @@ async fn run_dataplane(fd: RawFd, cfg: TunConfig, client: Arc<dyn Client>) -> Re
     let writer_task = Arc::clone(&writer);
     tokio::spawn(async move {
         while let Some(pkt) = pkt_rx.recv().await {
+            let wire = if family_hdr { prepend_family(&pkt) } else { pkt };
             let mut w = writer_task.lock().await;
-            let _ = w.write_all(&pkt).await;
+            let _ = w.write_all(&wire).await;
         }
     });
     // Keep writer alive for the read loop lifetime (channel closes on drop of pkt_tx at end).
@@ -391,8 +551,8 @@ async fn run_dataplane(fd: RawFd, cfg: TunConfig, client: Arc<dyn Client>) -> Re
         cfg.timeout
     };
 
-    let mut udp_txs: HashMap<(SocketAddrV4, SocketAddrV4), mpsc::Sender<Vec<u8>>> = HashMap::new();
-    let mut tcp_txs: HashMap<(SocketAddrV4, SocketAddrV4), mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut udp_txs: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut tcp_txs: HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut buf = vec![0u8; 65535];
 
     loop {
@@ -400,10 +560,16 @@ async fn run_dataplane(fd: RawFd, cfg: TunConfig, client: Arc<dyn Client>) -> Re
         if n == 0 {
             return Err(Error::Io(std::io::Error::other("tun device closed")));
         }
-        let pkt = &buf[..n];
-        let Some(ip) = parse_ipv4(pkt) else {
-            continue;
+        let raw = &buf[..n];
+        let pkt = if family_hdr {
+            match strip_family(raw) {
+                Some(p) => p,
+                None => continue,
+            }
+        } else {
+            raw
         };
+        if let Some(ip) = parse_ipv4(pkt) {
         match ip.proto {
             IP_PROTO_ICMP => {
                 // Official does not proxy ICMP.
@@ -412,8 +578,8 @@ async fn run_dataplane(fd: RawFd, cfg: TunConfig, client: Arc<dyn Client>) -> Re
                 let Some(udp) = parse_udp(pkt, &ip) else {
                     continue;
                 };
-                let src = SocketAddrV4::new(ip.src, udp.src_port);
-                let dst = SocketAddrV4::new(ip.dst, udp.dst_port);
+                let src = SocketAddr::V4(SocketAddrV4::new(ip.src, udp.src_port));
+                let dst = SocketAddr::V4(SocketAddrV4::new(ip.dst, udp.dst_port));
                 let payload = pkt[udp.payload_off..udp.payload_off + udp.payload_len].to_vec();
                 let key = (src, dst);
                 udp_txs.retain(|_, tx| !tx.is_closed());
@@ -434,8 +600,8 @@ async fn run_dataplane(fd: RawFd, cfg: TunConfig, client: Arc<dyn Client>) -> Re
                 let Some(tcp) = parse_tcp(pkt, &ip) else {
                     continue;
                 };
-                let src = SocketAddrV4::new(ip.src, tcp.src_port);
-                let dst = SocketAddrV4::new(ip.dst, tcp.dst_port);
+                let src = SocketAddr::V4(SocketAddrV4::new(ip.src, tcp.src_port));
+                let dst = SocketAddr::V4(SocketAddrV4::new(ip.dst, tcp.dst_port));
                 let key = (src, dst);
                 tcp_txs.retain(|_, tx| !tx.is_closed());
                 if let Some(tx) = tcp_txs.get(&key) {
@@ -460,6 +626,60 @@ async fn run_dataplane(fd: RawFd, cfg: TunConfig, client: Arc<dyn Client>) -> Re
             }
             _ => {}
         }
+        continue;
+        }
+        if enable_v6 {
+            if let Some(ip6) = parse_ipv6(pkt) {
+                match ip6.next {
+                    IP_PROTO_ICMP | 58 => {}
+                    IP_PROTO_UDP => {
+                        let Some(udp) = parse_udp6(pkt, &ip6) else { continue };
+                        let src = SocketAddr::V6(SocketAddrV6::new(ip6.src, udp.src_port, 0, 0));
+                        let dst = SocketAddr::V6(SocketAddrV6::new(ip6.dst, udp.dst_port, 0, 0));
+                        let payload = pkt[udp.payload_off..udp.payload_off + udp.payload_len].to_vec();
+                        let key = (src, dst);
+                        udp_txs.retain(|_, tx| !tx.is_closed());
+                        if let Some(tx) = udp_txs.get(&key) {
+                            let _ = tx.try_send(payload);
+                            continue;
+                        }
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+                        let _ = tx.try_send(payload);
+                        udp_txs.insert(key, tx);
+                        let client = Arc::clone(&client);
+                        let pkt_tx = pkt_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = udp_session(client, rx, pkt_tx, src, dst, idle).await;
+                        });
+                    }
+                    IP_PROTO_TCP => {
+                        let Some(tcp) = parse_tcp6(pkt, &ip6) else { continue };
+                        let src = SocketAddr::V6(SocketAddrV6::new(ip6.src, tcp.src_port, 0, 0));
+                        let dst = SocketAddr::V6(SocketAddrV6::new(ip6.dst, tcp.dst_port, 0, 0));
+                        let key = (src, dst);
+                        tcp_txs.retain(|_, tx| !tx.is_closed());
+                        if let Some(tx) = tcp_txs.get(&key) {
+                            let frame = pkt[ip6.header_len..ip6.total_len].to_vec();
+                            let _ = tx.try_send(frame);
+                            continue;
+                        }
+                        if tcp.flags & TCP_SYN == 0 || tcp.flags & TCP_ACK != 0 {
+                            continue;
+                        }
+                        let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
+                        let frame = pkt[ip6.header_len..ip6.total_len].to_vec();
+                        let _ = tx.try_send(frame);
+                        tcp_txs.insert(key, tx);
+                        let client = Arc::clone(&client);
+                        let pkt_tx = pkt_tx.clone();
+                        tokio::spawn(async move {
+                            let _ = tcp_session(client, rx, pkt_tx, src, dst, idle).await;
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -467,8 +687,8 @@ async fn udp_session(
     client: Arc<dyn Client>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
-    src: SocketAddrV4,
-    dst: SocketAddrV4,
+    src: SocketAddr,
+    dst: SocketAddr,
     idle: Duration,
 ) -> Result<(), Error> {
     let mut hy = client.udp().await?;
@@ -511,8 +731,8 @@ async fn tcp_session(
     client: Arc<dyn Client>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
-    client_addr: SocketAddrV4,
-    remote_addr: SocketAddrV4,
+    client_addr: SocketAddr,
+    remote_addr: SocketAddr,
     idle: Duration,
 ) -> Result<(), Error> {
     // Consume initial SYN.
@@ -584,8 +804,8 @@ async fn tcp_established(
     client: Arc<dyn Client>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
-    client_addr: SocketAddrV4,
-    remote_addr: SocketAddrV4,
+    client_addr: SocketAddr,
+    remote_addr: SocketAddr,
     mut snd_nxt: u32,
     mut rcv_nxt: u32,
     early: Vec<u8>,
@@ -755,6 +975,75 @@ mod tests {
         assert_eq!(tcp.dst_port, 443);
         assert_eq!(tcp.seq, 0xabcd);
         assert_eq!(tcp.flags & TCP_SYN, TCP_SYN);
+    }
+
+    #[test]
+    fn utun_name_scan() {
+        assert_eq!(crate::inbound::tun_plan::parse_utun_unit("utun123").unwrap(), 123);
+        assert_eq!(crate::inbound::tun_plan::parse_utun_unit("utun0").unwrap(), 0);
+        assert!(crate::inbound::tun_plan::parse_utun_unit("utun").is_err());
+        assert!(crate::inbound::tun_plan::parse_utun_unit("hy0").is_err());
+        assert!(crate::inbound::tun_plan::parse_utun_unit("utunX").is_err());
+        assert!(crate::inbound::tun_plan::parse_utun_unit("hytun").is_err());
+    }
+
+    #[test]
+    fn darwin_default_v4_is_eight_subranges() {
+        let p = crate::inbound::tun_plan::darwin_default_ipv4();
+        assert_eq!(p.len(), 8);
+        assert_eq!(p[0], (Ipv4Addr::new(1, 0, 0, 0), 8));
+        assert_eq!(p[7], (Ipv4Addr::new(128, 0, 0, 0), 1));
+        assert!(!p.iter().any(|(a, b)| *a == Ipv4Addr::UNSPECIFIED && *b == 0));
+    }
+
+    #[test]
+    fn exclude_diff_default_route_minus_host() {
+        let got = crate::inbound::tun_plan::darwin_ipv4_install_list(
+            &["0.0.0.0/0".into()],
+            &["1.2.3.4/32".into()],
+        )
+        .unwrap();
+        assert!(!got.is_empty());
+        let host = Ipv4Addr::new(1, 2, 3, 4);
+        for (a, bits) in &got {
+            let mask = if *bits == 0 { 0 } else { !0u32 << (32 - bits) };
+            let net = u32::from(*a) & mask;
+            assert_ne!(net, u32::from(host) & mask, "exclude leaked {a}/{bits}");
+        }
+        // 1.2.3.4 itself must not be covered
+        let covers = got.iter().any(|(a, bits)| {
+            let mask = if *bits == 0 { 0 } else { !0u32 << (32 - bits) };
+            (u32::from(*a) & mask) == (u32::from(host) & mask)
+        });
+        assert!(!covers);
+    }
+
+    #[test]
+    fn darwin_default_v6_and_exclude() {
+        let p = crate::inbound::tun_plan::darwin_default_ipv6();
+        assert_eq!(p.len(), 8);
+        let got = crate::inbound::tun_plan::darwin_ipv6_install_list(
+            &[],
+            &["2001:db8::1/128".into()],
+        )
+        .unwrap();
+        assert!(!got.is_empty());
+    }
+
+    #[test]
+    fn family_header_roundtrip_ipv4() {
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        ip[2..4].copy_from_slice(&20u16.to_be_bytes());
+        ip[8] = 64;
+        ip[9] = IP_PROTO_UDP;
+        ip[12..16].copy_from_slice(&[1, 2, 3, 4]);
+        ip[16..20].copy_from_slice(&[5, 6, 7, 8]);
+        let wire = prepend_family(&ip);
+        assert_eq!(&wire[..4], &[0, 0, 0, 2]);
+        let body = strip_family(&wire).expect("strip");
+        let parsed = parse_ipv4(body).expect("ipv4 after strip");
+        assert_eq!(parsed.src, Ipv4Addr::new(1, 2, 3, 4));
     }
 
     struct DummyClient;

@@ -502,6 +502,22 @@ tun:
 
 无特权时会打明确错误（如 `failed to create tun interface`），不会静默空转。ICMP 不代理。
 
+**Darwin utun**（P6.D1，对齐官方 Darwin CLI）：`name` 必须是 `utun` 加数字（`utun123`），不能写 `hy0`。创建走 `com.apple.net.utun_control`。配地址 / 加路由需要 `sudo`；失败要明确报错，不会留空接口。
+
+```yaml
+tun:
+  name: utun123
+  mtu: 1500
+  timeout: 5m
+  address:
+    ipv4: 100.100.100.101/30
+    ipv6: "2001::ffff:ffff:ffff:fff1/126"
+  route:
+    ipv4Exclude: ["<server-ip>/32"]   # 防环路；不自动填
+```
+
+没有 `route:` 只建接口、不加路由。有 `route:` 但没写 `ipv4` 时，官方 Darwin 会装 `1.0.0.0/8`…`128.0.0.0/1`（不含 `0.0.0.0/8`），不是直接改默认路由。显式 `route.ipv4: [0.0.0.0/0]` 才会装默认路由，这时必须自己 exclude 服务器地址。
+
 ### 场景 11 — Realm（NAT 穿透）
 
 `server` / `listen` 写成 Realm URL。本实现**不自带**信令服务，只做 hy 侧 STUN → 官方 `/v1/{id}` → punch。
@@ -584,6 +600,6 @@ socks5: { listen: 127.0.0.1:1080 }
 | 看用量 / 踢人 | `trafficStats` |
 | 测速 | `speedTest: true`，连 `@speedtest` |
 | 证书自动签 | `acme.type: http` 或 `tls`（要公网域名） |
-| 全局接管 | Linux `tun` / `tcpRedirect` / `tproxy` |
+| 全局接管 | Linux `tun` / `tcpRedirect` / `tproxy`；Darwin `tun.name: utunN`（要 sudo） |
 | NAT 两边直连 | Realm URL + 外部信令 |
 | 伪装成 Chrome QUIC | 默认 parrot；Linux 再加 `mimic` |

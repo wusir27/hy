@@ -6,3 +6,6 @@ pub mod tproxy;
 pub mod tproxy_tcp;
 pub mod tproxy_udp;
 pub mod tun;
+pub mod tun_plan;
+#[cfg(target_os = "macos")]
+pub mod tun_darwin;

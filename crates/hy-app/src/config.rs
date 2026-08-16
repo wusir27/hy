@@ -667,16 +667,22 @@ fn fill_tun(y: Option<&TunYaml>) -> Result<Option<TunConfig>, Error> {
     let Some(t) = y else {
         return Ok(None);
     };
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = t;
         return Err(Error::config("tun", "not supported"));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let name = t.name.as_deref().unwrap_or("").trim();
         if name.is_empty() {
             return Err(Error::config("tun.name", "name is empty"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if crate::inbound::tun::parse_utun_unit(name).is_err() {
+                return Err(Error::config("tun.name", "bad tun name"));
+            }
         }
         let mtu = match t.mtu {
             Some(0) | None => 1500,

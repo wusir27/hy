@@ -26,9 +26,9 @@ cleanup() {
   pkill -f "$HY client" 2>/dev/null
   pkill -f "$HY server" 2>/dev/null
   sleep 1
-  if ifconfig utun123 >/dev/null 2>&1; then
-    echo "WARN leftover utun123" >&2
-  fi
+  for ifc in utun123 utun124 utun125; do
+    ifconfig "$ifc" >/dev/null 2>&1 && echo "WARN leftover $ifc" >&2
+  done
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -58,7 +58,7 @@ server: 127.0.0.1:18443
 auth: test
 tls: { sni: localhost, insecure: true }
 tun:
-  name: utun123
+  name: utun124
   route:
     ipv4Exclude: ["127.0.0.0/8"]
 Y
@@ -68,7 +68,7 @@ server: 127.0.0.1:18443
 auth: test
 tls: { sni: localhost, insecure: true }
 tun:
-  name: utun123
+  name: utun125
   route:
     ipv4: ["1.1.1.1/32"]
 Y
@@ -134,59 +134,72 @@ echo "OK no-root create fails, no leftover"
 default_if() { route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}'; }
 BEFORE="$(default_if)"
 
-start_client() {
-  local cfg="$1"
-  : >"$CLIENT_LOG"
-  sudo -n "$HY" client -c "$cfg" >"$CLIENT_LOG" 2>&1 &
-  CLIENT_PID=$!
+wait_iface_gone() {
+  local ifc="$1"
   for _ in $(seq 1 40); do
+    if ! ifconfig "$ifc" >/dev/null 2>&1 && ! pgrep -f "$HY client" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "still present: $ifc / hy client"
+  ifconfig "$ifc" || true
+  pgrep -lf "$HY client" || true
+  return 1
+}
+
+start_client() {
+  local cfg="$1" ifc="$2"
+  wait_iface_gone "$ifc"
+  : >"$CLIENT_LOG"
+  # script -q gives a tty so tracing is line-buffered (file redirect is empty on fast death).
+  sudo -n script -q "$CLIENT_LOG" env HYSTERIA_LOG_LEVEL=debug "$HY" client -c "$cfg" >/dev/null 2>&1 &
+  CLIENT_PID=$!
+  for _ in $(seq 1 60); do
     if grep -q "TUN listening" "$CLIENT_LOG"; then
       return 0
     fi
     if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
-      echo "client died:"
+      echo "client died ($ifc):"
       cat "$CLIENT_LOG"
+      ifconfig "$ifc" || true
       return 1
     fi
     sleep 0.25
   done
-  echo "no TUN listening:"
+  echo "no TUN listening ($ifc):"
   cat "$CLIENT_LOG"
   return 1
 }
 
 stop_client() {
+  local ifc="$1"
+  sudo -n pkill -f "$HY client" 2>/dev/null || true
   if [[ -n "${CLIENT_PID}" ]]; then
     sudo -n kill "$CLIENT_PID" 2>/dev/null || true
     wait "$CLIENT_PID" 2>/dev/null || true
     CLIENT_PID=""
   fi
-  for _ in $(seq 1 20); do
-    ifconfig utun123 >/dev/null 2>&1 || return 0
-    sleep 0.2
-  done
-  echo "utun123 still up after stop"
-  ifconfig utun123 || true
-  return 1
+  wait_iface_gone "$ifc"
 }
 
-start_client client-c.yaml
+start_client client-c.yaml utun123
 ifconfig utun123
 ifconfig utun123 | grep -q "100.100.100.101"
 ifconfig utun123 | grep -qi "2001::ffff:ffff:ffff:fff1"
 AFTER="$(default_if)"
 test "$BEFORE" = "$AFTER"
-stop_client
+stop_client utun123
 if ifconfig utun123 >/dev/null 2>&1; then
   echo "C leftover utun123"
   exit 1
 fi
 echo "OK C: utun123 up with v4+official v6, default route unchanged, gone after exit"
 
-start_client client-e.yaml
+start_client client-e.yaml utun124
 AFTER="$(default_if)"
 test "$BEFORE" = "$AFTER"
-rts="$(netstat -rn -f inet | awk '/utun123/{print $1}')"
+rts="$(netstat -rn -f inet | awk '/utun124/{print $1}')"
 echo "$rts"
 # Darwin netstat: /8 → "1"/"126"; /1 → "128.0/1"; also "2/7", "64.0/3".
 has_net() {
@@ -212,17 +225,17 @@ has_net 126 8
 has_net 128 1
 echo "$rts" | awk '$1=="127" || $1=="127/8" || $1=="127.0/8" || $1=="127.0.0.0/8" {found=1} END{exit !found}' && { echo "127/8 exclude leaked"; exit 1; }
 echo "$rts" | awk '$1=="64/2" || $1=="64.0/2" || $1=="64.0.0.0/2" {found=1} END{exit !found}' && { echo "64/2 should have been split"; exit 1; }
-stop_client
-echo "OK E: Darwin ranges minus 127/8 on utun123, default route unchanged"
+stop_client utun124
+echo "OK E: Darwin ranges minus 127/8 on utun124, default route unchanged"
 
 set +e
-if start_client client-d.yaml; then
+if start_client client-d.yaml utun125; then
   if curl -sS --connect-timeout 8 --max-time 12 -o /dev/null -w "%{http_code}" https://1.1.1.1 | grep -qE '^[0-9]{3}$'; then
     echo "OK D optional TCP via utun to 1.1.1.1"
   else
     echo "WARN D optional TCP did not complete (not a gate)"
   fi
-  stop_client
+  stop_client utun125
 else
   echo "WARN D optional client did not start (not a gate)"
 fi

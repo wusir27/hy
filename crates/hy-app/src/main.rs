@@ -142,7 +142,7 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
             inbound::tproxy_udp::run(&listen, timeout, c).await
         }));
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(t) = app.tun.take() {
         let c = Arc::clone(&cli);
         tasks.push(tokio::spawn(async move { inbound::tun::run(t, c).await }));

@@ -188,16 +188,15 @@ AFTER="$(default_if)"
 test "$BEFORE" = "$AFTER"
 rts="$(netstat -rn -f inet | awk '/utun123/{print $1}')"
 echo "$rts"
-echo "$rts" | grep -Eq '(^|[[:space:]])1/8([[:space:]]|$)'
-echo "$rts" | grep -Eq '(^|[[:space:]])2/7([[:space:]]|$)'
-echo "$rts" | grep -Eq '(^|[[:space:]])4/6([[:space:]]|$)'
-echo "$rts" | grep -Eq '(^|[[:space:]])8/5([[:space:]]|$)'
-echo "$rts" | grep -Eq '(^|[[:space:]])16/4([[:space:]]|$)'
-echo "$rts" | grep -Eq '(^|[[:space:]])32/3([[:space:]]|$)'
-echo "$rts" | grep -Eq '(^|[[:space:]])64/2([[:space:]]|$)'
+# 8 default ranges minus 127.0.0.0/8 (cuts 64/2 into 64/3, 96/4, …).
+for cidr in 1/8 2/7 4/6 8/5 16/4 32/3 64/3 96/4 112/5 120/6 124/7 126/8; do
+  echo "$rts" | grep -Eq "(^|[[:space:]])${cidr}([[:space:]]|$)"
+done
 echo "$rts" | grep -Eq '128(\.0\.0\.0)?/1'
+echo "$rts" | grep -Eq '(^|[[:space:]])127/' && { echo "127/8 exclude leaked"; exit 1; }
+echo "$rts" | grep -Eq '(^|[[:space:]])64/2([[:space:]]|$)' && { echo "64/2 should have been split"; exit 1; }
 stop_client
-echo "OK E: Darwin 8 prefixes on utun123, default route unchanged"
+echo "OK E: Darwin ranges minus 127/8 on utun123, default route unchanged"
 
 set +e
 if start_client client-d.yaml; then

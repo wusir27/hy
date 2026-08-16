@@ -4,6 +4,8 @@ Protocol-compatible rewrite of [apernet/hysteria](https://github.com/apernet/hys
 
 **使用说明（参数、场景示例）：[USAGE.md](USAGE.md)**
 
+**不支持：** `tls.ech`（客户端）和 `ech` / `tls.ech.key`（服务端）。写了会拒绝启动，不会假装已藏 SNI。日常使用不需要这项。详见 [USAGE.md](USAGE.md)。
+
 | Crate | Role |
 |---|---|
 | `hy-core` | Protocol, QUIC, Client/Server |

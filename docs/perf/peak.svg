@@ -1,34 +1,34 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="720" height="360" font-family="sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="360" font-family="sans-serif">
 <rect width="100%" height="100%" fill="#fff"/>
-<text x="360.0" y="24" text-anchor="middle" font-size="15" font-weight="600">Peak throughput (sandbox, 6fa6a40)</text>
+<text x="400.0" y="24" text-anchor="middle" font-size="15" font-weight="600">Peak throughput (sandbox, 6fa6a40)</text>
 <line x1="56" y1="40" x2="56" y2="290" stroke="#333"/>
-<line x1="56" y1="290" x2="696" y2="290" stroke="#333"/>
-<line x1="56" y1="290.0" x2="696" y2="290.0" stroke="#eee"/>
+<line x1="56" y1="290" x2="776" y2="290" stroke="#333"/>
+<line x1="56" y1="290.0" x2="776" y2="290.0" stroke="#eee"/>
 <text x="48" y="294.0" text-anchor="end" font-size="11" fill="#555">0</text>
-<line x1="56" y1="227.5" x2="696" y2="227.5" stroke="#eee"/>
-<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">302</text>
-<line x1="56" y1="165.0" x2="696" y2="165.0" stroke="#eee"/>
-<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">604</text>
-<line x1="56" y1="102.5" x2="696" y2="102.5" stroke="#eee"/>
-<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">906</text>
-<line x1="56" y1="40.0" x2="696" y2="40.0" stroke="#eee"/>
-<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">1207</text>
+<line x1="56" y1="227.5" x2="776" y2="227.5" stroke="#eee"/>
+<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">334</text>
+<line x1="56" y1="165.0" x2="776" y2="165.0" stroke="#eee"/>
+<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">668</text>
+<line x1="56" y1="102.5" x2="776" y2="102.5" stroke="#eee"/>
+<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">1002</text>
+<line x1="56" y1="40.0" x2="776" y2="40.0" stroke="#eee"/>
+<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">1336</text>
 <text x="14" y="165.0" text-anchor="middle" font-size="11" fill="#555" transform="rotate(-90 14 165.0)">Mbps</text>
-<rect x="98.7" y="207.5" width="80.1" height="82.5" fill="#2563eb" rx="2"/>
-<text x="138.7" y="203.5" text-anchor="middle" font-size="10" fill="#333">398</text>
-<rect x="312.0" y="72.6" width="80.1" height="217.4" fill="#2563eb" rx="2"/>
-<text x="352.0" y="68.6" text-anchor="middle" font-size="10" fill="#333">1050</text>
-<rect x="525.3" y="74.6" width="80.1" height="215.4" fill="#2563eb" rx="2"/>
-<text x="565.4" y="70.6" text-anchor="middle" font-size="10" fill="#333">1040</text>
-<rect x="180.7" y="207.5" width="80.1" height="82.5" fill="#f59e0b" rx="2"/>
-<text x="220.7" y="203.5" text-anchor="middle" font-size="10" fill="#333">398</text>
-<rect x="394.1" y="122.0" width="80.1" height="168.0" fill="#f59e0b" rx="2"/>
-<text x="434.1" y="118.0" text-anchor="middle" font-size="10" fill="#333">811</text>
-<rect x="607.4" y="141.7" width="80.1" height="148.3" fill="#f59e0b" rx="2"/>
-<text x="647.4" y="137.7" text-anchor="middle" font-size="10" fill="#333">716</text>
-<text x="162.7" y="322" text-anchor="middle" font-size="11">Sal 400</text>
-<text x="376.0" y="322" text-anchor="middle" font-size="11">Sal unlimited</text>
-<text x="589.3" y="322" text-anchor="middle" font-size="11">No-Sal unlimited (prev)</text>
+<rect x="104.0" y="215.4" width="90.3" height="74.6" fill="#2563eb" rx="2"/>
+<text x="149.2" y="211.4" text-anchor="middle" font-size="10" fill="#333">398</text>
+<rect x="344.0" y="141.1" width="90.3" height="148.9" fill="#2563eb" rx="2"/>
+<text x="389.2" y="137.1" text-anchor="middle" font-size="10" fill="#333">796</text>
+<rect x="584.0" y="72.6" width="90.3" height="217.4" fill="#2563eb" rx="2"/>
+<text x="629.2" y="68.6" text-anchor="middle" font-size="10" fill="#333">1162</text>
+<rect x="196.3" y="215.4" width="90.3" height="74.6" fill="#f59e0b" rx="2"/>
+<text x="241.5" y="211.4" text-anchor="middle" font-size="10" fill="#333">399</text>
+<rect x="436.3" y="156.9" width="90.3" height="133.1" fill="#f59e0b" rx="2"/>
+<text x="481.5" y="152.9" text-anchor="middle" font-size="10" fill="#333">711</text>
+<rect x="676.3" y="121.1" width="90.3" height="168.9" fill="#f59e0b" rx="2"/>
+<text x="721.5" y="117.1" text-anchor="middle" font-size="10" fill="#333">903</text>
+<text x="176.0" y="322" text-anchor="middle" font-size="11">Sal 400</text>
+<text x="416.0" y="322" text-anchor="middle" font-size="11">Sal 800</text>
+<text x="656.0" y="322" text-anchor="middle" font-size="11">Sal unlimited</text>
 <rect x="56" y="338" width="12" height="12" fill="#2563eb"/>
 <text x="72" y="348" font-size="12">hy 0.2.0</text>
 <rect x="146" y="338" width="12" height="12" fill="#f59e0b"/>

@@ -1,0 +1,44 @@
+name: release-darwin
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: GitHub release tag to attach Darwin bins
+        required: true
+        default: v0.2.0
+
+permissions:
+  contents: write
+
+jobs:
+  darwin:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build Apple Silicon and Intel
+        run: |
+          cargo build --release -p hy-app --target aarch64-apple-darwin
+          cargo build --release -p hy-app --target x86_64-apple-darwin
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/hy dist/hy-darwin-arm64
+          cp target/x86_64-apple-darwin/release/hy dist/hy-darwin-amd64
+          chmod +x dist/hy-darwin-arm64 dist/hy-darwin-amd64
+          (cd dist && shasum -a 256 hy-darwin-arm64 hy-darwin-amd64 > SHA256SUMS-darwin)
+          git rev-parse HEAD
+          file dist/hy-darwin-arm64 dist/hy-darwin-amd64
+          dist/hy-darwin-arm64 version
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.tag }}" \
+            dist/hy-darwin-arm64 \
+            dist/hy-darwin-amd64 \
+            --clobber
+          gh release download "${{ inputs.tag }}" -p SHA256SUMS -O SHA256SUMS.old
+          { grep -v 'hy-darwin-' SHA256SUMS.old || true; cat dist/SHA256SUMS-darwin; } > SHA256SUMS
+          gh release upload "${{ inputs.tag }}" SHA256SUMS --clobber

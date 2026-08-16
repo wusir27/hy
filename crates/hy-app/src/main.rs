@@ -1,6 +1,7 @@
 mod acme;
 mod bps;
 mod config;
+mod geoloader;
 mod inbound;
 mod listen;
 mod mimic;

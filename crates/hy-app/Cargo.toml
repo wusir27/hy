@@ -26,6 +26,9 @@ rcgen = "=0.14.7"
 rustls-pemfile.workspace = true
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 socket2 = "0.6"
+ureq = { version = "=2.9.7", default-features = false, features = ["tls"] }
+# Newer url/idna pull ICU crates that require rustc 1.86+.
+url = "=2.5.2"
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 libc = "0.2"

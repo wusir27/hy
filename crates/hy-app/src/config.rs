@@ -16,6 +16,7 @@ use hy_extras::outbounds::{
     Socks5Outbound, SpeedtestHandler, StandardResolver, SystemResolver,
 };
 use hy_extras::acl::CompiledRuleSet;
+use crate::geoloader::{geo_interval_from_yaml, AppGeoLoader, DefaultHttp};
 use hy_extras::masq::{FileMasq, MasqTcpServer, NotFoundMasq, ProxyMasq, StringMasq};
 use hy_extras::sniff::{parse_port_union, Sniffer};
 use hy_extras::trafficlogger::TrafficStats;
@@ -314,6 +315,10 @@ pub struct AclYaml {
     pub file: Option<String>,
     #[serde(default, deserialize_with = "de_acl_inline")]
     pub inline: Option<String>,
+    pub geoip: Option<String>,
+    pub geosite: Option<String>,
+    #[serde(rename = "geoUpdateInterval")]
+    pub geo_update_interval: Option<String>,
 }
 
 fn de_acl_inline<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
@@ -1435,7 +1440,16 @@ fn build_outbound(y: &ServerYaml) -> Result<Arc<dyn hy_core::server::Outbound>, 
         } else {
             String::new()
         };
-        let rules = CompiledRuleSet::compile(&text).map_err(|e| Error::config("acl", e.to_string()))?;
+        let interval = geo_interval_from_yaml(acl.geo_update_interval.as_deref())?;
+        let loader = AppGeoLoader::new(
+            acl.geoip.clone(),
+            acl.geosite.clone(),
+            interval,
+            std::sync::Arc::new(DefaultHttp),
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        );
+        let rules = CompiledRuleSet::compile_with(&text, Some(&loader))
+            .map_err(|e| Error::config("acl", e.to_string()))?;
         Arc::new(AclEngine::new(rules, table))
     } else {
         default_ob
@@ -2278,6 +2292,10 @@ trafficStats: { listen: 127.0.0.1:19999, secret: s3cret }
         let inline = y.acl.as_ref().and_then(|a| a.inline.as_deref()).unwrap_or("");
         assert!(inline.contains("lmao(ok)"), "{inline}");
         assert!(inline.contains("kek(cringe,boba,tea)"), "{inline}");
+        let acl = y.acl.as_ref().expect("acl");
+        assert_eq!(acl.geoip.as_deref(), Some("some.dat"));
+        assert_eq!(acl.geosite.as_deref(), Some("some_site.dat"));
+        assert_eq!(acl.geo_update_interval.as_deref(), Some("168h"));
         let client = include_str!("/workspace/hysteria/app/cmd/client_test.yaml");
         let c = parse_client_yaml(client).expect("official client_test.yaml");
         assert_eq!(c.lazy, Some(true));
@@ -2626,6 +2644,117 @@ outbounds:
         let app = rt
             .block_on(fill_server(&y))
             .unwrap_or_else(|e| panic!("fill socks5/http: {e:?}"));
+        assert!(app.core.outbound.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn dummy_tls_dir(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "hy-geo-fill-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert = dir.join("t.crt");
+        let key = dir.join("t.key");
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+            .unwrap();
+        std::fs::write(&key, b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n")
+            .unwrap();
+        (dir, cert, key)
+    }
+
+    #[test]
+    fn fill_server_acl_no_geo_rules() {
+        let (dir, cert, key) = dummy_tls_dir("nogeo");
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+acl:
+  inline: "direct(*)\n"
+  geoUpdateInterval: 168h
+"#,
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        assert_eq!(
+            y.acl.as_ref().unwrap().geo_update_interval.as_deref(),
+            Some("168h")
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let app = rt
+            .block_on(fill_server(&y))
+            .unwrap_or_else(|e| panic!("fill no geo: {e:?}"));
+        assert!(app.core.outbound.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fill_server_acl_explicit_bad_geo_path() {
+        let (dir, cert, key) = dummy_tls_dir("badgeo");
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+acl:
+  inline: "reject(geoip:cn)\n"
+  geoip: /no/such/hy-geoip-missing.dat
+"#,
+            cert.display(),
+            key.display()
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        match rt.block_on(fill_server(&y)) {
+            Err(Error::Config { field, reason }) => {
+                assert_eq!(field, "acl");
+                assert!(!reason.is_empty(), "{reason}");
+            }
+            Ok(_) => panic!("expected acl config error, got success"),
+            Err(e) => panic!("expected acl config error, got {e:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fill_server_acl_explicit_good_dat() {
+        let (dir, cert, key) = dummy_tls_dir("goodgeo");
+        let dat = dir.join("geoip.dat");
+        std::fs::write(&dat, crate::geoloader::tiny_geoip_dat()).unwrap();
+        let y = parse_server_yaml(&format!(
+            r#"
+listen: 127.0.0.1:0
+tls: {{ cert: {}, key: {} }}
+auth: {{ type: password, password: test }}
+acl:
+  inline: "reject(geoip:cn)\ndirect(*)\n"
+  geoip: {}
+"#,
+            cert.display(),
+            key.display(),
+            dat.display()
+        ))
+        .unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let app = rt
+            .block_on(fill_server(&y))
+            .unwrap_or_else(|e| panic!("fill good geo: {e:?}"));
         assert!(app.core.outbound.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }

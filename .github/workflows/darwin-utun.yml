@@ -1,0 +1,32 @@
+name: darwin-utun
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/darwin-utun.yml"
+      - ".github/scripts/darwin-utun.sh"
+      - "crates/hy-app/src/inbound/tun.rs"
+      - "crates/hy-app/src/inbound/tun_darwin.rs"
+      - "crates/hy-app/src/inbound/tun_plan.rs"
+      - "crates/hy-app/src/inbound/mod.rs"
+      - "crates/hy-app/src/main.rs"
+      - "crates/hy-app/src/config.rs"
+      - "crates/hy-app/Cargo.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  p6-d1:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - name: Build hy
+        run: cargo build --release -p hy-app
+      - name: P6.D1 Darwin utun
+        run: bash .github/scripts/darwin-utun.sh

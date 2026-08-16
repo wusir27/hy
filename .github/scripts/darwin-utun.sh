@@ -188,31 +188,30 @@ AFTER="$(default_if)"
 test "$BEFORE" = "$AFTER"
 rts="$(netstat -rn -f inet | awk '/utun123/{print $1}')"
 echo "$rts"
-# Darwin netstat classful /8 is "1" / "126"; others keep "2/7", "64/3".
-has_dest() {
-  local tok
-  for tok in "$@"; do
-    echo "$rts" | awk -v t="$tok" '$1==t {found=1} END{exit !found}' && return 0
-  done
-  echo "missing route dest: $*"
-  return 1
+# Darwin netstat: /8 → "1"/"126"; /1 → "128.0/1"; also "2/7", "64.0/3".
+has_net() {
+  local a="$1" b="$2"
+  echo "$rts" | awk -v a="$a" -v b="$b" '
+    $1==a || $1==a"/"b || $1==a".0/"b || $1==a".0.0/"b || $1==a".0.0.0/"b { found=1 }
+    END { exit !found }
+  ' || { echo "missing ${a}/${b}"; return 1; }
 }
 # 8 default ranges minus 127.0.0.0/8 (cuts 64/2 into 64/3, 96/4, …).
-has_dest 1 1/8 1.0.0.0/8
-has_dest 2/7 2.0.0.0/7
-has_dest 4/6 4.0.0.0/6
-has_dest 8/5 8.0.0.0/5
-has_dest 16/4 16.0.0.0/4
-has_dest 32/3 32.0.0.0/3
-has_dest 64/3 64.0.0.0/3
-has_dest 96/4 96.0.0.0/4
-has_dest 112/5 112.0.0.0/5
-has_dest 120/6 120.0.0.0/6
-has_dest 124/7 124.0.0.0/7
-has_dest 126 126/8 126.0.0.0/8
-has_dest 128/1 128.0.0.0/1 128
-echo "$rts" | awk '$1=="127" || $1=="127/8" || $1=="127.0.0.0/8" {exit 0} END{exit 1}' && { echo "127/8 exclude leaked"; exit 1; }
-echo "$rts" | awk '$1=="64/2" || $1=="64.0.0.0/2" {exit 0} END{exit 1}' && { echo "64/2 should have been split"; exit 1; }
+has_net 1 8
+has_net 2 7
+has_net 4 6
+has_net 8 5
+has_net 16 4
+has_net 32 3
+has_net 64 3
+has_net 96 4
+has_net 112 5
+has_net 120 6
+has_net 124 7
+has_net 126 8
+has_net 128 1
+echo "$rts" | awk '$1=="127" || $1=="127/8" || $1=="127.0/8" || $1=="127.0.0.0/8" {found=1} END{exit !found}' && { echo "127/8 exclude leaked"; exit 1; }
+echo "$rts" | awk '$1=="64/2" || $1=="64.0/2" || $1=="64.0.0.0/2" {found=1} END{exit !found}' && { echo "64/2 should have been split"; exit 1; }
 stop_client
 echo "OK E: Darwin ranges minus 127/8 on utun123, default route unchanged"
 

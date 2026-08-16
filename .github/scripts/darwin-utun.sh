@@ -152,8 +152,7 @@ start_client() {
   local cfg="$1" ifc="$2"
   wait_iface_gone "$ifc"
   : >"$CLIENT_LOG"
-  # script -q gives a tty so tracing is line-buffered (file redirect is empty on fast death).
-  sudo -n script -q "$CLIENT_LOG" env HYSTERIA_LOG_LEVEL=debug "$HY" client -c "$cfg" >/dev/null 2>&1 &
+  sudo -n env HYSTERIA_LOG_LEVEL=debug "$HY" client -c "$cfg" >"$CLIENT_LOG" 2>&1 &
   CLIENT_PID=$!
   for _ in $(seq 1 60); do
     if grep -q "TUN listening" "$CLIENT_LOG"; then

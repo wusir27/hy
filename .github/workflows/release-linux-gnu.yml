@@ -1,0 +1,59 @@
+name: release-linux-gnu
+
+# P8.A1: gnu bins must target glibc 2.34 (Ubuntu 22.04 host is 2.35 — pin via zig).
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: GitHub release tag to attach Linux gnu bins
+        required: true
+        default: v0.3.1
+
+permissions:
+  contents: write
+
+jobs:
+  gnu:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85.0
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu,armv7-unknown-linux-gnueabihf,i686-unknown-linux-gnu
+      - name: Install zig + cargo-zigbuild
+        run: |
+          curl -fsSL -o /tmp/zig.tar.xz https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz
+          sudo tar -C /usr/local -xJf /tmp/zig.tar.xz
+          echo "/usr/local/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+          cargo install cargo-zigbuild --version 0.21.8
+      - name: Build gnu targets against glibc 2.34
+        run: |
+          cargo zigbuild --release -p hy-app --target x86_64-unknown-linux-gnu.2.34
+          cargo zigbuild --release -p hy-app --target aarch64-unknown-linux-gnu.2.34
+          cargo zigbuild --release -p hy-app --target armv7-unknown-linux-gnueabihf.2.34
+          cargo zigbuild --release -p hy-app --target i686-unknown-linux-gnu.2.34
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-gnu/release/hy dist/hy-linux-amd64
+          cp target/aarch64-unknown-linux-gnu/release/hy dist/hy-linux-arm64
+          cp target/armv7-unknown-linux-gnueabihf/release/hy dist/hy-linux-armv7
+          cp target/i686-unknown-linux-gnu/release/hy dist/hy-linux-386
+          chmod +x dist/hy-linux-*
+          dist/hy-linux-amd64 version
+          sh .github/scripts/check-glibc-max.sh dist/hy-linux-amd64 2.34
+          sh .github/scripts/check-glibc-max.sh dist/hy-linux-arm64 2.34
+          sh .github/scripts/check-glibc-max.sh dist/hy-linux-armv7 2.34
+          sh .github/scripts/check-glibc-max.sh dist/hy-linux-386 2.34
+          (cd dist && sha256sum hy-linux-amd64 hy-linux-arm64 hy-linux-armv7 hy-linux-386 > SHA256SUMS-gnu)
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ inputs.tag }}" \
+            dist/hy-linux-amd64 \
+            dist/hy-linux-arm64 \
+            dist/hy-linux-armv7 \
+            dist/hy-linux-386 \
+            --clobber
+          gh release download "${{ inputs.tag }}" -p SHA256SUMS -O SHA256SUMS.old || true
+          { grep -vE 'hy-linux-(amd64|arm64|armv7|386)$' SHA256SUMS.old || true; cat dist/SHA256SUMS-gnu; } > SHA256SUMS
+          gh release upload "${{ inputs.tag }}" SHA256SUMS --clobber

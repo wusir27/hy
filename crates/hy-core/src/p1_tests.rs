@@ -5,10 +5,17 @@
 use crate::client::{self, Config as ClientConfig, TlsConfig as ClientTls};
 use crate::error::Error;
 use crate::io::{DatagramIo, StdUdp};
+use crate::protocol::{read_tcp_response_bytes, write_tcp_request_bytes, STATUS_AUTH_OK};
 use crate::server::{
-    self, Config as ServerConfig, PasswordAuthenticator, TlsConfig as ServerTls,
+    self, Authenticator, Config as ServerConfig, PasswordAuthenticator, TlsConfig as ServerTls,
 };
+use crate::transport::h3_auth;
+use crate::transport::quic;
+use async_trait::async_trait;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -194,5 +201,161 @@ async fn p1_client_cert_mtls() {
     assert_eq!(&out, b"hello");
     let _ = tcp.close().await;
     let _ = cli.close().await;
+    let _ = server.close().await;
+}
+
+struct CountAuth {
+    password: String,
+    n: AtomicUsize,
+}
+
+#[async_trait]
+impl Authenticator for CountAuth {
+    async fn authenticate(&self, _addr: SocketAddr, auth: &str, _tx: u64) -> (bool, String) {
+        self.n.fetch_add(1, Ordering::SeqCst);
+        if auth == self.password {
+            (true, "user".into())
+        } else {
+            (false, String::new())
+        }
+    }
+}
+
+/// After auth, a second POST `/auth` on the same QUIC must return 233, H3 stays
+/// up, authenticator is not re-run, and 0x401 is still TCP.
+#[tokio::test]
+async fn p9_second_auth_same_quic_returns_233() {
+    let (cert_pem, key_pem) = self_signed_pem();
+    let (_echo_h, echo_addr) = echo_listener().await;
+
+    let udp = StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = udp.local_addr().unwrap();
+    assert_ne!(server_addr.port(), 443);
+
+    let counter = Arc::new(CountAuth {
+        password: "test".into(),
+        n: AtomicUsize::new(0),
+    });
+    let mut scfg = ServerConfig {
+        tls: ServerTls {
+            cert_pem,
+            key_pem,
+            ..Default::default()
+        },
+        conn: Some(Arc::new(udp)),
+        authenticator: Some(counter.clone()),
+        disable_udp: true,
+        ..Default::default()
+    };
+    scfg.fill().unwrap();
+    let server = server::serve(scfg).await.unwrap();
+    let server2 = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server2.serve().await;
+    });
+    tokio::task::yield_now().await;
+
+    let mut c = client_cfg(server_addr, "test");
+    c.verify_and_fill().unwrap();
+    let client_udp = StdUdp::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let (endpoint, _) = quic::build_client_endpoint(
+        Arc::new(client_udp),
+        &c.tls,
+        &c.quic,
+        &c.congestion.ty,
+        c.bandwidth.disable_loss_compensation,
+    )
+    .unwrap();
+    let conn = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("quic connect");
+
+    let h3_conn = h3_quinn::Connection::new(conn.clone());
+    let (mut driver, mut send_request) = h3::client::new(h3_conn).await.expect("h3 client");
+    tokio::spawn(async move {
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut driver).poll_close(cx)).await;
+    });
+
+    let (s1, r1) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+    )
+    .await
+    .expect("first auth timeout")
+    .expect("first auth");
+    assert_eq!(s1, STATUS_AUTH_OK);
+    assert_eq!(counter.n.load(Ordering::SeqCst), 1);
+
+    let get = http::Request::builder()
+        .method("GET")
+        .uri("https://example.com/")
+        .body(())
+        .unwrap();
+    let mut gs = send_request.send_request(get).await.expect("masq GET");
+    gs.finish().await.expect("masq finish");
+    let gresp = gs.recv_response().await.expect("masq resp");
+    assert_eq!(gresp.status().as_u16(), 404, "non-auth HTTP still masq");
+    while gs.recv_data().await.expect("masq body").is_some() {}
+
+    let (s2, r2) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "does-not-reauth", 0),
+    )
+    .await
+    .expect("second auth timeout")
+    .expect("second auth");
+    assert_eq!(s2, STATUS_AUTH_OK);
+    assert_eq!(r1, r2, "repeat 233 uses first AuthResponse fields");
+    assert_eq!(
+        counter.n.load(Ordering::SeqCst),
+        1,
+        "second /auth must not re-run authenticator"
+    );
+    assert!(
+        conn.close_reason().is_none(),
+        "QUIC must stay up after second /auth"
+    );
+
+    let echo_s = format!("{echo_addr}");
+    let (mut send, mut recv) = conn.open_bi().await.expect("tcp bi");
+    send.write_all(&write_tcp_request_bytes(&echo_s))
+        .await
+        .expect("tcp req");
+    send.write_all(b"hello").await.expect("payload");
+
+    let mut buf = Vec::new();
+    let (_ok, _msg, consumed) = loop {
+        let mut tmp = [0u8; 256];
+        let n = recv
+            .read(&mut tmp)
+            .await
+            .expect("tcp resp read")
+            .expect("eof before tcp response");
+        buf.extend_from_slice(&tmp[..n]);
+        match read_tcp_response_bytes(&buf) {
+            Ok(v) => break v,
+            Err(Error::Protocol(_)) if buf.len() < 8192 => continue,
+            Err(e) => panic!("tcp resp: {e}"),
+        }
+    };
+    assert!(_ok, "tcp response ok");
+    let mut rest = buf[consumed..].to_vec();
+    let mut got = rest.len();
+    while got < 5 {
+        let mut tmp = [0u8; 16];
+        let n = recv.read(&mut tmp).await.expect("echo").expect("eof echo");
+        rest.extend_from_slice(&tmp[..n]);
+        got = rest.len();
+    }
+    assert_eq!(&rest[..5], b"hello");
+    assert!(conn.close_reason().is_none());
+
+    let _ = send.finish();
+    drop(send_request);
+    conn.close(quinn::VarInt::from_u32(0x100), b"");
     let _ = server.close().await;
 }

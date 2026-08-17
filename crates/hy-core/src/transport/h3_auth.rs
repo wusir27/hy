@@ -1,4 +1,5 @@
-//! HTTP/3 `/auth` only. After 233, TCP/UDP leave h3.
+//! HTTP/3 `/auth` (and masq). The server keeps h3.accept() for the QUIC lifetime;
+//! TCP 0x401 is hijacked below h3, not by stopping accept.
 
 use crate::error::Error;
 use crate::protocol::{
@@ -9,7 +10,6 @@ use crate::server::{Authenticator, MasqHandler, MasqResponse};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 /// Client: POST `https://hysteria/auth` with Hysteria-Auth / CC-RX / Padding.
 ///
@@ -34,59 +34,8 @@ pub async fn client_auth(
         std::future::poll_fn(|cx| std::pin::Pin::new(&mut driver).poll_close(cx)).await;
     });
 
-    let req_body = AuthRequest {
-        auth: auth.to_string(),
-        rx: max_rx,
-    };
-    let headers = auth_request_to_headers(&req_body);
-
-    let request = async move {
-        let mut builder = Request::builder()
-            .method(Method::POST)
-            .uri(format!("https://{URL_HOST}{URL_PATH}"));
-        for (k, v) in &headers {
-            builder = builder.header(k.as_str(), v.as_str());
-        }
-        let req = builder
-            .body(())
-            .map_err(|e| Error::Connect(format!("build auth request: {e}")))?;
-
-        let mut stream = send_request
-            .send_request(req)
-            .await
-            .map_err(|e| Error::Connect(format!("send auth: {e}")))?;
-        stream
-            .finish()
-            .await
-            .map_err(|e| Error::Connect(format!("finish auth: {e}")))?;
-
-        let resp = stream
-            .recv_response()
-            .await
-            .map_err(|e| Error::Connect(format!("recv auth: {e}")))?;
-        let status = resp.status().as_u16();
-
-        let mut hdrs = Vec::new();
-        for (k, v) in resp.headers().iter() {
-            if let Ok(val) = v.to_str() {
-                hdrs.push((k.as_str().to_string(), val.to_string()));
-            }
-        }
-        // Drain body (auth has none meaningful).
-        while stream
-            .recv_data()
-            .await
-            .map_err(|e| Error::Connect(format!("auth body: {e}")))?
-            .is_some()
-        {}
-
-        let auth_resp = auth_response_from_headers(&hdrs);
-        // Keep send_request alive until here so Drop does not race the response.
-        Ok::<_, Error>((status, auth_resp, send_request))
-    };
-
-    match request.await {
-        Ok((status, auth_resp, send_request)) => Ok((
+    match post_hysteria_auth(&mut send_request, auth, max_rx).await {
+        Ok((status, auth_resp)) => Ok((
             status,
             auth_resp,
             ClientH3Hold {
@@ -101,10 +50,65 @@ pub async fn client_auth(
     }
 }
 
+/// POST `https://hysteria/auth` on an existing h3 client. Used by `client_auth`
+/// and by the same-QUIC second-auth integration test.
+pub(crate) async fn post_hysteria_auth(
+    send_request: &mut h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    auth: &str,
+    max_rx: u64,
+) -> Result<(u16, AuthResponse), Error> {
+    let req_body = AuthRequest {
+        auth: auth.to_string(),
+        rx: max_rx,
+    };
+    let headers = auth_request_to_headers(&req_body);
+
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(format!("https://{URL_HOST}{URL_PATH}"));
+    for (k, v) in &headers {
+        builder = builder.header(k.as_str(), v.as_str());
+    }
+    let req = builder
+        .body(())
+        .map_err(|e| Error::Connect(format!("build auth request: {e}")))?;
+
+    let mut stream = send_request
+        .send_request(req)
+        .await
+        .map_err(|e| Error::Connect(format!("send auth: {e}")))?;
+    stream
+        .finish()
+        .await
+        .map_err(|e| Error::Connect(format!("finish auth: {e}")))?;
+
+    let resp = stream
+        .recv_response()
+        .await
+        .map_err(|e| Error::Connect(format!("recv auth: {e}")))?;
+    let status = resp.status().as_u16();
+
+    let mut hdrs = Vec::new();
+    for (k, v) in resp.headers().iter() {
+        if let Ok(val) = v.to_str() {
+            hdrs.push((k.as_str().to_string(), val.to_string()));
+        }
+    }
+    while stream
+        .recv_data()
+        .await
+        .map_err(|e| Error::Connect(format!("auth body: {e}")))?
+        .is_some()
+    {}
+
+    Ok((status, auth_response_from_headers(&hdrs)))
+}
+
 /// Server: handle a single h3 request for auth (or masq).
 ///
-/// Returns `Some((auth_id, AuthResponse))` on success (233 written).
-/// Returns `None` if masq/404 was sent (connection stays unauthenticated).
+/// Returns `Some((auth_id, AuthResponse, cc))` on the **first** successful auth
+/// (233 written). Returns `None` if masq/404 was sent, or if the tunnel was
+/// already authenticated and a repeat POST `/auth` was answered 233.
 pub async fn server_handle_auth_request<S>(
     req: Request<()>,
     mut stream: h3::server::RequestStream<S, Bytes>,
@@ -115,6 +119,7 @@ pub async fn server_handle_auth_request<S>(
     server_max_rx: u64,
     disable_udp: bool,
     masq: Option<&dyn MasqHandler>,
+    already: Option<(&str, &AuthResponse)>,
 ) -> Result<Option<(String, AuthResponse, crate::congestion::CcChoice)>, Error>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -137,6 +142,11 @@ where
     let is_auth = is_hysteria_auth_request(method, &host, path);
 
     if is_auth {
+        if let Some((auth_id, resp)) = already {
+            tracing::info!(remote = %remote, id = %auth_id, "already authenticated");
+            send_auth_ok(&mut stream, resp).await?;
+            return Ok(None);
+        }
         let mut hdrs = Vec::new();
         for (k, v) in req.headers().iter() {
             if let Ok(val) = v.to_str() {
@@ -237,57 +247,6 @@ where
         .await
         .map_err(|e| Error::Quic(format!("finish masq: {e}")))?;
     Ok(())
-}
-
-/// Drive h3 on `conn` until one auth succeeds or the first request is masq'd.
-///
-/// On success, the `h3::server::Connection` is returned so the caller can keep it
-/// alive (its Drop would otherwise close the QUIC connection).
-pub async fn server_authenticate(
-    conn: quinn::Connection,
-    authenticator: Arc<dyn Authenticator>,
-    ignore_client_bw: bool,
-    server_max_tx: u64,
-    server_max_rx: u64,
-    disable_udp: bool,
-    masq: Option<Arc<dyn MasqHandler>>,
-) -> Result<
-    (
-        Option<(String, AuthResponse, crate::congestion::CcChoice)>,
-        h3::server::Connection<h3_quinn::Connection, Bytes>,
-    ),
-    Error,
-> {
-    let remote = conn.remote_address();
-    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
-        .await
-        .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
-
-    let resolver = match h3_conn.accept().await {
-        Ok(Some(r)) => r,
-        Ok(None) => return Ok((None, h3_conn)),
-        Err(e) => return Err(Error::Connect(format!("h3 accept: {e}"))),
-    };
-
-    let (req, stream) = resolver
-        .resolve_request()
-        .await
-        .map_err(|e| Error::Connect(format!("h3 resolve: {e}")))?;
-
-    let result = server_handle_auth_request(
-        req,
-        stream,
-        remote,
-        authenticator.as_ref(),
-        ignore_client_bw,
-        server_max_tx,
-        server_max_rx,
-        disable_udp,
-        masq.as_deref(),
-    )
-    .await?;
-
-    Ok((result, h3_conn))
 }
 
 fn is_hysteria_auth_request(method: &str, host: &str, path: &str) -> bool {

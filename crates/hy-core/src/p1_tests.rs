@@ -342,6 +342,123 @@ async fn p9_second_auth_same_quic_returns_233() {
     let _ = server.close().await;
 }
 
+/// Extra 0x00 uni before `POST /auth`: wrapper hides it from rust `h3`, so
+/// `accept()` still gets `/auth` and QUIC stays up.
+#[tokio::test]
+async fn p9_extra_control_uni_before_auth_still_gets_auth() {
+    let (cert_pem, key_pem) = self_signed_pem();
+    let (_echo_h, echo_addr) = echo_listener().await;
+
+    let udp = StdUdp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let server_addr = udp.local_addr().unwrap();
+    assert_ne!(server_addr.port(), 443);
+
+    let mut scfg = ServerConfig {
+        tls: ServerTls {
+            cert_pem,
+            key_pem,
+            ..Default::default()
+        },
+        conn: Some(Arc::new(udp)),
+        authenticator: Some(Arc::new(PasswordAuthenticator::new("test"))),
+        disable_udp: true,
+        ..Default::default()
+    };
+    scfg.fill().unwrap();
+    let server = server::serve(scfg).await.unwrap();
+    let server2 = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server2.serve().await;
+    });
+    tokio::task::yield_now().await;
+
+    let mut c = client_cfg(server_addr, "test");
+    c.verify_and_fill().unwrap();
+    let client_udp = StdUdp::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let (endpoint, _) = quic::build_client_endpoint(
+        Arc::new(client_udp),
+        &c.tls,
+        &c.quic,
+        &c.congestion.ty,
+        c.bandwidth.disable_loss_compensation,
+    )
+    .unwrap();
+    let conn = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("quic connect");
+
+    let h3_conn = h3_quinn::Connection::new(conn.clone());
+    let (mut driver, mut send_request) = h3::client::new(h3_conn)
+        .await
+        .expect("h3 client");
+    let drive = tokio::spawn(async move {
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut driver).poll_close(cx)).await;
+    });
+
+    // First 0x00 (and QPACK 0x02/0x03) already sent by h3::client::new.
+    // Second 0x00 must not make rust h3 close the connection.
+    let mut extra = conn.open_uni().await.expect("extra control uni");
+    extra.write_all(&[0x00]).await.expect("write extra 0x00");
+    let _ = extra.finish();
+
+    let (status, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+    )
+    .await
+    .expect("auth timeout")
+    .expect("auth");
+    assert_eq!(status, STATUS_AUTH_OK);
+    assert!(
+        conn.close_reason().is_none(),
+        "QUIC must stay up after extra 0x00 control uni: {:?}",
+        conn.close_reason()
+    );
+
+    let echo_s = format!("{echo_addr}");
+    let (mut send, mut recv) = conn.open_bi().await.expect("tcp bi");
+    send.write_all(&write_tcp_request_bytes(&echo_s))
+        .await
+        .expect("tcp req");
+    send.write_all(b"hello").await.expect("payload");
+
+    let mut buf = Vec::new();
+    let (_ok, _msg, consumed) = loop {
+        let mut tmp = [0u8; 256];
+        let n = recv
+            .read(&mut tmp)
+            .await
+            .expect("tcp resp read")
+            .expect("eof before tcp response");
+        buf.extend_from_slice(&tmp[..n]);
+        match read_tcp_response_bytes(&buf) {
+            Ok(v) => break v,
+            Err(Error::Protocol(_)) if buf.len() < 8192 => continue,
+            Err(e) => panic!("tcp resp: {e}"),
+        }
+    };
+    assert!(_ok, "tcp response ok");
+    let mut rest = buf[consumed..].to_vec();
+    let mut got = rest.len();
+    while got < 5 {
+        let mut tmp = [0u8; 16];
+        let n = recv.read(&mut tmp).await.expect("echo").expect("eof echo");
+        rest.extend_from_slice(&tmp[..n]);
+        got = rest.len();
+    }
+    assert_eq!(&rest[..5], b"hello");
+    assert!(conn.close_reason().is_none());
+
+    let _ = send.finish();
+    drive.abort();
+    conn.close(quinn::VarInt::from_u32(0x100), b"");
+    let _ = server.close().await;
+}
+
 /// After `server_authenticate` returns, `handle_conn` only `accept_bi` / `closed`
 /// (and optional uni drain). No `h3.accept()` in that loop.
 #[test]

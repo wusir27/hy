@@ -1,5 +1,6 @@
 //! HTTP/3 `/auth` only. After 233, TCP/UDP leave h3.
 
+use super::h3_uni::{AuthUniFilter, ServerAuthH3};
 use crate::error::Error;
 use crate::protocol::{
     auth_request_from_headers, auth_request_to_headers, auth_response_from_headers,
@@ -257,14 +258,16 @@ pub async fn server_authenticate(
 ) -> Result<
     (
         Option<(String, AuthResponse, crate::congestion::CcChoice)>,
-        h3::server::Connection<h3_quinn::Connection, Bytes>,
+        ServerAuthH3,
     ),
     Error,
 > {
     let remote = conn.remote_address();
-    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
-        .await
-        .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
+    let mut h3_conn = h3::server::Connection::new(AuthUniFilter::new(h3_quinn::Connection::new(
+        conn,
+    )))
+    .await
+    .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
 
     let resolver = match h3_conn.accept().await {
         Ok(Some(r)) => r,

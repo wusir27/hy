@@ -7,7 +7,7 @@ on:
       tag:
         description: GitHub release tag to attach Linux gnu bins
         required: true
-        default: v0.3.9
+        default: v0.3.10
 
 permissions:
   contents: write

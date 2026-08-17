@@ -22,7 +22,7 @@ hy server -c server.yaml
 hy version
 ```
 
-Release binaries: [v0.3.5](https://github.com/wusir27/hy/releases/tag/v0.3.5)（Linux 五套 + Darwin 两套）。
+Release binaries: [v0.3.6](https://github.com/wusir27/hy/releases/tag/v0.3.6)（Linux 五套 + Darwin 两套）。
 
 ---
 

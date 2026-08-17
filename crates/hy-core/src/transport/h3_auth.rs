@@ -126,18 +126,7 @@ where
 {
     let method = req.method().as_str();
     let path = req.uri().path();
-    let host = req
-        .uri()
-        .host()
-        .map(|h| h.to_string())
-        .or_else(|| {
-            req.headers()
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
-
+    let host = request_host(&req);
     let is_auth = is_hysteria_auth_request(method, &host, path);
 
     if is_auth {
@@ -245,8 +234,10 @@ where
 
 /// Drive h3 on `conn` until one auth succeeds or the first request is masq'd.
 ///
-/// Accepts **once**. After return the caller must not call `h3.accept()` again
-/// (Drop would close QUIC, so the `h3::server::Connection` is returned to hold).
+/// Accepts **once**. After a successful 233 the caller keeps this
+/// `h3::server::Connection` and continues `accept()` / `tcp_rx` in the same
+/// task (the wrapper is the only `accept_bi` owner). `tcp_rx` is the live
+/// 0x401 queue — not a one-shot drain.
 pub async fn server_authenticate(
     conn: quinn::Connection,
     authenticator: Arc<dyn Authenticator>,
@@ -259,12 +250,12 @@ pub async fn server_authenticate(
     (
         Option<(String, AuthResponse, crate::congestion::CcChoice)>,
         ServerAuthH3,
-        Vec<QueuedTcpBidi>,
+        tokio::sync::mpsc::UnboundedReceiver<QueuedTcpBidi>,
     ),
     Error,
 > {
     let remote = conn.remote_address();
-    let (tcp_tx, mut tcp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel();
     let mut h3_conn = h3::server::Connection::new(AuthUniFilter::with_tcp_tx(
         h3_quinn::Connection::new(conn),
         tcp_tx,
@@ -275,7 +266,7 @@ pub async fn server_authenticate(
     let resolver = match h3_conn.accept().await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return Ok((None, h3_conn, drain_queued_tcp(&mut tcp_rx)));
+            return Ok((None, h3_conn, tcp_rx));
         }
         Err(e) => return Err(Error::Connect(format!("h3 accept: {e}"))),
     };
@@ -298,17 +289,52 @@ pub async fn server_authenticate(
     )
     .await?;
 
-    Ok((result, h3_conn, drain_queued_tcp(&mut tcp_rx)))
+    Ok((result, h3_conn, tcp_rx))
 }
 
-fn drain_queued_tcp(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<QueuedTcpBidi>,
-) -> Vec<QueuedTcpBidi> {
-    let mut queued = Vec::new();
-    while let Ok(item) = rx.try_recv() {
-        queued.push(item);
+/// After first 233: another POST `/auth` writes 233 again (reuse `auth_resp`);
+/// any other HTTP is masquerade.
+pub async fn server_handle_authed_http<S>(
+    req: Request<()>,
+    mut stream: h3::server::RequestStream<S, Bytes>,
+    auth_resp: &AuthResponse,
+    masq: Option<&dyn MasqHandler>,
+) -> Result<(), Error>
+where
+    S: h3::quic::BidiStream<Bytes>,
+    <S as h3::quic::RecvStream>::Buf: bytes::Buf,
+{
+    let method = req.method().as_str();
+    let path = req.uri().path();
+    let host = request_host(&req);
+    if is_hysteria_auth_request(method, &host, path) {
+        send_auth_ok(&mut stream, auth_resp).await?;
+        return Ok(());
     }
-    queued
+    let masq_resp = if let Some(m) = masq {
+        m.handle(method, &host, path).await
+    } else {
+        MasqResponse {
+            status: 404,
+            headers: vec![],
+            body: Bytes::new(),
+        }
+    };
+    send_masq(&mut stream, masq_resp).await?;
+    Ok(())
+}
+
+fn request_host(req: &Request<()>) -> String {
+    req.uri()
+        .host()
+        .map(|h| h.to_string())
+        .or_else(|| {
+            req.headers()
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default()
 }
 
 fn is_hysteria_auth_request(method: &str, host: &str, path: &str) -> bool {

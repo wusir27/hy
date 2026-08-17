@@ -221,9 +221,8 @@ impl Authenticator for CountAuth {
     }
 }
 
-/// After first 233, H3 is left: extra non-0x401 bidi must not close QUIC, and
-/// hy↔hy TCP still works via native `accept_bi` (0x401). A second 233 is **not**
-/// required (P9.B product item cancelled).
+/// After first 233, extra non-0x401 bidi / late extra unis must not close QUIC,
+/// and a TCP `0x401` opened **after** 233 still reaches `handle_tcp`.
 #[tokio::test]
 async fn p9_second_auth_same_quic_returns_233() {
     let (cert_pem, key_pem) = self_signed_pem();
@@ -285,21 +284,25 @@ async fn p9_second_auth_same_quic_returns_233() {
     assert_eq!(status, STATUS_AUTH_OK);
     assert_eq!(counter.n.load(Ordering::SeqCst), 1);
 
-    // Extra bidi that is not 0x401: finish/stop that stream only; QUIC stays up.
+    // Extra bidi that is not 0x401: that stream only; QUIC stays up.
     let (mut junk_send, junk_recv) = conn.open_bi().await.expect("junk bi");
     junk_send.write_all(&[0x00]).await.expect("junk write");
     let _ = junk_send.finish();
     drop(junk_recv);
 
-    // A late uni after 233 must not close QUIC (H3 session ended; not fed to h3).
+    // Late extra unis after 233 must not close QUIC (wrapper hides them from h3).
     let mut junk_uni = conn.open_uni().await.expect("junk uni");
     junk_uni.write_all(&[0x00]).await.expect("junk uni write");
     let _ = junk_uni.finish();
+    let mut junk_enc = conn.open_uni().await.expect("junk encoder uni");
+    junk_enc.write_all(&[0x02]).await.expect("junk encoder write");
+    let _ = junk_enc.finish();
 
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert!(
         conn.close_reason().is_none(),
-        "QUIC must stay up after non-0x401 bidi / late uni"
+        "QUIC must stay up after non-0x401 bidi / late uni: {:?}",
+        conn.close_reason()
     );
 
     let echo_s = format!("{echo_addr}");
@@ -454,10 +457,124 @@ async fn p9_extra_qpack_decoder_uni_before_auth_still_gets_auth() {
     extra_h3_uni_before_auth_still_gets_auth(0x03).await;
 }
 
-/// After `server_authenticate` returns, `handle_conn` only `accept_bi` / `closed`.
-/// No `h3.accept()`, and no `recv.stop` / `RecvStream::stop` on late unis.
+/// After first 233, a new `0x401` (not queued during auth) reaches `handle_tcp`.
+#[tokio::test]
+async fn p9_tcp_request_after_233_reaches_handle_tcp() {
+    let (server, server_addr, echo_addr) = p9e_start_server(None).await;
+    let client_udp = StdUdp::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let mut c = client_cfg(server_addr, "test");
+    c.verify_and_fill().unwrap();
+    let (endpoint, _) = quic::build_client_endpoint(
+        Arc::new(client_udp),
+        &c.tls,
+        &c.quic,
+        &c.congestion.ty,
+        c.bandwidth.disable_loss_compensation,
+    )
+    .unwrap();
+    let conn = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("quic connect");
+
+    let (status, _auth, hold) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::client_auth(conn.clone(), "test", 0),
+    )
+    .await
+    .expect("first auth timeout")
+    .expect("first auth");
+    assert_eq!(status, STATUS_AUTH_OK);
+
+    let echo_s = format!("{echo_addr}");
+    let (mut send, mut recv) = conn.open_bi().await.expect("tcp bi after 233");
+    send.write_all(&write_tcp_request_bytes(&echo_s))
+        .await
+        .expect("tcp req");
+    send.write_all(b"hello").await.expect("payload");
+    tokio::time::timeout(Duration::from_secs(5), read_tcp_echo(&mut recv, b"hello"))
+        .await
+        .expect("0x401 after 233 must reach handle_tcp");
+    assert!(conn.close_reason().is_none());
+
+    let _ = send.finish();
+    drop(hold);
+    conn.close(quinn::VarInt::from_u32(0x100), b"");
+    let _ = server.close().await;
+}
+
+/// After first 233, another POST https://hysteria/auth on the same QUIC
+/// writes 233 (wrapper still polled).
+#[tokio::test]
+async fn p9_second_http_auth_after_233_returns_233() {
+    let (cert_pem, key_pem) = self_signed_pem();
+    let udp = StdUdp::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let server_addr = udp.local_addr().unwrap();
+    assert_ne!(server_addr.port(), 443);
+
+    let counter = Arc::new(CountAuth {
+        password: "test".into(),
+        n: AtomicUsize::new(0),
+    });
+    let mut scfg = ServerConfig {
+        tls: ServerTls {
+            cert_pem,
+            key_pem,
+            ..Default::default()
+        },
+        conn: Some(Arc::new(udp)),
+        authenticator: Some(counter.clone()),
+        disable_udp: true,
+        ..Default::default()
+    };
+    scfg.fill().unwrap();
+    let server = server::serve(scfg).await.unwrap();
+    let server2 = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server2.serve().await;
+    });
+    tokio::task::yield_now().await;
+
+    let (conn, mut send_request, drive) = p9e_h3_client(server_addr).await;
+    let (status, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+    )
+    .await
+    .expect("first auth timeout")
+    .expect("first auth");
+    assert_eq!(status, STATUS_AUTH_OK);
+    assert_eq!(counter.n.load(Ordering::SeqCst), 1);
+
+    let (status2, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+    )
+    .await
+    .expect("second auth timeout — h3.accept must keep polling after 233")
+    .expect("second auth");
+    assert_eq!(status2, STATUS_AUTH_OK);
+    assert!(
+        conn.close_reason().is_none(),
+        "QUIC must stay up after second /auth: {:?}",
+        conn.close_reason()
+    );
+
+    drive.abort();
+    conn.close(quinn::VarInt::from_u32(0x100), b"");
+    let _ = server.close().await;
+}
+
+/// After `server_authenticate` returns, `handle_conn` keeps polling the same
+/// wrapper (`h3.accept` / `h3_keep.accept`) plus `tcp_rx` and `conn.closed()`.
+/// Must not raw-accept bidis, and must not `recv.stop` / `RecvStream::stop`.
 #[test]
-fn p9_handle_conn_leaves_h3_after_authenticate() {
+fn p9_handle_conn_keeps_wrapper_accept_after_233() {
     let src = include_str!("server/impl.rs");
     let start = src.find("async fn handle_conn").expect("handle_conn");
     let rest = &src[start + 1..];
@@ -475,22 +592,24 @@ fn p9_handle_conn_leaves_h3_after_authenticate() {
         .expect("server_authenticate");
     let after = &fn_src[auth_at..];
     assert!(
-        after.contains("conn.accept_bi()"),
-        "after auth the loop must accept_bi"
+        after.contains("h3_keep.accept()") || after.contains("h3.accept()"),
+        "after 233 must keep polling h3.accept on the same wrapper"
+    );
+    assert!(
+        !after.contains("conn.accept_bi()"),
+        "after auth must not call raw accept (wrapper is the only owner)"
     );
     assert!(
         after.contains("conn.closed()"),
         "after auth the loop must wait on closed"
     );
     assert!(
-        !after.contains("h3_conn.accept()")
-            && !after.contains("h3.accept()")
-            && !after.contains("h3_conn.accept"),
-        "must not call h3.accept after authenticate returns"
-    );
-    assert!(
         !after.contains("recv.stop") && !after.contains("RecvStream::stop"),
         "must not stop/reset late unis after authenticate"
+    );
+    assert!(
+        !after.contains("let _h3"),
+        "must not spawn-hold h3 without polling"
     );
 }
 

@@ -12,6 +12,7 @@ use crate::protocol::{
     FRAME_TYPE_TCP_REQUEST,
 };
 use crate::transport::h3_auth;
+use crate::transport::h3_uni::QueuedTcpBidi;
 use crate::transport::quic;
 use async_trait::async_trait;
 use bytes::{Buf, Bytes};
@@ -119,7 +120,7 @@ struct ServerConnCfg {
 
 async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> {
     let remote = conn.remote_address();
-    let (auth, h3_keep, queued_tcp) = h3_auth::server_authenticate(
+    let (auth, mut h3_keep, mut tcp_rx) = h3_auth::server_authenticate(
         conn.clone(),
         cfg.authenticator.clone(),
         cfg.ignore_client_bw,
@@ -130,9 +131,9 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
     )
     .await?;
 
-    let Some((auth_id, _auth_resp, cc_choice)) = auth else {
+    let Some((auth_id, auth_resp, cc_choice)) = auth else {
         // Unauthenticated: drop queued 0x401 without outbound dial.
-        drop(queued_tcp);
+        drop(tcp_rx);
         let _ = conn.closed().await;
         drop(h3_keep);
         return Ok(());
@@ -147,13 +148,6 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
         tl.log_online_state(&auth_id, true);
     }
 
-    // Hold h3 so Drop does not close QUIC; do not resume the H3 accept loop.
-    let hold_conn = conn.clone();
-    tokio::spawn(async move {
-        let _h3 = h3_keep;
-        let _ = hold_conn.closed().await;
-    });
-
     // UDP SM (even when disable_udp — it silently drops datagrams).
     let _udp_sm = ServerUdpSm::start(
         conn.clone(),
@@ -167,15 +161,10 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
         cfg.disable_udp,
     );
 
-    // Drain 0x401 bidis peeked during authenticate. Forbidden before 233.
-    for (stream, prefix) in queued_tcp {
-        let (send, recv) = stream.split();
-        spawn_tcp(
-            TcpSend::H3(send),
-            TcpRecv::H3 {
-                leftover: prefix,
-                inner: recv,
-            },
+    // Drain 0x401 peeked during authenticate. Outbound only after 233.
+    while let Ok(queued) = tcp_rx.try_recv() {
+        spawn_queued_tcp(
+            queued,
             cfg.outbound.clone(),
             cfg.request_hook.clone(),
             remote,
@@ -186,42 +175,113 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
         );
     }
 
-    // Authenticated: leave H3. TCP is native accept_bi (frame 0x401).
-    // Late unis stay unread: stopping them resets the client's still-open
-    // QPACK/control, and the client treats that as a connection failure.
+    // Keep polling the same wrapper in this task. Hold is only so Drop does
+    // not close QUIC — a spawn that parks h3 without polling would eat 0x401.
     loop {
         tokio::select! {
-            bi = conn.accept_bi() => {
-                match bi {
-                    Ok((send, recv)) => {
-                        spawn_tcp(
-                            TcpSend::Quinn(send),
-                            TcpRecv::Quinn(recv),
-                            cfg.outbound.clone(),
-                            cfg.request_hook.clone(),
-                            remote,
-                            auth_id.clone(),
-                            cfg.event_logger.clone(),
-                            cfg.traffic_logger.clone(),
-                            conn.clone(),
-                        );
+            h3 = h3_keep.accept() => {
+                match h3 {
+                    Ok(Some(resolver)) => {
+                        let auth_resp = auth_resp.clone();
+                        let masq = cfg.masq.clone();
+                        tokio::spawn(async move {
+                            match resolver.resolve_request().await {
+                                Ok((req, stream)) => {
+                                    if let Err(e) = h3_auth::server_handle_authed_http(
+                                        req,
+                                        stream,
+                                        &auth_resp,
+                                        masq.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        tracing::info!(err = %e, "h3 later request");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::info!(err = %e, "h3 resolve");
+                                }
+                            }
+                        });
                     }
-                    Err(_) => break,
+                    Ok(None) => {
+                        tracing::info!("h3 accept ended");
+                        let err = conn.closed().await;
+                        emit_disconnect(&cfg, remote, &auth_id, &err);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::info!(err = %e, "h3 accept");
+                        let err = conn.closed().await;
+                        emit_disconnect(&cfg, remote, &auth_id, &err);
+                        break;
+                    }
+                }
+            }
+            queued = tcp_rx.recv() => {
+                if let Some(queued) = queued {
+                    spawn_queued_tcp(
+                        queued,
+                        cfg.outbound.clone(),
+                        cfg.request_hook.clone(),
+                        remote,
+                        auth_id.clone(),
+                        cfg.event_logger.clone(),
+                        cfg.traffic_logger.clone(),
+                        conn.clone(),
+                    );
                 }
             }
             err = conn.closed() => {
-                if let Some(ref ev) = cfg.event_logger {
-                    let e = Error::Closed(Some(err.to_string()));
-                    ev.disconnect(remote, &auth_id, Some(&e));
-                }
-                if let Some(ref tl) = cfg.traffic_logger {
-                    tl.log_online_state(&auth_id, false);
-                }
+                emit_disconnect(&cfg, remote, &auth_id, &err);
                 break;
             }
         }
     }
     Ok(())
+}
+
+fn emit_disconnect(
+    cfg: &ServerConnCfg,
+    remote: SocketAddr,
+    auth_id: &str,
+    err: &quinn::ConnectionError,
+) {
+    if let Some(ref ev) = cfg.event_logger {
+        let e = Error::Closed(Some(err.to_string()));
+        ev.disconnect(remote, auth_id, Some(&e));
+    }
+    if let Some(ref tl) = cfg.traffic_logger {
+        tl.log_online_state(auth_id, false);
+    }
+}
+
+fn spawn_queued_tcp(
+    queued: QueuedTcpBidi,
+    outbound: Arc<dyn Outbound>,
+    hook: Option<Arc<dyn super::RequestHook>>,
+    remote: SocketAddr,
+    auth_id: String,
+    ev: Option<Arc<dyn EventLogger>>,
+    tl: Option<Arc<dyn TrafficLogger>>,
+    c: Connection,
+) {
+    let (stream, prefix) = queued;
+    let (send, recv) = stream.split();
+    spawn_tcp(
+        TcpSend::H3(send),
+        TcpRecv::H3 {
+            leftover: prefix,
+            inner: recv,
+        },
+        outbound,
+        hook,
+        remote,
+        auth_id,
+        ev,
+        tl,
+        c,
+    );
 }
 
 fn spawn_tcp(
@@ -243,11 +303,13 @@ fn spawn_tcp(
 }
 
 enum TcpSend {
+    #[allow(dead_code)]
     Quinn(SendStream),
     H3(h3_quinn::SendStream<Bytes>),
 }
 
 enum TcpRecv {
+    #[allow(dead_code)]
     Quinn(RecvStream),
     H3 {
         leftover: Bytes,

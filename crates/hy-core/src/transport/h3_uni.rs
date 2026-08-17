@@ -1,16 +1,16 @@
-//! Auth-phase wrapper around `poll_accept_recv` and `poll_accept_bidi`.
+//! Wrapper around `poll_accept_recv` and `poll_accept_bidi`.
 //!
 //! Shadowrocket may open extra HTTP/3 unis before `POST /auth`: a second control
 //! (`0x00`), QPACK encoder (`0x02`), or QPACK decoder (`0x03`). rust `h3`
 //! correctly closing on a duplicate is left alone; this filter never hands the
 //! extra stream to h3, and never `Close`s QUIC.
 //!
-//! During the one authenticate accept, inbound bidis are peeked: `0x401`
-//! (Hysteria TCP) is queued for `handle_tcp` after 233, and is never given to
-//! h3. HTTP bytes are put back. After 233 we leave H3 (no `h3.accept()`).
+//! Inbound bidis are peeked: `0x401` (Hysteria TCP) is queued for `handle_tcp`
+//! (outbound only after 233) and is never given to h3. HTTP bytes are put back.
+//! After 233 the same wrapper is still polled (`h3.accept`); do not raw-accept.
 
-use bytes::{Buf, Bytes, BytesMut};
 use crate::protocol::FRAME_TYPE_TCP_REQUEST;
+use bytes::{Buf, Bytes, BytesMut};
 use h3::quic::{
     self, ConnectionErrorIncoming, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming,
     StreamId,
@@ -24,11 +24,14 @@ const STREAM_TYPE_CONTROL: u64 = 0x00;
 const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
 /// QPACK decoder stream (RFC 9204).
 const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
+/// HTTP/3 HEADERS frame (RFC 9114). Request streams start with this.
+/// A DATA (0x00) first frame makes rust `h3` close QUIC (`H3_FRAME_UNEXPECTED`).
+const H3_FRAME_HEADERS: u64 = 0x01;
 
 /// A `0x401` bidi hijacked during authenticate. Do not dial until 233.
 pub type QueuedTcpBidi = (h3_quinn::BidiStream<Bytes>, Bytes);
 
-/// h3 server connection used for a single `/auth` accept (hold after 233).
+/// h3 server connection used for `/auth` and kept as the only bidi owner after 233.
 pub type ServerAuthH3 = h3::server::Connection<AuthUniFilter<h3_quinn::Connection>, Bytes>;
 
 /// Connection given to `h3::server::Connection::new` during authenticate.
@@ -343,9 +346,18 @@ where
                     if ty == FRAME_TYPE_TCP_REQUEST {
                         tracing::info!(
                             stream_id = %RecvStream::recv_id(&stream),
-                            "auth-phase queued 0x401"
+                            "queued 0x401"
                         );
                         let _ = self.tcp_tx.send((stream, buf.freeze()));
+                        continue;
+                    }
+                    if ty != H3_FRAME_HEADERS {
+                        tracing::info!(
+                            stream_id = %RecvStream::recv_id(&stream),
+                            frame = ty,
+                            "dropping non-http bidi"
+                        );
+                        drop(stream);
                         continue;
                     }
                     return Poll::Ready(Ok(restore_bidi(stream, buf.freeze())));
@@ -893,5 +905,15 @@ mod tests {
         assert!(got.is_empty(), "0x401 must not enter resolve_request");
         let (_, prefix) = tcp_rx.try_recv().expect("queued before /auth");
         assert_eq!(&prefix[..], &[0x44, 0x01]);
+    }
+
+    #[test]
+    fn non_http_non_tcp_bidi_is_not_given_to_h3() {
+        let conn = MockConn::with_bidi(&[(0, &[0x00]), (4, &[0x01, 0x40])]);
+        let (mut filter, mut tcp_rx) = AuthUniFilter::new(conn);
+        let mut got = drain_bidi(&mut filter);
+        assert_eq!(got.len(), 1, "0x00 bidi must not be returned to h3");
+        assert_eq!(first_bytes_bidi(&mut got[0]), &[0x01, 0x40]);
+        assert!(tcp_rx.try_recv().is_err());
     }
 }

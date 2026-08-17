@@ -405,7 +405,7 @@ fn finish_client_auth(
         .map_err(|e| Error::config("tls.clientCertificate", e.to_string()))
 }
 
-fn build_rustls_client(tls: &ClientTlsConfig) -> Result<RustlsClientConfig, Error> {
+pub(crate) fn build_rustls_client(tls: &ClientTlsConfig) -> Result<RustlsClientConfig, Error> {
     let builder = rustls::ClientConfig::builder();
     let mut cfg = if tls.insecure_skip_verify {
         finish_client_auth(
@@ -454,7 +454,7 @@ fn load_root_store(tls: &ClientTlsConfig) -> Result<rustls::RootCertStore, Error
     Ok(roots)
 }
 
-fn build_rustls_server(tls: &ServerTlsConfig) -> Result<RustlsServerConfig, Error> {
+pub(crate) fn build_rustls_server(tls: &ServerTlsConfig) -> Result<RustlsServerConfig, Error> {
     let certs = load_certs(&tls.cert_pem)?;
     let key = load_private_key(&tls.key_pem)?;
     let builder = RustlsServerConfig::builder();
@@ -479,7 +479,7 @@ fn build_rustls_server(tls: &ServerTlsConfig) -> Result<RustlsServerConfig, Erro
             .map_err(|e| Error::config("TLSConfig", e.to_string()))?
     };
     cfg.alpn_protocols = vec![ALPN_H3.to_vec()];
-    cfg.max_early_data_size = u32::MAX;
+    cfg.max_early_data_size = 0;
     Ok(cfg)
 }
 
@@ -634,4 +634,39 @@ fn hex_encode(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0xf) as usize] as char);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::TlsConfig as ClientTls;
+    use crate::server::TlsConfig as ServerTls;
+
+    fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        (
+            certified.cert.pem().into_bytes(),
+            certified.key_pair.serialize_pem().into_bytes(),
+        )
+    }
+
+    #[test]
+    fn server_0rtt_disabled_client_early_data_still_enabled() {
+        ensure_crypto_provider();
+        let (cert_pem, key_pem) = self_signed_pem();
+        let server_cfg = build_rustls_server(&ServerTls {
+            cert_pem,
+            key_pem,
+            ..Default::default()
+        })
+        .expect("server rustls config");
+        assert_eq!(server_cfg.max_early_data_size, 0);
+
+        let client_cfg = build_rustls_client(&ClientTls {
+            insecure_skip_verify: true,
+            ..Default::default()
+        })
+        .expect("client rustls config");
+        assert!(client_cfg.enable_early_data);
+    }
 }

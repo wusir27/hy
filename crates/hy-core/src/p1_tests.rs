@@ -342,10 +342,9 @@ async fn p9_second_auth_same_quic_returns_233() {
     let _ = server.close().await;
 }
 
-/// Extra 0x00 uni before `POST /auth`: wrapper hides it from rust `h3`, so
-/// `accept()` still gets `/auth` and QUIC stays up.
-#[tokio::test]
-async fn p9_extra_control_uni_before_auth_still_gets_auth() {
+/// Extra HTTP/3 uni of `ty` before `POST /auth`: wrapper hides it from rust
+/// `h3`, so `accept()` still gets `/auth` and QUIC stays up.
+async fn extra_h3_uni_before_auth_still_gets_auth(ty: u8) {
     let (cert_pem, key_pem) = self_signed_pem();
     let (_echo_h, echo_addr) = echo_listener().await;
 
@@ -399,10 +398,10 @@ async fn p9_extra_control_uni_before_auth_still_gets_auth() {
         std::future::poll_fn(|cx| std::pin::Pin::new(&mut driver).poll_close(cx)).await;
     });
 
-    // First 0x00 (and QPACK 0x02/0x03) already sent by h3::client::new.
-    // Second 0x00 must not make rust h3 close the connection.
-    let mut extra = conn.open_uni().await.expect("extra control uni");
-    extra.write_all(&[0x00]).await.expect("write extra 0x00");
+    // First 0x00 / 0x02 / 0x03 already sent by h3::client::new.
+    // A second uni of the same type must not make rust h3 close the connection.
+    let mut extra = conn.open_uni().await.expect("extra uni");
+    extra.write_all(&[ty]).await.expect("write extra uni type");
     let _ = extra.finish();
 
     let (status, _) = tokio::time::timeout(
@@ -415,7 +414,7 @@ async fn p9_extra_control_uni_before_auth_still_gets_auth() {
     assert_eq!(status, STATUS_AUTH_OK);
     assert!(
         conn.close_reason().is_none(),
-        "QUIC must stay up after extra 0x00 control uni: {:?}",
+        "QUIC must stay up after extra 0x{ty:02x} uni: {:?}",
         conn.close_reason()
     );
 
@@ -425,32 +424,9 @@ async fn p9_extra_control_uni_before_auth_still_gets_auth() {
         .await
         .expect("tcp req");
     send.write_all(b"hello").await.expect("payload");
-
-    let mut buf = Vec::new();
-    let (_ok, _msg, consumed) = loop {
-        let mut tmp = [0u8; 256];
-        let n = recv
-            .read(&mut tmp)
-            .await
-            .expect("tcp resp read")
-            .expect("eof before tcp response");
-        buf.extend_from_slice(&tmp[..n]);
-        match read_tcp_response_bytes(&buf) {
-            Ok(v) => break v,
-            Err(Error::Protocol(_)) if buf.len() < 8192 => continue,
-            Err(e) => panic!("tcp resp: {e}"),
-        }
-    };
-    assert!(_ok, "tcp response ok");
-    let mut rest = buf[consumed..].to_vec();
-    let mut got = rest.len();
-    while got < 5 {
-        let mut tmp = [0u8; 16];
-        let n = recv.read(&mut tmp).await.expect("echo").expect("eof echo");
-        rest.extend_from_slice(&tmp[..n]);
-        got = rest.len();
-    }
-    assert_eq!(&rest[..5], b"hello");
+    tokio::time::timeout(Duration::from_secs(5), read_tcp_echo(&mut recv, b"hello"))
+        .await
+        .expect("tcp echo");
     assert!(conn.close_reason().is_none());
 
     let _ = send.finish();
@@ -459,17 +435,40 @@ async fn p9_extra_control_uni_before_auth_still_gets_auth() {
     let _ = server.close().await;
 }
 
-/// After `server_authenticate` returns, `handle_conn` only `accept_bi` / `closed`
-/// (and optional uni drain). No `h3.accept()` in that loop.
+/// Extra 0x00 uni before `POST /auth`: wrapper hides it from rust `h3`, so
+/// `accept()` still gets `/auth` and QUIC stays up.
+#[tokio::test]
+async fn p9_extra_control_uni_before_auth_still_gets_auth() {
+    extra_h3_uni_before_auth_still_gets_auth(0x00).await;
+}
+
+/// Extra 0x02 QPACK encoder uni before `POST /auth`: not given to h3.
+#[tokio::test]
+async fn p9_extra_qpack_encoder_uni_before_auth_still_gets_auth() {
+    extra_h3_uni_before_auth_still_gets_auth(0x02).await;
+}
+
+/// Extra 0x03 QPACK decoder uni before `POST /auth`: not given to h3.
+#[tokio::test]
+async fn p9_extra_qpack_decoder_uni_before_auth_still_gets_auth() {
+    extra_h3_uni_before_auth_still_gets_auth(0x03).await;
+}
+
+/// After `server_authenticate` returns, `handle_conn` only `accept_bi` / `closed`.
+/// No `h3.accept()`, and no `recv.stop` / `RecvStream::stop` on late unis.
 #[test]
 fn p9_handle_conn_leaves_h3_after_authenticate() {
     let src = include_str!("server/impl.rs");
     let start = src.find("async fn handle_conn").expect("handle_conn");
     let rest = &src[start + 1..];
     let end = rest
-        .find("\nasync fn ")
+        .find("\nfn spawn_tcp")
         .map(|i| start + 1 + i)
-        .unwrap_or(src.len());
+        .unwrap_or_else(|| {
+            rest.find("\nasync fn ")
+                .map(|i| start + 1 + i)
+                .unwrap_or(src.len())
+        });
     let fn_src = &src[start..end];
     let auth_at = fn_src
         .find("server_authenticate")
@@ -488,6 +487,10 @@ fn p9_handle_conn_leaves_h3_after_authenticate() {
             && !after.contains("h3.accept()")
             && !after.contains("h3_conn.accept"),
         "must not call h3.accept after authenticate returns"
+    );
+    assert!(
+        !after.contains("recv.stop") && !after.contains("RecvStream::stop"),
+        "must not stop/reset late unis after authenticate"
     );
 }
 

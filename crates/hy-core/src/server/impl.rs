@@ -187,7 +187,8 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
     }
 
     // Authenticated: leave H3. TCP is native accept_bi (frame 0x401).
-    // Late uni (e.g. a second H3 control) is reset/dropped, never given to h3.
+    // Late unis stay unread: stopping them resets the client's still-open
+    // QPACK/control, and the client treats that as a connection failure.
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
@@ -204,14 +205,6 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
                             cfg.traffic_logger.clone(),
                             conn.clone(),
                         );
-                    }
-                    Err(_) => break,
-                }
-            }
-            uni = conn.accept_uni() => {
-                match uni {
-                    Ok(mut recv) => {
-                        let _ = recv.stop(quinn::VarInt::from_u32(0));
                     }
                     Err(_) => break,
                 }

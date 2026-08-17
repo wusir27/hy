@@ -1,8 +1,9 @@
 //! Auth-phase wrapper around `poll_accept_recv` and `poll_accept_bidi`.
 //!
-//! Shadowrocket may open a second HTTP/3 control uni (`0x00`) before `POST /auth`.
-//! rust `h3` correctly closing on a duplicate control is left alone; this filter
-//! never hands the extra stream to h3, and never `Close`s QUIC.
+//! Shadowrocket may open extra HTTP/3 unis before `POST /auth`: a second control
+//! (`0x00`), QPACK encoder (`0x02`), or QPACK decoder (`0x03`). rust `h3`
+//! correctly closing on a duplicate is left alone; this filter never hands the
+//! extra stream to h3, and never `Close`s QUIC.
 //!
 //! During the one authenticate accept, inbound bidis are peeked: `0x401`
 //! (Hysteria TCP) is queued for `handle_tcp` after 233, and is never given to
@@ -37,6 +38,8 @@ where
 {
     inner: C,
     saw_control: bool,
+    saw_qpack_encoder: bool,
+    saw_qpack_decoder: bool,
     peek: Option<(C::RecvStream, BytesMut)>,
     bidi_peek: Option<(C::BidiStream, BytesMut)>,
     tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>,
@@ -55,6 +58,8 @@ where
         Self {
             inner,
             saw_control: false,
+            saw_qpack_encoder: false,
+            saw_qpack_decoder: false,
             peek: None,
             bidi_peek: None,
             tcp_tx,
@@ -405,17 +410,23 @@ where
                 }
                 Ok((ty, _)) => {
                     let (mut stream, buf) = self.peek.take().expect("peek take");
-                    match uni_action(ty, &mut self.saw_control) {
+                    match uni_action(
+                        ty,
+                        &mut self.saw_control,
+                        &mut self.saw_qpack_encoder,
+                        &mut self.saw_qpack_decoder,
+                    ) {
                         UniAction::Deliver => {
                             return Poll::Ready(Ok(PrefixedRecv {
                                 inner: stream,
                                 prefix: Some(buf.freeze()),
                             }));
                         }
-                        UniAction::DropExtraControl => {
+                        UniAction::DropExtra => {
                             tracing::info!(
+                                stream_type = ty,
                                 stream_id = %stream.recv_id(),
-                                "dropping extra h3 control uni"
+                                "dropping extra h3 uni"
                             );
                             abort_uni(&mut stream);
                             continue;
@@ -433,19 +444,30 @@ where
 
 enum UniAction {
     Deliver,
-    DropExtraControl,
+    DropExtra,
     DropUnknown,
 }
 
-fn uni_action(ty: u64, saw_control: &mut bool) -> UniAction {
+fn uni_action(
+    ty: u64,
+    saw_control: &mut bool,
+    saw_qpack_encoder: &mut bool,
+    saw_qpack_decoder: &mut bool,
+) -> UniAction {
     match ty {
-        STREAM_TYPE_CONTROL if !*saw_control => {
-            *saw_control = true;
-            UniAction::Deliver
-        }
-        STREAM_TYPE_CONTROL => UniAction::DropExtraControl,
-        STREAM_TYPE_QPACK_ENCODER | STREAM_TYPE_QPACK_DECODER => UniAction::Deliver,
+        STREAM_TYPE_CONTROL => first_or_extra(saw_control),
+        STREAM_TYPE_QPACK_ENCODER => first_or_extra(saw_qpack_encoder),
+        STREAM_TYPE_QPACK_DECODER => first_or_extra(saw_qpack_decoder),
         _ => UniAction::DropUnknown,
+    }
+}
+
+fn first_or_extra(saw: &mut bool) -> UniAction {
+    if !*saw {
+        *saw = true;
+        UniAction::Deliver
+    } else {
+        UniAction::DropExtra
     }
 }
 
@@ -759,6 +781,58 @@ mod tests {
         assert_eq!(first_bytes(&mut got[0]), &[0x00]);
         assert_eq!(first_bytes(&mut got[1]), &[0x02]);
         assert_eq!(first_bytes(&mut got[2]), &[0x03]);
+    }
+
+    #[test]
+    fn extra_qpack_encoder_uni_is_hidden() {
+        let conn = MockConn::with_unis(&[
+            (2, &[0x00]),
+            (6, &[0x02, 0xaa]),
+            (10, &[0x02, 0xbb]),
+            (14, &[0x03]),
+        ]);
+        let stopped = Arc::clone(&conn.stopped);
+        let (mut filter, _tcp) = AuthUniFilter::new(conn);
+        let mut got = drain(&mut filter);
+        assert_eq!(got.len(), 3, "second 0x02 must not be returned to h3");
+        assert_eq!(first_bytes(&mut got[0]), &[0x00]);
+        assert_eq!(first_bytes(&mut got[1]), &[0x02, 0xaa]);
+        assert_eq!(first_bytes(&mut got[2]), &[0x03]);
+        let stopped = stopped.lock().expect("stopped");
+        assert!(
+            stopped.iter().any(|(id, _)| *id == 10),
+            "extra encoder uni must be reset, got {stopped:?}"
+        );
+        assert!(
+            !stopped.iter().any(|(id, _)| *id == 6),
+            "first encoder must reach h3, got {stopped:?}"
+        );
+    }
+
+    #[test]
+    fn extra_qpack_decoder_uni_is_hidden() {
+        let conn = MockConn::with_unis(&[
+            (2, &[0x00]),
+            (6, &[0x02]),
+            (10, &[0x03, 0xaa]),
+            (14, &[0x03, 0xbb]),
+        ]);
+        let stopped = Arc::clone(&conn.stopped);
+        let (mut filter, _tcp) = AuthUniFilter::new(conn);
+        let mut got = drain(&mut filter);
+        assert_eq!(got.len(), 3, "second 0x03 must not be returned to h3");
+        assert_eq!(first_bytes(&mut got[0]), &[0x00]);
+        assert_eq!(first_bytes(&mut got[1]), &[0x02]);
+        assert_eq!(first_bytes(&mut got[2]), &[0x03, 0xaa]);
+        let stopped = stopped.lock().expect("stopped");
+        assert!(
+            stopped.iter().any(|(id, _)| *id == 14),
+            "extra decoder uni must be reset, got {stopped:?}"
+        );
+        assert!(
+            !stopped.iter().any(|(id, _)| *id == 10),
+            "first decoder must reach h3, got {stopped:?}"
+        );
     }
 
     #[test]

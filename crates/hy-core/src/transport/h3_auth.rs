@@ -134,9 +134,7 @@ where
         })
         .unwrap_or_default();
 
-    let is_auth = method.eq_ignore_ascii_case("POST")
-        && host.eq_ignore_ascii_case(URL_HOST)
-        && path == URL_PATH;
+    let is_auth = is_hysteria_auth_request(method, &host, path);
 
     if is_auth {
         let mut hdrs = Vec::new();
@@ -150,6 +148,7 @@ where
             .authenticate(remote, &auth_req.auth, auth_req.rx)
             .await;
         if ok {
+            tracing::info!(remote = %remote, id = %id, "auth ok");
             let cc = crate::congestion::server_send_cc(
                 ignore_client_bw,
                 server_max_tx,
@@ -163,6 +162,8 @@ where
             send_auth_ok(&mut stream, &resp).await?;
             return Ok(Some((id, resp, cc)));
         }
+        // Auth HTTP request with a failed password: still masquerade, but log first.
+        tracing::info!(remote = %remote, id = %id, "auth failed");
     }
 
     // Masq / 404
@@ -287,4 +288,26 @@ pub async fn server_authenticate(
     .await?;
 
     Ok((result, h3_conn))
+}
+
+fn is_hysteria_auth_request(method: &str, host: &str, path: &str) -> bool {
+    method.eq_ignore_ascii_case("POST")
+        && host.eq_ignore_ascii_case(URL_HOST)
+        && path == URL_PATH
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_hysteria_auth_path_is_auth() {
+        assert!(is_hysteria_auth_request("POST", "hysteria", "/auth"));
+        assert!(is_hysteria_auth_request("post", "HYSTERIA", "/auth"));
+        // Ordinary masquerade HTTP must not be treated as auth fail.
+        assert!(!is_hysteria_auth_request("GET", "hysteria", "/auth"));
+        assert!(!is_hysteria_auth_request("POST", "example.com", "/"));
+        assert!(!is_hysteria_auth_request("POST", "hysteria", "/"));
+        assert!(!is_hysteria_auth_request("POST", "", "/auth"));
+    }
 }

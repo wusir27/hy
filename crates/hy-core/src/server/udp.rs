@@ -177,7 +177,15 @@ impl ServerUdpSm {
             if let Some(a) = over {
                 a
             } else {
-                if self.check_udp_cached(&session, &complete.addr).await.is_err() {
+                if let Err(e) = self.check_udp_cached(&session, &complete.addr).await {
+                    tracing::info!(
+                        remote = %self.remote,
+                        id = %self.auth_id,
+                        dest = %complete.addr,
+                        result = e.outbound_result(),
+                        err = %e,
+                        "udp outbound"
+                    );
                     return;
                 }
                 complete.addr.clone()
@@ -205,7 +213,38 @@ impl ServerUdpSm {
         if let Some(ref ev) = self.event_logger {
             ev.udp_request(self.remote, &self.auth_id, session.id, &addr);
         }
-        let sock = self.outbound.udp(&addr).await?;
+        tracing::info!(
+            remote = %self.remote,
+            id = %self.auth_id,
+            sid = session.id,
+            dest = %addr,
+            "udp request"
+        );
+        let sock = match self.outbound.udp(&addr).await {
+            Ok(sock) => {
+                tracing::info!(
+                    remote = %self.remote,
+                    id = %self.auth_id,
+                    sid = session.id,
+                    dest = %addr,
+                    result = "ok",
+                    "udp outbound"
+                );
+                sock
+            }
+            Err(e) => {
+                tracing::info!(
+                    remote = %self.remote,
+                    id = %self.auth_id,
+                    sid = session.id,
+                    dest = %addr,
+                    result = e.outbound_result(),
+                    err = %e,
+                    "udp outbound"
+                );
+                return Err(e);
+            }
+        };
         if first.addr != actual {
             *session.override_addr.lock().unwrap() = Some(actual);
             *session.original_addr.lock().unwrap() = Some(first.addr.clone());

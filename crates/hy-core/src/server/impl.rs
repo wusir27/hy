@@ -97,8 +97,8 @@ impl Server for ServerInner {
     }
 }
 
-fn tracing_log(_e: &Error) {
-    // no tracing dep required
+fn tracing_log(e: &Error) {
+    tracing::info!(err = %e, "server conn error");
 }
 
 struct ServerConnCfg {
@@ -177,7 +177,13 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
                         let tl = cfg.traffic_logger.clone();
                         let c = conn.clone();
                         tokio::spawn(async move {
-                            let _ = handle_tcp(send, recv, outbound, hook, remote, &auth_id, ev, tl, c).await;
+                            if let Err(e) = handle_tcp(
+                                send, recv, outbound, hook, remote, &auth_id, ev, tl, c,
+                            )
+                            .await
+                            {
+                                tracing::info!(remote = %remote, id = %auth_id, err = %e, "tcp stream error");
+                            }
                         });
                     }
                     Err(_) => break,
@@ -263,9 +269,18 @@ async fn handle_tcp(
     if let Some(ref ev) = event_logger {
         ev.tcp_request(remote, auth_id, &addr);
     }
+    tracing::info!(remote = %remote, id = %auth_id, dest = %addr, "tcp request");
 
     match outbound.tcp(&addr).await {
         Err(e) => {
+            tracing::info!(
+                remote = %remote,
+                id = %auth_id,
+                dest = %addr,
+                result = e.outbound_result(),
+                err = %e,
+                "tcp outbound"
+            );
             if !hooked {
                 let msg = e.to_string();
                 let resp = write_tcp_response_bytes(false, &msg);
@@ -278,6 +293,13 @@ async fn handle_tcp(
             return Ok(());
         }
         Ok(mut remote_tcp) => {
+            tracing::info!(
+                remote = %remote,
+                id = %auth_id,
+                dest = %addr,
+                result = "ok",
+                "tcp outbound"
+            );
             if !hooked {
                 let resp = write_tcp_response_bytes(true, "Connected");
                 send.write_all(&resp)

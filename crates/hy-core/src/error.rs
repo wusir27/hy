@@ -45,4 +45,27 @@ impl Error {
     pub fn protocol(msg: impl Into<String>) -> Self {
         Self::Protocol(msg.into())
     }
+
+    /// Outbound info-log `result`: ACL `Error::Dial("rejected")` vs other failures.
+    pub(crate) fn outbound_result(&self) -> &'static str {
+        match self {
+            Error::Dial(s) if s.contains("reject") => "rejected",
+            _ => "error",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbound_result_rejected_vs_error() {
+        assert_eq!(Error::Dial("rejected".into()).outbound_result(), "rejected");
+        assert_eq!(
+            Error::Dial("connection refused".into()).outbound_result(),
+            "error"
+        );
+        assert_eq!(Error::Protocol("eof".into()).outbound_result(), "error");
+    }
 }

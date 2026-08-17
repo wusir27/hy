@@ -686,6 +686,7 @@ dependencies = [
  "rustls-pemfile",
  "thiserror",
  "tokio",
+ "tracing",
  "webpki-roots 0.26.11",
 ]
 

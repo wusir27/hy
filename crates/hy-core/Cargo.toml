@@ -26,6 +26,7 @@ rand = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 bytes = { workspace = true }
+tracing = { workspace = true }
 quinn = { workspace = true, optional = true }
 quinn-proto = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }

@@ -1,12 +1,21 @@
-//! Auth-phase wrapper around `poll_accept_recv`.
+//! Auth-phase wrapper around `poll_accept_recv` and `poll_accept_bidi`.
 //!
 //! Shadowrocket may open a second HTTP/3 control uni (`0x00`) before `POST /auth`.
 //! rust `h3` correctly closing on a duplicate control is left alone; this filter
 //! never hands the extra stream to h3, and never `Close`s QUIC.
+//!
+//! During the one authenticate accept, inbound bidis are peeked: `0x401`
+//! (Hysteria TCP) is queued for `handle_tcp` after 233, and is never given to
+//! h3. HTTP bytes are put back. After 233 we leave H3 (no `h3.accept()`).
 
 use bytes::{Buf, Bytes, BytesMut};
-use h3::quic::{self, ConnectionErrorIncoming, RecvStream, StreamErrorIncoming, StreamId};
+use crate::protocol::FRAME_TYPE_TCP_REQUEST;
+use h3::quic::{
+    self, ConnectionErrorIncoming, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming,
+    StreamId,
+};
 use std::task::{Context, Poll};
+use tokio::sync::mpsc;
 
 /// HTTP/3 control stream type (RFC 9114 §6.2.1).
 const STREAM_TYPE_CONTROL: u64 = 0x00;
@@ -14,6 +23,9 @@ const STREAM_TYPE_CONTROL: u64 = 0x00;
 const STREAM_TYPE_QPACK_ENCODER: u64 = 0x02;
 /// QPACK decoder stream (RFC 9204).
 const STREAM_TYPE_QPACK_DECODER: u64 = 0x03;
+
+/// A `0x401` bidi hijacked during authenticate. Do not dial until 233.
+pub type QueuedTcpBidi = (h3_quinn::BidiStream<Bytes>, Bytes);
 
 /// h3 server connection used for a single `/auth` accept (hold after 233).
 pub type ServerAuthH3 = h3::server::Connection<AuthUniFilter<h3_quinn::Connection>, Bytes>;
@@ -26,17 +38,26 @@ where
     inner: C,
     saw_control: bool,
     peek: Option<(C::RecvStream, BytesMut)>,
+    bidi_peek: Option<(C::BidiStream, BytesMut)>,
+    tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>,
 }
 
 impl<C> AuthUniFilter<C>
 where
     C: quic::Connection<Bytes>,
 {
-    pub fn new(inner: C) -> Self {
+    pub fn new(inner: C) -> (Self, mpsc::UnboundedReceiver<(C::BidiStream, Bytes)>) {
+        let (tcp_tx, tcp_rx) = mpsc::unbounded_channel();
+        (Self::with_tcp_tx(inner, tcp_tx), tcp_rx)
+    }
+
+    pub fn with_tcp_tx(inner: C, tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>) -> Self {
         Self {
             inner,
             saw_control: false,
             peek: None,
+            bidi_peek: None,
+            tcp_tx,
         }
     }
 }
@@ -74,19 +95,175 @@ where
     }
 }
 
-impl<C> quic::OpenStreams<Bytes> for AuthUniFilter<C>
+/// Bidi that prepends bytes already read while peeking the first varint.
+pub struct PrefixedBidi<S> {
+    inner: S,
+    prefix: Option<Bytes>,
+}
+
+fn restore_bidi<S>(inner: S, prefix: Bytes) -> PrefixedBidi<S> {
+    PrefixedBidi {
+        inner,
+        prefix: if prefix.is_empty() { None } else { Some(prefix) },
+    }
+}
+
+impl<S> RecvStream for PrefixedBidi<S>
 where
-    C: quic::Connection<Bytes>,
-    C::RecvStream: RecvStream<Buf = Bytes>,
+    S: RecvStream<Buf = Bytes>,
 {
-    type SendStream = C::SendStream;
-    type BidiStream = C::BidiStream;
+    type Buf = Bytes;
+
+    fn poll_data(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Self::Buf>, StreamErrorIncoming>> {
+        if let Some(prefix) = self.prefix.take() {
+            if !prefix.is_empty() {
+                return Poll::Ready(Ok(Some(prefix)));
+            }
+        }
+        self.inner.poll_data(cx)
+    }
+
+    fn stop_sending(&mut self, error_code: u64) {
+        self.inner.stop_sending(error_code);
+    }
+
+    fn recv_id(&self) -> StreamId {
+        self.inner.recv_id()
+    }
+}
+
+impl<S, B> SendStream<B> for PrefixedBidi<S>
+where
+    S: SendStream<B>,
+    B: Buf,
+{
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn send_data<T: Into<h3::quic::WriteBuf<B>>>(
+        &mut self,
+        data: T,
+    ) -> Result<(), StreamErrorIncoming> {
+        self.inner.send_data(data)
+    }
+
+    fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), StreamErrorIncoming>> {
+        self.inner.poll_finish(cx)
+    }
+
+    fn reset(&mut self, reset_code: u64) {
+        self.inner.reset(reset_code);
+    }
+
+    fn send_id(&self) -> StreamId {
+        self.inner.send_id()
+    }
+}
+
+impl<S, B> SendStreamUnframed<B> for PrefixedBidi<S>
+where
+    S: SendStreamUnframed<B>,
+    B: Buf,
+{
+    fn poll_send<D: Buf>(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &mut D,
+    ) -> Poll<Result<usize, StreamErrorIncoming>> {
+        self.inner.poll_send(cx, buf)
+    }
+}
+
+impl<S, B> quic::BidiStream<B> for PrefixedBidi<S>
+where
+    S: quic::BidiStream<B> + RecvStream<Buf = Bytes>,
+    S::RecvStream: RecvStream<Buf = Bytes>,
+    B: Buf,
+{
+    type SendStream = S::SendStream;
+    type RecvStream = PrefixedRecv<S::RecvStream>;
+
+    fn split(self) -> (Self::SendStream, Self::RecvStream) {
+        let (send, recv) = self.inner.split();
+        (
+            send,
+            PrefixedRecv {
+                inner: recv,
+                prefix: self.prefix,
+            },
+        )
+    }
+}
+
+/// Opener whose bidis match `AuthUniFilter` (prefix wrapper, empty prefix).
+pub struct AuthOpener<O> {
+    inner: O,
+}
+
+impl<O> Clone for AuthOpener<O>
+where
+    O: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<O> quic::OpenStreams<Bytes> for AuthOpener<O>
+where
+    O: quic::OpenStreams<Bytes>,
+    O::BidiStream: RecvStream<Buf = Bytes>,
+{
+    type SendStream = O::SendStream;
+    type BidiStream = PrefixedBidi<O::BidiStream>;
 
     fn poll_open_bidi(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
-        self.inner.poll_open_bidi(cx)
+        match self.inner.poll_open_bidi(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(s)) => Poll::Ready(Ok(restore_bidi(s, Bytes::new()))),
+        }
+    }
+
+    fn poll_open_send(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::SendStream, StreamErrorIncoming>> {
+        self.inner.poll_open_send(cx)
+    }
+
+    fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
+        self.inner.close(code, reason);
+    }
+}
+
+impl<C> quic::OpenStreams<Bytes> for AuthUniFilter<C>
+where
+    C: quic::Connection<Bytes>,
+    C::RecvStream: RecvStream<Buf = Bytes>,
+    C::BidiStream: RecvStream<Buf = Bytes>,
+{
+    type SendStream = C::SendStream;
+    type BidiStream = PrefixedBidi<C::BidiStream>;
+
+    fn poll_open_bidi(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Self::BidiStream, StreamErrorIncoming>> {
+        match self.inner.poll_open_bidi(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(s)) => Poll::Ready(Ok(restore_bidi(s, Bytes::new()))),
+        }
     }
 
     fn poll_open_send(
@@ -105,19 +282,77 @@ impl<C> quic::Connection<Bytes> for AuthUniFilter<C>
 where
     C: quic::Connection<Bytes>,
     C::RecvStream: RecvStream<Buf = Bytes>,
+    C::BidiStream: RecvStream<Buf = Bytes>,
 {
     type RecvStream = PrefixedRecv<C::RecvStream>;
-    type OpenStreams = C::OpenStreams;
+    type OpenStreams = AuthOpener<C::OpenStreams>;
 
     fn poll_accept_bidi(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-        self.inner.poll_accept_bidi(cx)
+        loop {
+            if self.bidi_peek.is_none() {
+                match self.inner.poll_accept_bidi(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(stream)) => {
+                        self.bidi_peek = Some((stream, BytesMut::new()));
+                    }
+                }
+            }
+
+            let chunk = {
+                let (stream, _) = self.bidi_peek.as_mut().expect("bidi peek stream");
+                match RecvStream::poll_data(stream, cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(StreamErrorIncoming::ConnectionErrorIncoming {
+                        connection_error,
+                    })) => {
+                        self.bidi_peek = None;
+                        return Poll::Ready(Err(connection_error));
+                    }
+                    Poll::Ready(Err(_)) => {
+                        self.bidi_peek = None;
+                        continue;
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        self.bidi_peek = None;
+                        continue;
+                    }
+                    Poll::Ready(Ok(Some(data))) => data,
+                }
+            };
+
+            let (_, buf) = self.bidi_peek.as_mut().expect("bidi peek buf");
+            buf.extend_from_slice(chunk.chunk());
+
+            match crate::protocol::varint_decode(buf) {
+                Err(_) if buf.len() < 8 => continue,
+                Err(_) => {
+                    let (stream, buf) = self.bidi_peek.take().expect("bidi peek take");
+                    return Poll::Ready(Ok(restore_bidi(stream, buf.freeze())));
+                }
+                Ok((ty, _)) => {
+                    let (stream, buf) = self.bidi_peek.take().expect("bidi peek take");
+                    if ty == FRAME_TYPE_TCP_REQUEST {
+                        tracing::info!(
+                            stream_id = %RecvStream::recv_id(&stream),
+                            "auth-phase queued 0x401"
+                        );
+                        let _ = self.tcp_tx.send((stream, buf.freeze()));
+                        continue;
+                    }
+                    return Poll::Ready(Ok(restore_bidi(stream, buf.freeze())));
+                }
+            }
+        }
     }
 
     fn opener(&self) -> Self::OpenStreams {
-        self.inner.opener()
+        AuthOpener {
+            inner: self.inner.opener(),
+        }
     }
 
     fn poll_accept_recv(
@@ -221,7 +456,7 @@ fn abort_uni<R: RecvStream>(stream: &mut R) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use h3::quic::{OpenStreams, SendStream};
+    use h3::quic::{OpenStreams, RecvStream, SendStream};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
     use std::task::Waker;
@@ -378,13 +613,22 @@ mod tests {
 
     struct MockConn {
         incoming: VecDeque<MockRecv>,
+        incoming_bidi: VecDeque<DummyBidi>,
         stopped: Arc<Mutex<Vec<(u64, u64)>>>,
     }
 
     impl MockConn {
         fn with_unis(payloads: &[(u64, &[u8])]) -> Self {
+            Self::with_streams(payloads, &[])
+        }
+
+        fn with_bidi(payloads: &[(u64, &[u8])]) -> Self {
+            Self::with_streams(&[], payloads)
+        }
+
+        fn with_streams(unis: &[(u64, &[u8])], bidis: &[(u64, &[u8])]) -> Self {
             let stopped = Arc::new(Mutex::new(Vec::new()));
-            let incoming = payloads
+            let incoming = unis
                 .iter()
                 .map(|(id, bytes)| MockRecv {
                     id: sid(*id),
@@ -392,7 +636,22 @@ mod tests {
                     stopped: Arc::clone(&stopped),
                 })
                 .collect();
-            Self { incoming, stopped }
+            let incoming_bidi = bidis
+                .iter()
+                .map(|(id, bytes)| DummyBidi {
+                    send: DummySend,
+                    recv: MockRecv {
+                        id: sid(*id),
+                        chunks: VecDeque::from([Bytes::copy_from_slice(bytes)]),
+                        stopped: Arc::clone(&stopped),
+                    },
+                })
+                .collect();
+            Self {
+                incoming,
+                incoming_bidi,
+                stopped,
+            }
         }
     }
 
@@ -435,7 +694,10 @@ mod tests {
             &mut self,
             _cx: &mut Context<'_>,
         ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-            Poll::Pending
+            match self.incoming_bidi.pop_front() {
+                Some(s) => Poll::Ready(Ok(s)),
+                None => Poll::Pending,
+            }
         }
 
         fn opener(&self) -> Self::OpenStreams {
@@ -473,7 +735,7 @@ mod tests {
             (6, &[0x00, 0x04, 0x00]),
         ]);
         let stopped = Arc::clone(&conn.stopped);
-        let mut filter = AuthUniFilter::new(conn);
+        let (mut filter, _tcp) = AuthUniFilter::new(conn);
         let mut got = drain(&mut filter);
         assert_eq!(got.len(), 1, "second 0x00 must not be returned to h3");
         assert_eq!(first_bytes(&mut got[0]), &[0x00, 0x04, 0x00]);
@@ -491,7 +753,7 @@ mod tests {
             (6, &[0x02]),
             (10, &[0x03]),
         ]);
-        let mut filter = AuthUniFilter::new(conn);
+        let (mut filter, _tcp) = AuthUniFilter::new(conn);
         let mut got = drain(&mut filter);
         assert_eq!(got.len(), 3);
         assert_eq!(first_bytes(&mut got[0]), &[0x00]);
@@ -503,10 +765,59 @@ mod tests {
     fn unknown_uni_reset_not_delivered() {
         let conn = MockConn::with_unis(&[(2, &[0x00]), (6, &[0x21])]);
         let stopped = Arc::clone(&conn.stopped);
-        let mut filter = AuthUniFilter::new(conn);
+        let (mut filter, _tcp) = AuthUniFilter::new(conn);
         let got = drain(&mut filter);
         assert_eq!(got.len(), 1);
         let stopped = stopped.lock().expect("stopped");
         assert!(stopped.iter().any(|(id, _)| *id == 6), "{stopped:?}");
+    }
+
+    fn drain_bidi(filter: &mut AuthUniFilter<MockConn>) -> Vec<PrefixedBidi<DummyBidi>> {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut out = Vec::new();
+        loop {
+            match quic::Connection::poll_accept_bidi(filter, &mut cx) {
+                Poll::Ready(Ok(s)) => out.push(s),
+                Poll::Ready(Err(e)) => panic!("poll_accept_bidi error: {e:?}"),
+                Poll::Pending => break,
+            }
+        }
+        out
+    }
+
+    fn first_bytes_bidi(stream: &mut PrefixedBidi<DummyBidi>) -> Vec<u8> {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        match RecvStream::poll_data(stream, &mut cx) {
+            Poll::Ready(Ok(Some(b))) => b.to_vec(),
+            other => panic!("expected prefix bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tcp_request_bidi_is_queued_http_bytes_restored() {
+        let conn = MockConn::with_bidi(&[
+            (0, &[0x44, 0x01, 0x0e]),
+            (4, &[0x01, 0x40]),
+        ]);
+        let (mut filter, mut tcp_rx) = AuthUniFilter::new(conn);
+        let mut got = drain_bidi(&mut filter);
+        assert_eq!(got.len(), 1, "0x401 must not be returned to h3");
+        assert_eq!(first_bytes_bidi(&mut got[0]), &[0x01, 0x40]);
+        let (queued, prefix) = tcp_rx.try_recv().expect("0x401 queued");
+        assert_eq!(&prefix[..], &[0x44, 0x01, 0x0e]);
+        assert_eq!(queued.recv_id().into_inner(), 0);
+        assert!(tcp_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn first_bidi_tcp_request_is_queued_until_http_arrives() {
+        let conn = MockConn::with_bidi(&[(0, &[0x44, 0x01])]);
+        let (mut filter, mut tcp_rx) = AuthUniFilter::new(conn);
+        let got = drain_bidi(&mut filter);
+        assert!(got.is_empty(), "0x401 must not enter resolve_request");
+        let (_, prefix) = tcp_rx.try_recv().expect("queued before /auth");
+        assert_eq!(&prefix[..], &[0x44, 0x01]);
     }
 }

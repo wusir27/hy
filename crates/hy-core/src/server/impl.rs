@@ -14,7 +14,8 @@ use crate::protocol::{
 use crate::transport::h3_auth;
 use crate::transport::quic;
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use h3::quic::{BidiStream, RecvStream as H3RecvStream, SendStream as H3SendStream, SendStreamUnframed};
 use quinn::{Connection, RecvStream, SendStream};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,7 +119,7 @@ struct ServerConnCfg {
 
 async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> {
     let remote = conn.remote_address();
-    let (auth, h3_keep) = h3_auth::server_authenticate(
+    let (auth, h3_keep, queued_tcp) = h3_auth::server_authenticate(
         conn.clone(),
         cfg.authenticator.clone(),
         cfg.ignore_client_bw,
@@ -130,6 +131,8 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
     .await?;
 
     let Some((auth_id, _auth_resp, cc_choice)) = auth else {
+        // Unauthenticated: drop queued 0x401 without outbound dial.
+        drop(queued_tcp);
         let _ = conn.closed().await;
         drop(h3_keep);
         return Ok(());
@@ -164,6 +167,25 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
         cfg.disable_udp,
     );
 
+    // Drain 0x401 bidis peeked during authenticate. Forbidden before 233.
+    for (stream, prefix) in queued_tcp {
+        let (send, recv) = stream.split();
+        spawn_tcp(
+            TcpSend::H3(send),
+            TcpRecv::H3 {
+                leftover: prefix,
+                inner: recv,
+            },
+            cfg.outbound.clone(),
+            cfg.request_hook.clone(),
+            remote,
+            auth_id.clone(),
+            cfg.event_logger.clone(),
+            cfg.traffic_logger.clone(),
+            conn.clone(),
+        );
+    }
+
     // Authenticated: leave H3. TCP is native accept_bi (frame 0x401).
     // Late uni (e.g. a second H3 control) is reset/dropped, never given to h3.
     loop {
@@ -171,22 +193,17 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
             bi = conn.accept_bi() => {
                 match bi {
                     Ok((send, recv)) => {
-                        let outbound = cfg.outbound.clone();
-                        let hook = cfg.request_hook.clone();
-                        let auth_id = auth_id.clone();
-                        let remote = remote;
-                        let ev = cfg.event_logger.clone();
-                        let tl = cfg.traffic_logger.clone();
-                        let c = conn.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_tcp(
-                                send, recv, outbound, hook, remote, &auth_id, ev, tl, c,
-                            )
-                            .await
-                            {
-                                tracing::info!(remote = %remote, id = %auth_id, err = %e, "tcp stream error");
-                            }
-                        });
+                        spawn_tcp(
+                            TcpSend::Quinn(send),
+                            TcpRecv::Quinn(recv),
+                            cfg.outbound.clone(),
+                            cfg.request_hook.clone(),
+                            remote,
+                            auth_id.clone(),
+                            cfg.event_logger.clone(),
+                            cfg.traffic_logger.clone(),
+                            conn.clone(),
+                        );
                     }
                     Err(_) => break,
                 }
@@ -214,9 +231,115 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
     Ok(())
 }
 
+fn spawn_tcp(
+    send: TcpSend,
+    recv: TcpRecv,
+    outbound: Arc<dyn Outbound>,
+    hook: Option<Arc<dyn super::RequestHook>>,
+    remote: SocketAddr,
+    auth_id: String,
+    ev: Option<Arc<dyn EventLogger>>,
+    tl: Option<Arc<dyn TrafficLogger>>,
+    c: Connection,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = handle_tcp(send, recv, outbound, hook, remote, &auth_id, ev, tl, c).await {
+            tracing::info!(remote = %remote, id = %auth_id, err = %e, "tcp stream error");
+        }
+    });
+}
+
+enum TcpSend {
+    Quinn(SendStream),
+    H3(h3_quinn::SendStream<Bytes>),
+}
+
+enum TcpRecv {
+    Quinn(RecvStream),
+    H3 {
+        leftover: Bytes,
+        inner: h3_quinn::RecvStream,
+    },
+}
+
+impl TcpSend {
+    async fn write_all(&mut self, buf: &[u8]) -> Result<(), Error> {
+        match self {
+            TcpSend::Quinn(s) => s
+                .write_all(buf)
+                .await
+                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e))),
+            TcpSend::H3(s) => {
+                let mut remaining = buf;
+                while !remaining.is_empty() {
+                    let n = std::future::poll_fn(|cx| {
+                        SendStreamUnframed::poll_send(s, cx, &mut remaining)
+                    })
+                    .await
+                    .map_err(|e| Error::Quic(e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    async fn finish(&mut self) -> Result<(), Error> {
+        match self {
+            TcpSend::Quinn(s) => {
+                let _ = s.finish();
+                Ok(())
+            }
+            TcpSend::H3(s) => {
+                let _ = std::future::poll_fn(|cx| H3SendStream::poll_finish(s, cx)).await;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl TcpRecv {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        match self {
+            TcpRecv::Quinn(r) => match r.read(buf).await {
+                Ok(Some(n)) => Ok(n),
+                Ok(None) => Ok(0),
+                Err(e) => Err(Error::Closed(Some(e.to_string()))),
+            },
+            TcpRecv::H3 { leftover, inner } => {
+                if leftover.is_empty() {
+                    match std::future::poll_fn(|cx| H3RecvStream::poll_data(inner, cx)).await {
+                        Ok(Some(b)) => *leftover = b,
+                        Ok(None) => return Ok(0),
+                        Err(e) => return Err(Error::Closed(Some(e.to_string()))),
+                    }
+                }
+                if leftover.is_empty() {
+                    return Ok(0);
+                }
+                let n = leftover.len().min(buf.len());
+                buf[..n].copy_from_slice(&leftover[..n]);
+                leftover.advance(n);
+                Ok(n)
+            }
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            TcpRecv::Quinn(r) => {
+                let _ = r.stop(quinn::VarInt::from_u32(0));
+            }
+            TcpRecv::H3 { inner, .. } => inner.stop_sending(0),
+        }
+    }
+}
+
 async fn handle_tcp(
-    mut send: SendStream,
-    recv: RecvStream,
+    mut send: TcpSend,
+    recv: TcpRecv,
     outbound: Arc<dyn Outbound>,
     request_hook: Option<Arc<dyn super::RequestHook>>,
     remote: SocketAddr,
@@ -229,11 +352,10 @@ async fn handle_tcp(
     let mut recv = recv;
     let (mut addr, after_req) = loop {
         let mut tmp = [0u8; 512];
-        let n = recv
-            .read(&mut tmp)
-            .await
-            .map_err(|e| Error::Closed(Some(e.to_string())))?
-            .ok_or_else(|| Error::Protocol("eof before tcp request".into()))?;
+        let n = recv.read(&mut tmp).await?;
+        if n == 0 {
+            return Err(Error::Protocol("eof before tcp request".into()));
+        }
         buf.extend_from_slice(&tmp[..n]);
 
         let (frame, frame_n) = match varint_decode(&buf) {
@@ -242,8 +364,8 @@ async fn handle_tcp(
             Err(e) => return Err(e),
         };
         if frame != FRAME_TYPE_TCP_REQUEST {
-            let _ = send.finish();
-            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            let _ = send.finish().await;
+            recv.stop();
             return Ok(());
         }
         match read_tcp_request_bytes(&buf[frame_n..]) {
@@ -268,9 +390,7 @@ async fn handle_tcp(
     if let Some(ref hook) = request_hook {
         if hook.check(false, &addr) {
             let resp = write_tcp_response_bytes(true, "RequestHook enabled");
-            send.write_all(&resp)
-                .await
-                .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            send.write_all(&resp).await?;
             hooked = true;
             hook_putback = hook.tcp(&mut client, &mut addr).await?;
         }
@@ -296,7 +416,7 @@ async fn handle_tcp(
                 let resp = write_tcp_response_bytes(false, &msg);
                 let _ = send.write_all(&resp).await;
             }
-            let _ = send.finish();
+            let _ = send.finish().await;
             if let Some(ref ev) = event_logger {
                 ev.tcp_error(remote, auth_id, &addr, Some(&e));
             }
@@ -312,9 +432,7 @@ async fn handle_tcp(
             );
             if !hooked {
                 let resp = write_tcp_response_bytes(true, "Connected");
-                send.write_all(&resp)
-                    .await
-                    .map_err(|e| Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                send.write_all(&resp).await?;
             }
 
             // Hook putback (bytes sniffed from client) plus any unused leftover.
@@ -341,7 +459,7 @@ async fn handle_tcp(
             if let Some(ref ev) = event_logger {
                 ev.tcp_error(remote, auth_id, &addr, err.as_ref());
             }
-            let _ = send.finish();
+            let _ = send.finish().await;
             let _ = remote_tcp.close().await;
         }
     }
@@ -351,7 +469,7 @@ async fn handle_tcp(
 /// Wraps a QUIC recv stream plus bytes already read after the TCP request.
 struct RecvAsHyTcp {
     leftover: Vec<u8>,
-    recv: RecvStream,
+    recv: TcpRecv,
 }
 
 #[async_trait]
@@ -363,11 +481,7 @@ impl HyTcpStream for RecvAsHyTcp {
             self.leftover.drain(..n);
             return Ok(n);
         }
-        match self.recv.read(buf).await {
-            Ok(Some(n)) => Ok(n),
-            Ok(None) => Ok(0),
-            Err(e) => Err(Error::Closed(Some(e.to_string()))),
-        }
+        self.recv.read(buf).await
     }
 
     async fn write(&mut self, _buf: &[u8]) -> Result<usize, Error> {
@@ -375,14 +489,14 @@ impl HyTcpStream for RecvAsHyTcp {
     }
 
     async fn close(&mut self) -> Result<(), Error> {
-        let _ = self.recv.stop(quinn::VarInt::from_u32(0));
+        self.recv.stop();
         Ok(())
     }
 }
 
 /// Bidirectional copy. Either side finishing ends both.
 async fn copy_two_way(
-    send: &mut SendStream,
+    send: &mut TcpSend,
     client: &mut dyn HyTcpStream,
     remote: &mut dyn HyTcpStream,
     auth_id: &str,
@@ -419,7 +533,7 @@ async fn copy_two_way(
                             }
                         }
                         if let Err(e) = send.write_all(&r2c_buf[..n]).await {
-                            return Some(Error::Io(std::io::Error::new(std::io::ErrorKind::Other, e)));
+                            return Some(e);
                         }
                     }
                     Err(e) => return Some(e),

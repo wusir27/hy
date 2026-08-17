@@ -490,3 +490,245 @@ fn p9_handle_conn_leaves_h3_after_authenticate() {
         "must not call h3.accept after authenticate returns"
     );
 }
+
+async fn read_tcp_echo(recv: &mut quinn::RecvStream, want: &[u8]) {
+    use crate::protocol::read_tcp_response_bytes;
+    let mut buf = Vec::new();
+    let (_ok, _msg, consumed) = loop {
+        let mut tmp = [0u8; 256];
+        let n = recv
+            .read(&mut tmp)
+            .await
+            .expect("tcp resp read")
+            .expect("eof before tcp response");
+        buf.extend_from_slice(&tmp[..n]);
+        match read_tcp_response_bytes(&buf) {
+            Ok(v) => break v,
+            Err(Error::Protocol(_)) if buf.len() < 8192 => continue,
+            Err(e) => panic!("tcp resp: {e}"),
+        }
+    };
+    assert!(_ok, "tcp response ok");
+    let mut rest = buf[consumed..].to_vec();
+    while rest.len() < want.len() {
+        let mut tmp = [0u8; 16];
+        let n = recv.read(&mut tmp).await.expect("echo").expect("eof echo");
+        rest.extend_from_slice(&tmp[..n]);
+    }
+    assert_eq!(&rest[..want.len()], want);
+}
+
+async fn p9e_start_server(
+    outbound: Option<Arc<dyn crate::server::Outbound>>,
+) -> (Arc<dyn crate::server::Server>, std::net::SocketAddr, std::net::SocketAddr) {
+    let (cert_pem, key_pem) = self_signed_pem();
+    let (_echo_h, echo_addr) = echo_listener().await;
+    let udp = StdUdp::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let server_addr = udp.local_addr().unwrap();
+    assert_ne!(server_addr.port(), 443);
+    let mut scfg = ServerConfig {
+        tls: ServerTls {
+            cert_pem,
+            key_pem,
+            ..Default::default()
+        },
+        conn: Some(Arc::new(udp)),
+        authenticator: Some(Arc::new(PasswordAuthenticator::new("test"))),
+        outbound,
+        disable_udp: true,
+        ..Default::default()
+    };
+    scfg.fill().unwrap();
+    let server = server::serve(scfg).await.unwrap();
+    let server2 = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server2.serve().await;
+    });
+    tokio::task::yield_now().await;
+    (server, server_addr, echo_addr)
+}
+
+async fn p9e_h3_client(
+    server_addr: std::net::SocketAddr,
+) -> (
+    quinn::Connection,
+    h3::client::SendRequest<h3_quinn::OpenStreams, bytes::Bytes>,
+    tokio::task::JoinHandle<()>,
+) {
+    let mut c = client_cfg(server_addr, "test");
+    c.verify_and_fill().unwrap();
+    let client_udp = StdUdp::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let (endpoint, _) = quic::build_client_endpoint(
+        Arc::new(client_udp),
+        &c.tls,
+        &c.quic,
+        &c.congestion.ty,
+        c.bandwidth.disable_loss_compensation,
+    )
+    .unwrap();
+    let conn = endpoint
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .expect("quic connect");
+    let h3_conn = h3_quinn::Connection::new(conn.clone());
+    let (mut driver, send_request) = h3::client::new(h3_conn).await.expect("h3 client");
+    let drive = tokio::spawn(async move {
+        std::future::poll_fn(|cx| std::pin::Pin::new(&mut driver).poll_close(cx)).await;
+    });
+    (conn, send_request, drive)
+}
+
+/// Auth HTTP bidi plus an immediate `0x401`: 233 succeeds, TCP reaches
+/// `handle_tcp` (echo), does not stall in `resolve_request`.
+#[tokio::test]
+async fn p9_auth_http_then_immediate_tcp_request() {
+    let (server, server_addr, echo_addr) = p9e_start_server(None).await;
+    let (conn, mut send_request, drive) = p9e_h3_client(server_addr).await;
+    let echo_s = format!("{echo_addr}");
+    let conn_tcp = conn.clone();
+    let echo_tcp = echo_s.clone();
+    let tcp_task = tokio::spawn(async move {
+        let (mut send, mut recv) = conn_tcp.open_bi().await.expect("tcp bi");
+        send.write_all(&write_tcp_request_bytes(&echo_tcp))
+            .await
+            .expect("tcp req");
+        send.write_all(b"hello").await.expect("payload");
+        read_tcp_echo(&mut recv, b"hello").await;
+        let _ = send.finish();
+    });
+
+    let (status, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+    )
+    .await
+    .expect("auth timeout — 0x401 must not enter resolve_request")
+    .expect("auth");
+    assert_eq!(status, STATUS_AUTH_OK);
+
+    tokio::time::timeout(Duration::from_secs(5), tcp_task)
+        .await
+        .expect("queued/concurrent 0x401 must reach handle_tcp")
+        .expect("tcp task");
+    drive.abort();
+    conn.close(quinn::VarInt::from_u32(0x100), b"");
+    let _ = server.close().await;
+}
+
+/// First bidi is `0x401`, `/auth` comes later: no Timeout; after 233 the queued
+/// TCP is handled. Outbound is not dialed before authenticate succeeds.
+#[tokio::test]
+async fn p9_tcp_request_before_auth_is_queued() {
+    struct GateOutbound {
+        authed: Arc<std::sync::atomic::AtomicBool>,
+        illegal: Arc<std::sync::atomic::AtomicBool>,
+        inner: crate::server::DefaultOutbound,
+    }
+    #[async_trait]
+    impl crate::server::Outbound for GateOutbound {
+        async fn tcp(
+            &self,
+            req_addr: &str,
+        ) -> Result<Box<dyn crate::server::HyTcpStream>, Error> {
+            if !self.authed.load(Ordering::SeqCst) {
+                self.illegal.store(true, Ordering::SeqCst);
+            }
+            self.inner.tcp(req_addr).await
+        }
+        async fn udp(
+            &self,
+            req_addr: &str,
+        ) -> Result<Box<dyn crate::server::HyUdpSocket>, Error> {
+            self.inner.udp(req_addr).await
+        }
+        async fn check_udp(&self, req_addr: &str) -> Result<(), Error> {
+            self.inner.check_udp(req_addr).await
+        }
+    }
+    struct GateAuth {
+        password: String,
+        authed: Arc<std::sync::atomic::AtomicBool>,
+    }
+    #[async_trait]
+    impl Authenticator for GateAuth {
+        async fn authenticate(&self, _addr: SocketAddr, auth: &str, _tx: u64) -> (bool, String) {
+            let ok = auth == self.password;
+            if ok {
+                self.authed.store(true, Ordering::SeqCst);
+            }
+            (ok, if ok { "user".into() } else { String::new() })
+        }
+    }
+
+    let (cert_pem, key_pem) = self_signed_pem();
+    let (_echo_h, echo_addr) = echo_listener().await;
+    let udp = StdUdp::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let server_addr = udp.local_addr().unwrap();
+    let authed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let illegal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut scfg = ServerConfig {
+        tls: ServerTls {
+            cert_pem,
+            key_pem,
+            ..Default::default()
+        },
+        conn: Some(Arc::new(udp)),
+        authenticator: Some(Arc::new(GateAuth {
+            password: "test".into(),
+            authed: authed.clone(),
+        })),
+        outbound: Some(Arc::new(GateOutbound {
+            authed: authed.clone(),
+            illegal: illegal.clone(),
+            inner: crate::server::DefaultOutbound,
+        })),
+        disable_udp: true,
+        ..Default::default()
+    };
+    scfg.fill().unwrap();
+    let server = server::serve(scfg).await.unwrap();
+    let server2 = Arc::clone(&server);
+    tokio::spawn(async move {
+        let _ = server2.serve().await;
+    });
+    tokio::task::yield_now().await;
+
+    let (conn, mut send_request, drive) = p9e_h3_client(server_addr).await;
+    let echo_s = format!("{echo_addr}");
+
+    // 0x401 first, then POST /auth.
+    let (mut send, mut recv) = conn.open_bi().await.expect("tcp bi first");
+    send.write_all(&write_tcp_request_bytes(&echo_s))
+        .await
+        .expect("tcp req");
+    send.write_all(b"hello").await.expect("payload");
+
+    let (status, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+    )
+    .await
+    .expect("auth timeout — first bidi 0x401 must not enter resolve_request")
+    .expect("auth");
+    assert_eq!(status, STATUS_AUTH_OK);
+
+    tokio::time::timeout(Duration::from_secs(5), read_tcp_echo(&mut recv, b"hello"))
+        .await
+        .expect("queued 0x401 after 233");
+    assert!(
+        !illegal.load(Ordering::SeqCst),
+        "must not dial outbound before 233"
+    );
+
+    let _ = send.finish();
+    drive.abort();
+    conn.close(quinn::VarInt::from_u32(0x100), b"");
+    let _ = server.close().await;
+}

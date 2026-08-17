@@ -1,6 +1,6 @@
 //! HTTP/3 `/auth` only. After 233, TCP/UDP leave h3.
 
-use super::h3_uni::{AuthUniFilter, ServerAuthH3};
+use super::h3_uni::{AuthUniFilter, QueuedTcpBidi, ServerAuthH3};
 use crate::error::Error;
 use crate::protocol::{
     auth_request_from_headers, auth_request_to_headers, auth_response_from_headers,
@@ -259,19 +259,24 @@ pub async fn server_authenticate(
     (
         Option<(String, AuthResponse, crate::congestion::CcChoice)>,
         ServerAuthH3,
+        Vec<QueuedTcpBidi>,
     ),
     Error,
 > {
     let remote = conn.remote_address();
-    let mut h3_conn = h3::server::Connection::new(AuthUniFilter::new(h3_quinn::Connection::new(
-        conn,
-    )))
+    let (tcp_tx, mut tcp_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut h3_conn = h3::server::Connection::new(AuthUniFilter::with_tcp_tx(
+        h3_quinn::Connection::new(conn),
+        tcp_tx,
+    ))
     .await
     .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
 
     let resolver = match h3_conn.accept().await {
         Ok(Some(r)) => r,
-        Ok(None) => return Ok((None, h3_conn)),
+        Ok(None) => {
+            return Ok((None, h3_conn, drain_queued_tcp(&mut tcp_rx)));
+        }
         Err(e) => return Err(Error::Connect(format!("h3 accept: {e}"))),
     };
 
@@ -293,7 +298,17 @@ pub async fn server_authenticate(
     )
     .await?;
 
-    Ok((result, h3_conn))
+    Ok((result, h3_conn, drain_queued_tcp(&mut tcp_rx)))
+}
+
+fn drain_queued_tcp(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<QueuedTcpBidi>,
+) -> Vec<QueuedTcpBidi> {
+    let mut queued = Vec::new();
+    while let Ok(item) = rx.try_recv() {
+        queued.push(item);
+    }
+    queued
 }
 
 fn is_hysteria_auth_request(method: &str, host: &str, path: &str) -> bool {

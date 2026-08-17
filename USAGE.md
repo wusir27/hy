@@ -161,7 +161,9 @@ outbound(address, protoPort, hijackIP)
 | `sniff.timeout` | 默认 `4s` |
 | `sniff.rewriteDomain` | `true` 才改写 `req_addr` 的 host |
 | `sniff.tcpPorts` / `udpPorts` | 如 `80,443,8000-9000`；`@` 前缀目标跳过 |
-| `acl.file` / `acl.inline` | 规则；`inline` 是字符串序列 |
+| `acl.file` / `acl.inline` | 规则；`inline` 是字符串序列；二者互斥 |
+| `acl.geoip` / `acl.geosite` | V2Ray `.dat` 路径。省略则 cwd 下 `geoip.dat` / `geosite.dat`，按需自动下载 |
+| `acl.geoUpdateInterval` | 仅自动下载：文件超过这个时间再下，默认 7 天 |
 | `outbounds` | `direct` / `socks5` / `http` |
 | `trafficStats.listen` / `secret` | 统计 HTTP。`Authorization` 头**等于** secret（不是 Bearer） |
 | `masquerade.type` | 空/`404`、`string`、`file`、`proxy` |
@@ -374,6 +376,39 @@ outbounds:
 - SOCKS5/HTTP **出站**把 hostname 交给上游，不强制本地解析。
 - HTTP 出站不能做 UDP（`http outbound is tcp only`）。
 - 有 ACL 时必须包一层 Resolver（system 或上面的 udp/tcp/tls/https）。
+
+### 场景 6b — 服务端按国家 / 站点分流（Geo）
+
+只在**服务端** ACL 里写。客户端没有 `acl.geoip`。`geoip:` 看的是解析后的 IP，所以前面必须有 Resolver（有 ACL 时本来就会包一层）。
+
+```yaml
+# server.yaml
+listen: :443
+tls: { cert: /c.pem, key: /k.pem }
+auth: { type: password, password: secret }
+acl:
+  inline:
+    - "reject(geoip:cn)"           # 中国 IP 拒绝
+    - "direct(geosite:google@cn)"  # google 列表里带 cn 属性的域名直连
+    - "direct(geosite:google)"
+    - "default(*)"
+  geoip: /var/lib/hy/geoip.dat      # 指定路径：只读这份，不下载
+  geosite: /var/lib/hy/geosite.dat
+  # geoUpdateInterval: 168h         # 仅路径省略时有用
+```
+
+路径**省略**时，进程工作目录找 `geoip.dat` / `geosite.dat`；没有或超过 7 天，会从 Loyalsoldier 下：
+
+`https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat`  
+`https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat`
+
+写法：
+
+- `geoip:cn` / `geoip:us` / `geoip:private`（码小写；`geoip:JP` 也可以，编译时会折成小写）
+- `geosite:google`、`geosite:google@cn`（多个 `@attr` 是 AND）
+- 库里没有这个码、文件读不开：启动失败，带行号。不会当成「没这条规则」
+
+先写先中。`geoip` 只匹配 IP，域名还没解析出地址时不中（除非 dat 里是 inverse）。`geosite` 只匹配域名。
 
 ### 场景 7 — 文件/反代伪装 + Alt-Svc
 

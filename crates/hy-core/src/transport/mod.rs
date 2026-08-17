@@ -1,10 +1,11 @@
 //! quinn + h3 wiring.
 //!
 //! Auth is a one-shot h3 accept. Incoming unis are filtered (`h3_uni`) so a
-//! second 0x00 / 0x02 / 0x03 never reaches rust `h3`. Bidis are peeked: `0x401`
-//! is queued (not given to h3); HTTP bytes are restored. After 233 the same
-//! wrapper stays the only bidi owner (`h3.accept` + `tcp_rx`). UDP uses quinn
-//! datagrams. Chrome parrot: client default CID length 0
+//! second 0x00 / 0x02 / 0x03 never reaches rust `h3`. Before 233 extra unis
+//! are reset; after 233 they are held (never `stop` / Drop-reset). Bidis are
+//! peeked: `0x401` is queued (not given to h3); HTTP bytes are restored. After
+//! 233 the same wrapper stays the only bidi owner (`h3.accept` + `tcp_rx`).
+//! UDP uses quinn datagrams. Chrome parrot: client default CID length 0
 //! (`quic.disableChromeParrot` restores the hashed 8-byte CID).
 
 pub mod h3_auth;

@@ -162,7 +162,9 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
     );
 
     // Drain 0x401 peeked during authenticate. Outbound only after 233.
+    let mut tcp_started = false;
     while let Ok(queued) = tcp_rx.try_recv() {
+        tcp_started = true;
         spawn_queued_tcp(
             queued,
             cfg.outbound.clone(),
@@ -177,9 +179,13 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
 
     // Keep polling the same wrapper in this task. Hold is only so Drop does
     // not close QUIC — a spawn that parks h3 without polling would eat 0x401.
+    // After ApplicationClose 0x0, stop polling accept (sticky error) but keep
+    // the wrapper so held extra unis are not Drop/STOP_SENDING, and leave
+    // in-flight handle_tcp copy tasks running until QUIC itself closes.
+    let mut h3_gone = false;
     loop {
         tokio::select! {
-            h3 = h3_keep.accept() => {
+            h3 = h3_keep.accept(), if !h3_gone => {
                 match h3 {
                     Ok(Some(resolver)) => {
                         let auth_resp = auth_resp.clone();
@@ -206,20 +212,29 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
                     }
                     Ok(None) => {
                         tracing::info!("h3 accept ended");
-                        let err = conn.closed().await;
-                        emit_disconnect(&cfg, remote, &auth_id, &err);
-                        break;
+                        if tcp_started {
+                            h3_gone = true;
+                        } else {
+                            let err = conn.closed().await;
+                            emit_disconnect(&cfg, remote, &auth_id, &err);
+                            break;
+                        }
                     }
                     Err(e) => {
                         tracing::info!(err = %e, "h3 accept");
-                        let err = conn.closed().await;
-                        emit_disconnect(&cfg, remote, &auth_id, &err);
-                        break;
+                        if tcp_started && h3_auth::h3_accept_is_peer_normal_close(&e) {
+                            h3_gone = true;
+                        } else {
+                            let err = conn.closed().await;
+                            emit_disconnect(&cfg, remote, &auth_id, &err);
+                            break;
+                        }
                     }
                 }
             }
             queued = tcp_rx.recv() => {
                 if let Some(queued) = queued {
+                    tcp_started = true;
                     spawn_queued_tcp(
                         queued,
                         cfg.outbound.clone(),

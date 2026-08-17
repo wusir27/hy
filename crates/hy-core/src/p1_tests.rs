@@ -290,13 +290,12 @@ async fn p9_second_auth_same_quic_returns_233() {
     let _ = junk_send.finish();
     drop(junk_recv);
 
-    // Late extra unis after 233 must not close QUIC (wrapper hides them from h3).
-    let mut junk_uni = conn.open_uni().await.expect("junk uni");
-    junk_uni.write_all(&[0x00]).await.expect("junk uni write");
-    let _ = junk_uni.finish();
-    let mut junk_enc = conn.open_uni().await.expect("junk encoder uni");
-    junk_enc.write_all(&[0x02]).await.expect("junk encoder write");
-    let _ = junk_enc.finish();
+    // Late extra unis after 233 must not close QUIC (wrapper holds them).
+    for ty in [0x00u8, 0x02, 0x03] {
+        let mut junk_uni = conn.open_uni().await.expect("junk uni");
+        junk_uni.write_all(&[ty]).await.expect("junk uni write");
+        let _ = junk_uni.finish();
+    }
 
     tokio::time::sleep(Duration::from_millis(80)).await;
     assert!(
@@ -610,6 +609,75 @@ fn p9_handle_conn_keeps_wrapper_accept_after_233() {
     assert!(
         !after.contains("let _h3"),
         "must not spawn-hold h3 without polling"
+    );
+    assert!(
+        after.contains("h3_accept_is_peer_normal_close"),
+        "ApplicationClose 0x0 after TCP started must not tear down handle_tcp"
+    );
+}
+
+/// After first 233, extra 0x00/0x02/0x03 unis: QUIC stays up; a later 0x401
+/// TCP echo still works.
+#[tokio::test]
+async fn p9_extra_unis_after_233_then_tcp_echo() {
+    let (server, server_addr, echo_addr) = p9e_start_server(None).await;
+    let (conn, mut send_request, drive) = p9e_h3_client(server_addr).await;
+    let (status, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+    )
+    .await
+    .expect("auth timeout")
+    .expect("auth");
+    assert_eq!(status, STATUS_AUTH_OK);
+
+    for ty in [0x00u8, 0x02, 0x03] {
+        let mut extra = conn.open_uni().await.expect("extra uni after 233");
+        extra.write_all(&[ty]).await.expect("write extra uni");
+        let _ = extra.finish();
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        conn.close_reason().is_none(),
+        "QUIC must stay up after extra 0x00/0x02/0x03: {:?}",
+        conn.close_reason()
+    );
+
+    let echo_s = format!("{echo_addr}");
+    let (mut send, mut recv) = conn.open_bi().await.expect("tcp bi after extra unis");
+    send.write_all(&write_tcp_request_bytes(&echo_s))
+        .await
+        .expect("tcp req");
+    send.write_all(b"hello").await.expect("payload");
+    tokio::time::timeout(Duration::from_secs(5), read_tcp_echo(&mut recv, b"hello"))
+        .await
+        .expect("0x401 after extra post-233 unis must still echo");
+    assert!(conn.close_reason().is_none());
+
+    let _ = send.finish();
+    drive.abort();
+    conn.close(quinn::VarInt::from_u32(0x100), b"");
+    let _ = server.close().await;
+}
+
+#[test]
+fn p9_drop_or_hold_after_auth_does_not_stop() {
+    let src = include_str!("transport/h3_uni.rs");
+    let start = src.find("fn drop_or_hold_uni").expect("drop_or_hold_uni");
+    let rest = &src[start..];
+    let end = rest.find("\nfn abort_uni").unwrap_or(rest.len());
+    let fn_src = &rest[..end];
+    assert!(fn_src.contains("holding extra h3 uni"));
+    assert!(fn_src.contains("held.push(stream)"));
+    assert!(
+        fn_src.contains("authed.load"),
+        "hold vs abort must key off the authed flag"
+    );
+    let authed_return = fn_src.find("held.push(stream)").expect("hold");
+    let abort_at = fn_src.find("abort_uni").expect("abort only if not authed");
+    assert!(
+        authed_return < abort_at,
+        "authed hold must return before abort_uni"
     );
 }
 

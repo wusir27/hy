@@ -5,6 +5,12 @@
 //! correctly closing on a duplicate is left alone; this filter never hands the
 //! extra stream to h3, and never `Close`s QUIC.
 //!
+//! Before the first 233, extra / unknown unis are reset (`stop_sending`) so
+//! authenticate does not see `got two * streams`. After 233 they are taken out
+//! of `poll_accept_recv` and **held** until the connection dies — Quinn
+//! `RecvStream` Drop is STOP_SENDING, which the client treats as failure and
+//! `Close(0x0)`.
+//!
 //! Inbound bidis are peeked: `0x401` (Hysteria TCP) is queued for `handle_tcp`
 //! (outbound only after 233) and is never given to h3. HTTP bytes are put back.
 //! After 233 the same wrapper is still polled (`h3.accept`); do not raw-accept.
@@ -15,6 +21,8 @@ use h3::quic::{
     self, ConnectionErrorIncoming, RecvStream, SendStream, SendStreamUnframed, StreamErrorIncoming,
     StreamId,
 };
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
@@ -46,6 +54,10 @@ where
     peek: Option<(C::RecvStream, BytesMut)>,
     bidi_peek: Option<(C::BidiStream, BytesMut)>,
     tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>,
+    /// Set immediately after the first 233. Extra unis are held, not reset.
+    authed: Arc<AtomicBool>,
+    /// Extra / unknown unis accepted after 233. Must not Drop until QUIC dies.
+    held_unis: Vec<C::RecvStream>,
 }
 
 impl<C> AuthUniFilter<C>
@@ -58,6 +70,14 @@ where
     }
 
     pub fn with_tcp_tx(inner: C, tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>) -> Self {
+        Self::with_tcp_tx_authed(inner, tcp_tx, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn with_tcp_tx_authed(
+        inner: C,
+        tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>,
+        authed: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             inner,
             saw_control: false,
@@ -66,7 +86,14 @@ where
             peek: None,
             bidi_peek: None,
             tcp_tx,
+            authed,
+            held_unis: Vec::new(),
         }
+    }
+
+    /// First 233 succeeded. Extra unis from this point must be held, not reset.
+    pub fn mark_authenticated(&self) {
+        self.authed.store(true, Ordering::Release);
     }
 }
 
@@ -415,13 +442,19 @@ where
             match crate::protocol::varint_decode(buf) {
                 Err(_) if buf.len() < 8 => continue,
                 Err(_) => {
-                    if let Some((mut stream, _)) = self.peek.take() {
-                        abort_uni(&mut stream);
+                    if let Some((stream, _)) = self.peek.take() {
+                        drop_or_hold_uni(
+                            &self.authed,
+                            &mut self.held_unis,
+                            stream,
+                            None,
+                            false,
+                        );
                     }
                     continue;
                 }
                 Ok((ty, _)) => {
-                    let (mut stream, buf) = self.peek.take().expect("peek take");
+                    let (stream, buf) = self.peek.take().expect("peek take");
                     match uni_action(
                         ty,
                         &mut self.saw_control,
@@ -435,16 +468,23 @@ where
                             }));
                         }
                         UniAction::DropExtra => {
-                            tracing::info!(
-                                stream_type = ty,
-                                stream_id = %stream.recv_id(),
-                                "dropping extra h3 uni"
+                            drop_or_hold_uni(
+                                &self.authed,
+                                &mut self.held_unis,
+                                stream,
+                                Some(ty),
+                                true,
                             );
-                            abort_uni(&mut stream);
                             continue;
                         }
                         UniAction::DropUnknown => {
-                            abort_uni(&mut stream);
+                            drop_or_hold_uni(
+                                &self.authed,
+                                &mut self.held_unis,
+                                stream,
+                                Some(ty),
+                                false,
+                            );
                             continue;
                         }
                     }
@@ -481,6 +521,40 @@ fn first_or_extra(saw: &mut bool) -> UniAction {
     } else {
         UniAction::DropExtra
     }
+}
+
+fn drop_or_hold_uni<R: RecvStream>(
+    authed: &AtomicBool,
+    held: &mut Vec<R>,
+    mut stream: R,
+    ty: Option<u64>,
+    extra: bool,
+) {
+    if authed.load(Ordering::Acquire) {
+        match ty {
+            Some(ty) => tracing::info!(
+                stream_type = ty,
+                stream_id = %stream.recv_id(),
+                "holding extra h3 uni"
+            ),
+            None => tracing::info!(
+                stream_id = %stream.recv_id(),
+                "holding extra h3 uni"
+            ),
+        }
+        held.push(stream);
+        return;
+    }
+    if extra {
+        if let Some(ty) = ty {
+            tracing::info!(
+                stream_type = ty,
+                stream_id = %stream.recv_id(),
+                "dropping extra h3 uni"
+            );
+        }
+    }
+    abort_uni(&mut stream);
 }
 
 fn abort_uni<R: RecvStream>(stream: &mut R) {
@@ -524,6 +598,27 @@ mod tests {
 
         fn recv_id(&self) -> StreamId {
             self.id
+        }
+    }
+
+    /// Quinn `RecvStream` Drop sends STOP_SENDING. Record that so after-auth
+    /// holds are distinguishable from silent `drop(stream)`.
+    impl Drop for MockRecv {
+        fn drop(&mut self) {
+            if let Ok(mut stopped) = self.stopped.lock() {
+                let id = self.id.into_inner();
+                if !stopped.iter().any(|(i, _)| *i == id) {
+                    stopped.push((id, 0));
+                }
+            }
+        }
+    }
+
+    fn mock_recv(id: u64, bytes: &[u8], stopped: &Arc<Mutex<Vec<(u64, u64)>>>) -> MockRecv {
+        MockRecv {
+            id: sid(id),
+            chunks: VecDeque::from([Bytes::copy_from_slice(bytes)]),
+            stopped: Arc::clone(stopped),
         }
     }
 
@@ -646,8 +741,8 @@ mod tests {
     }
 
     struct MockConn {
-        incoming: VecDeque<MockRecv>,
-        incoming_bidi: VecDeque<DummyBidi>,
+        incoming: Arc<Mutex<VecDeque<MockRecv>>>,
+        incoming_bidi: Arc<Mutex<VecDeque<DummyBidi>>>,
         stopped: Arc<Mutex<Vec<(u64, u64)>>>,
     }
 
@@ -664,26 +759,18 @@ mod tests {
             let stopped = Arc::new(Mutex::new(Vec::new()));
             let incoming = unis
                 .iter()
-                .map(|(id, bytes)| MockRecv {
-                    id: sid(*id),
-                    chunks: VecDeque::from([Bytes::copy_from_slice(bytes)]),
-                    stopped: Arc::clone(&stopped),
-                })
+                .map(|(id, bytes)| mock_recv(*id, bytes, &stopped))
                 .collect();
             let incoming_bidi = bidis
                 .iter()
                 .map(|(id, bytes)| DummyBidi {
                     send: DummySend,
-                    recv: MockRecv {
-                        id: sid(*id),
-                        chunks: VecDeque::from([Bytes::copy_from_slice(bytes)]),
-                        stopped: Arc::clone(&stopped),
-                    },
+                    recv: mock_recv(*id, bytes, &stopped),
                 })
                 .collect();
             Self {
-                incoming,
-                incoming_bidi,
+                incoming: Arc::new(Mutex::new(incoming)),
+                incoming_bidi: Arc::new(Mutex::new(incoming_bidi)),
                 stopped,
             }
         }
@@ -718,7 +805,7 @@ mod tests {
             &mut self,
             _cx: &mut Context<'_>,
         ) -> Poll<Result<Self::RecvStream, ConnectionErrorIncoming>> {
-            match self.incoming.pop_front() {
+            match self.incoming.lock().expect("incoming").pop_front() {
                 Some(s) => Poll::Ready(Ok(s)),
                 None => Poll::Pending,
             }
@@ -728,7 +815,7 @@ mod tests {
             &mut self,
             _cx: &mut Context<'_>,
         ) -> Poll<Result<Self::BidiStream, ConnectionErrorIncoming>> {
-            match self.incoming_bidi.pop_front() {
+            match self.incoming_bidi.lock().expect("incoming_bidi").pop_front() {
                 Some(s) => Poll::Ready(Ok(s)),
                 None => Poll::Pending,
             }
@@ -858,6 +945,47 @@ mod tests {
         assert!(stopped.iter().any(|(id, _)| *id == 6), "{stopped:?}");
     }
 
+    #[test]
+    fn extra_unis_after_auth_are_held_not_stopped() {
+        let authed = Arc::new(AtomicBool::new(false));
+        let conn = MockConn::with_unis(&[(2, &[0x00]), (6, &[0x02]), (10, &[0x03])]);
+        let stopped = Arc::clone(&conn.stopped);
+        let incoming = Arc::clone(&conn.incoming);
+        let (tcp_tx, _tcp) = mpsc::unbounded_channel();
+        let mut filter = AuthUniFilter::with_tcp_tx_authed(conn, tcp_tx, Arc::clone(&authed));
+        let mut got = drain(&mut filter);
+        assert_eq!(got.len(), 3);
+        assert_eq!(first_bytes(&mut got[0]), &[0x00]);
+        assert_eq!(first_bytes(&mut got[1]), &[0x02]);
+        assert_eq!(first_bytes(&mut got[2]), &[0x03]);
+
+        authed.store(true, Ordering::Release);
+        incoming.lock().expect("incoming").extend([
+            mock_recv(14, &[0x00], &stopped),
+            mock_recv(18, &[0x02], &stopped),
+            mock_recv(22, &[0x03], &stopped),
+            mock_recv(26, &[0x21], &stopped),
+        ]);
+        let more = drain(&mut filter);
+        assert!(
+            more.is_empty(),
+            "extra unis after auth must not be returned to h3"
+        );
+        let stopped_now = stopped.lock().expect("stopped");
+        for id in [14u64, 18, 22, 26] {
+            assert!(
+                !stopped_now.iter().any(|(i, _)| *i == id),
+                "after auth extra uni {id} must not be stopped, got {stopped_now:?}"
+            );
+        }
+        drop(stopped_now);
+        assert_eq!(
+            filter.held_unis.len(),
+            4,
+            "extra 0x00/0x02/0x03 and unknown must be held"
+        );
+    }
+
     fn drain_bidi(filter: &mut AuthUniFilter<MockConn>) -> Vec<PrefixedBidi<DummyBidi>> {
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);
@@ -915,5 +1043,41 @@ mod tests {
         assert_eq!(got.len(), 1, "0x00 bidi must not be returned to h3");
         assert_eq!(first_bytes_bidi(&mut got[0]), &[0x01, 0x40]);
         assert!(tcp_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn tcp_request_after_auth_still_queued_while_holding_extras() {
+        let conn = MockConn::with_unis(&[(2, &[0x00]), (6, &[0x02]), (10, &[0x03])]);
+        let stopped = Arc::clone(&conn.stopped);
+        let incoming = Arc::clone(&conn.incoming);
+        let incoming_bidi = Arc::clone(&conn.incoming_bidi);
+        let (mut filter, mut tcp_rx) = AuthUniFilter::new(conn);
+        let got = drain(&mut filter);
+        assert_eq!(got.len(), 3);
+        filter.mark_authenticated();
+        incoming.lock().expect("incoming").extend([
+            mock_recv(14, &[0x00], &stopped),
+            mock_recv(18, &[0x02], &stopped),
+            mock_recv(22, &[0x03], &stopped),
+        ]);
+        incoming_bidi.lock().expect("incoming_bidi").push_back(DummyBidi {
+            send: DummySend,
+            recv: mock_recv(4, &[0x44, 0x01], &stopped),
+        });
+        let more_uni = drain(&mut filter);
+        assert!(more_uni.is_empty());
+        let got_bidi = drain_bidi(&mut filter);
+        assert!(got_bidi.is_empty(), "0x401 must not enter h3");
+        let (_, prefix) = tcp_rx.try_recv().expect("0x401 after 233");
+        assert_eq!(&prefix[..], &[0x44, 0x01]);
+        let stopped_now = stopped.lock().expect("stopped");
+        for id in [14u64, 18, 22] {
+            assert!(
+                !stopped_now.iter().any(|(i, _)| *i == id),
+                "extra uni {id} must not be stopped, got {stopped_now:?}"
+            );
+        }
+        drop(stopped_now);
+        assert_eq!(filter.held_unis.len(), 3);
     }
 }

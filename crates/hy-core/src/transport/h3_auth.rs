@@ -10,6 +10,7 @@ use crate::server::{Authenticator, MasqHandler, MasqResponse};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Client: POST `https://hysteria/auth` with Hysteria-Auth / CC-RX / Padding.
@@ -256,9 +257,11 @@ pub async fn server_authenticate(
 > {
     let remote = conn.remote_address();
     let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut h3_conn = h3::server::Connection::new(AuthUniFilter::with_tcp_tx(
+    let authed = Arc::new(AtomicBool::new(false));
+    let mut h3_conn = h3::server::Connection::new(AuthUniFilter::with_tcp_tx_authed(
         h3_quinn::Connection::new(conn),
         tcp_tx,
+        Arc::clone(&authed),
     ))
     .await
     .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
@@ -289,6 +292,10 @@ pub async fn server_authenticate(
     )
     .await?;
 
+    if result.is_some() {
+        authed.store(true, Ordering::Release);
+    }
+
     Ok((result, h3_conn, tcp_rx))
 }
 
@@ -308,8 +315,14 @@ where
     let path = req.uri().path();
     let host = request_host(&req);
     if is_hysteria_auth_request(method, &host, path) {
-        send_auth_ok(&mut stream, auth_resp).await?;
-        return Ok(());
+        match send_auth_ok(&mut stream, auth_resp).await {
+            Ok(()) => return Ok(()),
+            Err(e) if later_http_peer_closed(&e) => {
+                tracing::info!(err = %e, "h3 later request send 233");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
     }
     let masq_resp = if let Some(m) = masq {
         m.handle(method, &host, path).await
@@ -320,8 +333,35 @@ where
             body: Bytes::new(),
         }
     };
-    send_masq(&mut stream, masq_resp).await?;
-    Ok(())
+    match send_masq(&mut stream, masq_resp).await {
+        Ok(()) => Ok(()),
+        Err(e) if later_http_peer_closed(&e) => {
+            tracing::info!(err = %e, "h3 later request send 233");
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Peer closed QUIC with HTTP/3 / QUIC NO_ERROR (`ApplicationClose: 0x0` or
+/// `H3_NO_ERROR`). Later HTTP must not escalate this to a protocol error.
+fn later_http_peer_closed(e: &Error) -> bool {
+    match e {
+        Error::Quic(s) | Error::Connect(s) => {
+            s.contains("ApplicationClose: 0x0") || s.contains("H3_NO_ERROR")
+        }
+        _ => false,
+    }
+}
+
+/// `h3.accept` saw the peer close with no error. After 233 this is not auth
+/// failure; in-flight TCP copy tasks must not be torn down.
+pub(crate) fn h3_accept_is_peer_normal_close(e: &h3::error::ConnectionError) -> bool {
+    if e.is_h3_no_error() {
+        return true;
+    }
+    let s = e.to_string();
+    s.contains("ApplicationClose: 0x0") || s.contains("ApplicationClose: H3_NO_ERROR")
 }
 
 fn request_host(req: &Request<()>) -> String {
@@ -356,5 +396,19 @@ mod tests {
         assert!(!is_hysteria_auth_request("POST", "example.com", "/"));
         assert!(!is_hysteria_auth_request("POST", "hysteria", "/"));
         assert!(!is_hysteria_auth_request("POST", "", "/auth"));
+    }
+
+    #[test]
+    fn later_send_233_on_peer_0x0_is_not_protocol_error() {
+        assert!(later_http_peer_closed(&Error::Quic(
+            "send 233: ApplicationClose: 0x0".into()
+        )));
+        assert!(later_http_peer_closed(&Error::Quic(
+            "Connection error: Remote error: ApplicationClose: H3_NO_ERROR".into()
+        )));
+        assert!(!later_http_peer_closed(&Error::Quic(
+            "H3_FRAME_UNEXPECTED".into()
+        )));
+        assert!(!later_http_peer_closed(&Error::Protocol("bad".into())));
     }
 }

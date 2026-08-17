@@ -6,18 +6,19 @@ use super::{
 };
 use crate::congestion::apply_cc_mode;
 use crate::error::Error;
+use crate::protocol::varint_decode;
 use crate::protocol::{
-    read_tcp_request_bytes, write_tcp_response_bytes, AuthResponse, CLOSE_EXCESSIVE_LOAD, CLOSE_OK,
+    read_tcp_request_bytes, write_tcp_response_bytes, CLOSE_EXCESSIVE_LOAD, CLOSE_OK,
+    FRAME_TYPE_TCP_REQUEST,
 };
 use crate::transport::h3_auth;
-use crate::transport::h3_dispatch::StreamDispatcher;
 use crate::transport::quic;
 use async_trait::async_trait;
 use bytes::Bytes;
 use quinn::{Connection, RecvStream, SendStream};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
@@ -117,126 +118,105 @@ struct ServerConnCfg {
 
 async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> {
     let remote = conn.remote_address();
-    let authenticated = Arc::new(AtomicBool::new(false));
-    let auth_id_slot: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    let (auth, h3_keep) = h3_auth::server_authenticate(
+        conn.clone(),
+        cfg.authenticator.clone(),
+        cfg.ignore_client_bw,
+        cfg.max_tx,
+        cfg.max_rx,
+        cfg.disable_udp,
+        cfg.masq.clone(),
+    )
+    .await?;
 
-    let on_tcp = {
-        let outbound = cfg.outbound.clone();
-        let hook = cfg.request_hook.clone();
-        let auth_id_slot = auth_id_slot.clone();
-        let ev = cfg.event_logger.clone();
-        let tl = cfg.traffic_logger.clone();
-        let c = conn.clone();
-        Arc::new(move |send: SendStream, recv: RecvStream, leftover: Vec<u8>| {
-            let outbound = outbound.clone();
-            let hook = hook.clone();
-            let auth_id = auth_id_slot.lock().unwrap().clone();
-            let ev = ev.clone();
-            let tl = tl.clone();
-            let c = c.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_tcp(
-                    send, recv, leftover, outbound, hook, remote, &auth_id, ev, tl, c,
-                )
-                .await
-                {
-                    tracing::info!(remote = %remote, id = %auth_id, err = %e, "tcp stream error");
-                }
-            });
-        }) as crate::transport::h3_dispatch::TcpHijack
+    let Some((auth_id, _auth_resp, cc_choice)) = auth else {
+        let _ = conn.closed().await;
+        drop(h3_keep);
+        return Ok(());
     };
 
-    let dispatcher = StreamDispatcher::new(conn.clone(), authenticated.clone(), on_tcp);
-    let mut h3_conn = h3::server::Connection::new(dispatcher)
-        .await
-        .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
+    apply_cc_mode(&conn, cc_choice);
 
-    let mut first_auth: Option<(String, AuthResponse)> = None;
-    let mut udp_sm = None;
-    let mut accept_err: Option<Error> = None;
+    if let Some(ref ev) = cfg.event_logger {
+        ev.connect(remote, &auth_id, cfg.max_tx);
+    }
+    if let Some(ref tl) = cfg.traffic_logger {
+        tl.log_online_state(&auth_id, true);
+    }
 
+    // Hold h3 so Drop does not close QUIC; do not resume the H3 accept loop.
+    let hold_conn = conn.clone();
+    tokio::spawn(async move {
+        let _h3 = h3_keep;
+        let _ = hold_conn.closed().await;
+    });
+
+    // UDP SM (even when disable_udp — it silently drops datagrams).
+    let _udp_sm = ServerUdpSm::start(
+        conn.clone(),
+        cfg.outbound.clone(),
+        cfg.request_hook.clone(),
+        cfg.event_logger.clone(),
+        cfg.traffic_logger.clone(),
+        auth_id.clone(),
+        remote,
+        cfg.udp_idle,
+        cfg.disable_udp,
+    );
+
+    // Authenticated: leave H3. TCP is native accept_bi (frame 0x401).
+    // Late uni (e.g. a second H3 control) is reset/dropped, never given to h3.
     loop {
-        match h3_conn.accept().await {
-            Ok(Some(resolver)) => {
-                let (req, stream) = match resolver.resolve_request().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::info!(remote = %remote, err = %e, "h3 resolve");
-                        continue;
+        tokio::select! {
+            bi = conn.accept_bi() => {
+                match bi {
+                    Ok((send, recv)) => {
+                        let outbound = cfg.outbound.clone();
+                        let hook = cfg.request_hook.clone();
+                        let auth_id = auth_id.clone();
+                        let remote = remote;
+                        let ev = cfg.event_logger.clone();
+                        let tl = cfg.traffic_logger.clone();
+                        let c = conn.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_tcp(
+                                send, recv, outbound, hook, remote, &auth_id, ev, tl, c,
+                            )
+                            .await
+                            {
+                                tracing::info!(remote = %remote, id = %auth_id, err = %e, "tcp stream error");
+                            }
+                        });
                     }
-                };
-                let already = first_auth
-                    .as_ref()
-                    .map(|(id, resp)| (id.as_str(), resp));
-                match h3_auth::server_handle_auth_request(
-                    req,
-                    stream,
-                    remote,
-                    cfg.authenticator.as_ref(),
-                    cfg.ignore_client_bw,
-                    cfg.max_tx,
-                    cfg.max_rx,
-                    cfg.disable_udp,
-                    cfg.masq.as_deref(),
-                    already,
-                )
-                .await
-                {
-                    Ok(Some((id, resp, cc))) => {
-                        *auth_id_slot.lock().unwrap() = id.clone();
-                        authenticated.store(true, Ordering::Release);
-                        apply_cc_mode(&conn, cc);
-                        if let Some(ref ev) = cfg.event_logger {
-                            ev.connect(remote, &id, cfg.max_tx);
-                        }
-                        if let Some(ref tl) = cfg.traffic_logger {
-                            tl.log_online_state(&id, true);
-                        }
-                        udp_sm = Some(ServerUdpSm::start(
-                            conn.clone(),
-                            cfg.outbound.clone(),
-                            cfg.request_hook.clone(),
-                            cfg.event_logger.clone(),
-                            cfg.traffic_logger.clone(),
-                            id.clone(),
-                            remote,
-                            cfg.udp_idle,
-                            cfg.disable_udp,
-                        ));
-                        first_auth = Some((id, resp));
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing_log(&e),
+                    Err(_) => break,
                 }
             }
-            Ok(None) => break,
-            Err(e) => {
-                accept_err = Some(Error::Connect(format!("h3 accept: {e}")));
+            uni = conn.accept_uni() => {
+                match uni {
+                    Ok(mut recv) => {
+                        let _ = recv.stop(quinn::VarInt::from_u32(0));
+                    }
+                    Err(_) => break,
+                }
+            }
+            err = conn.closed() => {
+                if let Some(ref ev) = cfg.event_logger {
+                    let e = Error::Closed(Some(err.to_string()));
+                    ev.disconnect(remote, &auth_id, Some(&e));
+                }
+                if let Some(ref tl) = cfg.traffic_logger {
+                    tl.log_online_state(&auth_id, false);
+                }
                 break;
             }
         }
     }
-
-    let _ = udp_sm;
-    if let Some((id, _)) = &first_auth {
-        let closed = conn.close_reason().map(|e| Error::Closed(Some(e.to_string())));
-        if let Some(ref ev) = cfg.event_logger {
-            ev.disconnect(remote, id, closed.as_ref());
-        }
-        if let Some(ref tl) = cfg.traffic_logger {
-            tl.log_online_state(id, false);
-        }
-    }
-    match accept_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 async fn handle_tcp(
     mut send: SendStream,
     recv: RecvStream,
-    leftover: Vec<u8>,
     outbound: Arc<dyn Outbound>,
     request_hook: Option<Arc<dyn super::RequestHook>>,
     remote: SocketAddr,
@@ -245,22 +225,30 @@ async fn handle_tcp(
     traffic_logger: Option<Arc<dyn TrafficLogger>>,
     conn: Connection,
 ) -> Result<(), Error> {
-    // 0x401 already consumed by StreamDispatcher (official ReadTCPRequest
-    // starts at address length).
-    let mut buf = leftover;
+    let mut buf = Vec::with_capacity(256);
     let mut recv = recv;
     let (mut addr, after_req) = loop {
-        match read_tcp_request_bytes(&buf) {
-            Ok((addr, consumed)) => break (addr, consumed),
-            Err(Error::Protocol(_)) if buf.len() < 8192 => {
-                let mut tmp = [0u8; 512];
-                let n = recv
-                    .read(&mut tmp)
-                    .await
-                    .map_err(|e| Error::Closed(Some(e.to_string())))?
-                    .ok_or_else(|| Error::Protocol("eof before tcp request".into()))?;
-                buf.extend_from_slice(&tmp[..n]);
-            }
+        let mut tmp = [0u8; 512];
+        let n = recv
+            .read(&mut tmp)
+            .await
+            .map_err(|e| Error::Closed(Some(e.to_string())))?
+            .ok_or_else(|| Error::Protocol("eof before tcp request".into()))?;
+        buf.extend_from_slice(&tmp[..n]);
+
+        let (frame, frame_n) = match varint_decode(&buf) {
+            Ok(v) => v,
+            Err(_) if buf.len() < 8 => continue,
+            Err(e) => return Err(e),
+        };
+        if frame != FRAME_TYPE_TCP_REQUEST {
+            let _ = send.finish();
+            let _ = recv.stop(quinn::VarInt::from_u32(0));
+            return Ok(());
+        }
+        match read_tcp_request_bytes(&buf[frame_n..]) {
+            Ok((addr, consumed)) => break (addr, frame_n + consumed),
+            Err(Error::Protocol(_)) if buf.len() < 8192 => continue,
             Err(e) => return Err(e),
         }
     };

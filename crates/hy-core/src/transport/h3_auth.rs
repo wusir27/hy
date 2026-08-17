@@ -1,5 +1,4 @@
-//! HTTP/3 `/auth` (and masq). The server keeps h3.accept() for the QUIC lifetime;
-//! TCP 0x401 is hijacked below h3, not by stopping accept.
+//! HTTP/3 `/auth` only. After 233, TCP/UDP leave h3.
 
 use crate::error::Error;
 use crate::protocol::{
@@ -10,6 +9,7 @@ use crate::server::{Authenticator, MasqHandler, MasqResponse};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode};
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 /// Client: POST `https://hysteria/auth` with Hysteria-Auth / CC-RX / Padding.
 ///
@@ -106,9 +106,8 @@ pub(crate) async fn post_hysteria_auth(
 
 /// Server: handle a single h3 request for auth (or masq).
 ///
-/// Returns `Some((auth_id, AuthResponse, cc))` on the **first** successful auth
-/// (233 written). Returns `None` if masq/404 was sent, or if the tunnel was
-/// already authenticated and a repeat POST `/auth` was answered 233.
+/// Returns `Some((auth_id, AuthResponse))` on success (233 written).
+/// Returns `None` if masq/404 was sent (connection stays unauthenticated).
 pub async fn server_handle_auth_request<S>(
     req: Request<()>,
     mut stream: h3::server::RequestStream<S, Bytes>,
@@ -119,7 +118,6 @@ pub async fn server_handle_auth_request<S>(
     server_max_rx: u64,
     disable_udp: bool,
     masq: Option<&dyn MasqHandler>,
-    already: Option<(&str, &AuthResponse)>,
 ) -> Result<Option<(String, AuthResponse, crate::congestion::CcChoice)>, Error>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -142,11 +140,6 @@ where
     let is_auth = is_hysteria_auth_request(method, &host, path);
 
     if is_auth {
-        if let Some((auth_id, resp)) = already {
-            tracing::info!(remote = %remote, id = %auth_id, "already authenticated");
-            send_auth_ok(&mut stream, resp).await?;
-            return Ok(None);
-        }
         let mut hdrs = Vec::new();
         for (k, v) in req.headers().iter() {
             if let Ok(val) = v.to_str() {
@@ -247,6 +240,57 @@ where
         .await
         .map_err(|e| Error::Quic(format!("finish masq: {e}")))?;
     Ok(())
+}
+
+/// Drive h3 on `conn` until one auth succeeds or the first request is masq'd.
+///
+/// Accepts **once**. After return the caller must not call `h3.accept()` again
+/// (Drop would close QUIC, so the `h3::server::Connection` is returned to hold).
+pub async fn server_authenticate(
+    conn: quinn::Connection,
+    authenticator: Arc<dyn Authenticator>,
+    ignore_client_bw: bool,
+    server_max_tx: u64,
+    server_max_rx: u64,
+    disable_udp: bool,
+    masq: Option<Arc<dyn MasqHandler>>,
+) -> Result<
+    (
+        Option<(String, AuthResponse, crate::congestion::CcChoice)>,
+        h3::server::Connection<h3_quinn::Connection, Bytes>,
+    ),
+    Error,
+> {
+    let remote = conn.remote_address();
+    let mut h3_conn = h3::server::Connection::new(h3_quinn::Connection::new(conn))
+        .await
+        .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
+
+    let resolver = match h3_conn.accept().await {
+        Ok(Some(r)) => r,
+        Ok(None) => return Ok((None, h3_conn)),
+        Err(e) => return Err(Error::Connect(format!("h3 accept: {e}"))),
+    };
+
+    let (req, stream) = resolver
+        .resolve_request()
+        .await
+        .map_err(|e| Error::Connect(format!("h3 resolve: {e}")))?;
+
+    let result = server_handle_auth_request(
+        req,
+        stream,
+        remote,
+        authenticator.as_ref(),
+        ignore_client_bw,
+        server_max_tx,
+        server_max_rx,
+        disable_udp,
+        masq.as_deref(),
+    )
+    .await?;
+
+    Ok((result, h3_conn))
 }
 
 fn is_hysteria_auth_request(method: &str, host: &str, path: &str) -> bool {

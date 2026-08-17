@@ -221,8 +221,9 @@ impl Authenticator for CountAuth {
     }
 }
 
-/// After auth, a second POST `/auth` on the same QUIC must return 233, H3 stays
-/// up, authenticator is not re-run, and 0x401 is still TCP.
+/// After first 233, H3 is left: extra non-0x401 bidi must not close QUIC, and
+/// hy↔hy TCP still works via native `accept_bi` (0x401). A second 233 is **not**
+/// required (P9.B product item cancelled).
 #[tokio::test]
 async fn p9_second_auth_same_quic_returns_233() {
     let (cert_pem, key_pem) = self_signed_pem();
@@ -274,50 +275,31 @@ async fn p9_second_auth_same_quic_returns_233() {
         .await
         .expect("quic connect");
 
-    let h3_conn = h3_quinn::Connection::new(conn.clone());
-    let (mut driver, mut send_request) = h3::client::new(h3_conn).await.expect("h3 client");
-    tokio::spawn(async move {
-        std::future::poll_fn(|cx| std::pin::Pin::new(&mut driver).poll_close(cx)).await;
-    });
-
-    let (s1, r1) = tokio::time::timeout(
+    let (status, _auth, hold) = tokio::time::timeout(
         Duration::from_secs(5),
-        h3_auth::post_hysteria_auth(&mut send_request, "test", 0),
+        h3_auth::client_auth(conn.clone(), "test", 0),
     )
     .await
     .expect("first auth timeout")
     .expect("first auth");
-    assert_eq!(s1, STATUS_AUTH_OK);
+    assert_eq!(status, STATUS_AUTH_OK);
     assert_eq!(counter.n.load(Ordering::SeqCst), 1);
 
-    let get = http::Request::builder()
-        .method("GET")
-        .uri("https://example.com/")
-        .body(())
-        .unwrap();
-    let mut gs = send_request.send_request(get).await.expect("masq GET");
-    gs.finish().await.expect("masq finish");
-    let gresp = gs.recv_response().await.expect("masq resp");
-    assert_eq!(gresp.status().as_u16(), 404, "non-auth HTTP still masq");
-    while gs.recv_data().await.expect("masq body").is_some() {}
+    // Extra bidi that is not 0x401: finish/stop that stream only; QUIC stays up.
+    let (mut junk_send, junk_recv) = conn.open_bi().await.expect("junk bi");
+    junk_send.write_all(&[0x00]).await.expect("junk write");
+    let _ = junk_send.finish();
+    drop(junk_recv);
 
-    let (s2, r2) = tokio::time::timeout(
-        Duration::from_secs(5),
-        h3_auth::post_hysteria_auth(&mut send_request, "does-not-reauth", 0),
-    )
-    .await
-    .expect("second auth timeout")
-    .expect("second auth");
-    assert_eq!(s2, STATUS_AUTH_OK);
-    assert_eq!(r1, r2, "repeat 233 uses first AuthResponse fields");
-    assert_eq!(
-        counter.n.load(Ordering::SeqCst),
-        1,
-        "second /auth must not re-run authenticator"
-    );
+    // A late uni after 233 must not close QUIC (H3 session ended; not fed to h3).
+    let mut junk_uni = conn.open_uni().await.expect("junk uni");
+    junk_uni.write_all(&[0x00]).await.expect("junk uni write");
+    let _ = junk_uni.finish();
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
     assert!(
         conn.close_reason().is_none(),
-        "QUIC must stay up after second /auth"
+        "QUIC must stay up after non-0x401 bidi / late uni"
     );
 
     let echo_s = format!("{echo_addr}");
@@ -355,7 +337,39 @@ async fn p9_second_auth_same_quic_returns_233() {
     assert!(conn.close_reason().is_none());
 
     let _ = send.finish();
-    drop(send_request);
+    drop(hold);
     conn.close(quinn::VarInt::from_u32(0x100), b"");
     let _ = server.close().await;
+}
+
+/// After `server_authenticate` returns, `handle_conn` only `accept_bi` / `closed`
+/// (and optional uni drain). No `h3.accept()` in that loop.
+#[test]
+fn p9_handle_conn_leaves_h3_after_authenticate() {
+    let src = include_str!("server/impl.rs");
+    let start = src.find("async fn handle_conn").expect("handle_conn");
+    let rest = &src[start + 1..];
+    let end = rest
+        .find("\nasync fn ")
+        .map(|i| start + 1 + i)
+        .unwrap_or(src.len());
+    let fn_src = &src[start..end];
+    let auth_at = fn_src
+        .find("server_authenticate")
+        .expect("server_authenticate");
+    let after = &fn_src[auth_at..];
+    assert!(
+        after.contains("conn.accept_bi()"),
+        "after auth the loop must accept_bi"
+    );
+    assert!(
+        after.contains("conn.closed()"),
+        "after auth the loop must wait on closed"
+    );
+    assert!(
+        !after.contains("h3_conn.accept()")
+            && !after.contains("h3.accept()")
+            && !after.contains("h3_conn.accept"),
+        "must not call h3.accept after authenticate returns"
+    );
 }

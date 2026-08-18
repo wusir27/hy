@@ -1,36 +1,29 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="360" font-family="sans-serif">
 <rect width="100%" height="100%" fill="#fff"/>
-<text x="400.0" y="24" text-anchor="middle" font-size="15" font-weight="600">Peak throughput (sandbox, 6fa6a40)</text>
+<text x="400" y="24" text-anchor="middle" font-size="15" font-weight="600">UDP peak / 800 / unlimited (3eee581)</text>
 <line x1="56" y1="40" x2="56" y2="290" stroke="#333"/>
 <line x1="56" y1="290" x2="776" y2="290" stroke="#333"/>
 <line x1="56" y1="290.0" x2="776" y2="290.0" stroke="#eee"/>
 <text x="48" y="294.0" text-anchor="end" font-size="11" fill="#555">0</text>
 <line x1="56" y1="227.5" x2="776" y2="227.5" stroke="#eee"/>
-<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">334</text>
+<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">250</text>
 <line x1="56" y1="165.0" x2="776" y2="165.0" stroke="#eee"/>
-<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">668</text>
+<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">500</text>
 <line x1="56" y1="102.5" x2="776" y2="102.5" stroke="#eee"/>
-<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">1002</text>
+<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">750</text>
 <line x1="56" y1="40.0" x2="776" y2="40.0" stroke="#eee"/>
-<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">1336</text>
-<text x="14" y="165.0" text-anchor="middle" font-size="11" fill="#555" transform="rotate(-90 14 165.0)">Mbps</text>
-<rect x="104.0" y="215.4" width="90.3" height="74.6" fill="#2563eb" rx="2"/>
-<text x="149.2" y="211.4" text-anchor="middle" font-size="10" fill="#333">398</text>
-<rect x="344.0" y="141.1" width="90.3" height="148.9" fill="#2563eb" rx="2"/>
-<text x="389.2" y="137.1" text-anchor="middle" font-size="10" fill="#333">796</text>
-<rect x="584.0" y="72.6" width="90.3" height="217.4" fill="#2563eb" rx="2"/>
-<text x="629.2" y="68.6" text-anchor="middle" font-size="10" fill="#333">1162</text>
-<rect x="196.3" y="215.4" width="90.3" height="74.6" fill="#f59e0b" rx="2"/>
-<text x="241.5" y="211.4" text-anchor="middle" font-size="10" fill="#333">399</text>
-<rect x="436.3" y="156.9" width="90.3" height="133.1" fill="#f59e0b" rx="2"/>
-<text x="481.5" y="152.9" text-anchor="middle" font-size="10" fill="#333">711</text>
-<rect x="676.3" y="121.1" width="90.3" height="168.9" fill="#f59e0b" rx="2"/>
-<text x="721.5" y="117.1" text-anchor="middle" font-size="10" fill="#333">903</text>
-<text x="176.0" y="322" text-anchor="middle" font-size="11">Sal 400</text>
-<text x="416.0" y="322" text-anchor="middle" font-size="11">Sal 800</text>
-<text x="656.0" y="322" text-anchor="middle" font-size="11">Sal unlimited</text>
-<rect x="56" y="338" width="12" height="12" fill="#2563eb"/>
-<text x="72" y="348" font-size="12">hy 0.2.0</text>
-<rect x="146" y="338" width="12" height="12" fill="#f59e0b"/>
-<text x="162" y="348" font-size="12">Go v2.8.1</text>
+<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">1000</text>
+<text x="14" y="165" text-anchor="middle" font-size="11" fill="#555" transform="rotate(-90 14 165)">Mbps</text>
+<rect x="133.2" y="101.0" width="100.8" height="189.0" fill="#2563eb" rx="2"/>
+<text x="183.6" y="97.0" text-anchor="middle" font-size="10" fill="#333">756</text>
+<rect x="238.0" y="118.0" width="100.8" height="172.0" fill="#f59e0b" rx="2"/>
+<text x="288.4" y="114.0" text-anchor="middle" font-size="10" fill="#333">688</text>
+<text x="236.0" y="322" text-anchor="middle" font-size="11">800</text>
+<rect x="493.2" y="79.8" width="100.8" height="210.2" fill="#2563eb" rx="2"/>
+<text x="543.6" y="75.8" text-anchor="middle" font-size="10" fill="#333">841</text>
+<rect x="598.0" y="127.5" width="100.8" height="162.5" fill="#f59e0b" rx="2"/>
+<text x="648.4" y="123.5" text-anchor="middle" font-size="10" fill="#333">650</text>
+<text x="596.0" y="322" text-anchor="middle" font-size="11">unlimited</text>
+<rect x="620" y="332" width="12" height="12" fill="#2563eb"/><text x="636" y="343" font-size="12">hy</text>
+<rect x="680" y="332" width="12" height="12" fill="#f59e0b"/><text x="696" y="343" font-size="12">Go</text>
 </svg>

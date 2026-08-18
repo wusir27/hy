@@ -1,36 +1,34 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="360" font-family="sans-serif">
 <rect width="100%" height="100%" fill="#fff"/>
-<text x="400.0" y="24" text-anchor="middle" font-size="15" font-weight="600">CPU at same 400 Mbps UDP (TLS+Salamander, 6fa6a40)</text>
+<text x="400" y="24" text-anchor="middle" font-size="15" font-weight="600">CPU at ~386 Mbps UDP (TLS+Salamander, 3eee581)</text>
 <line x1="56" y1="40" x2="56" y2="290" stroke="#333"/>
 <line x1="56" y1="290" x2="776" y2="290" stroke="#333"/>
 <line x1="56" y1="290.0" x2="776" y2="290.0" stroke="#eee"/>
 <text x="48" y="294.0" text-anchor="end" font-size="11" fill="#555">0</text>
 <line x1="56" y1="227.5" x2="776" y2="227.5" stroke="#eee"/>
-<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">71</text>
+<text x="48" y="231.5" text-anchor="end" font-size="11" fill="#555">88</text>
 <line x1="56" y1="165.0" x2="776" y2="165.0" stroke="#eee"/>
-<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">142</text>
+<text x="48" y="169.0" text-anchor="end" font-size="11" fill="#555">175</text>
 <line x1="56" y1="102.5" x2="776" y2="102.5" stroke="#eee"/>
-<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">214</text>
+<text x="48" y="106.5" text-anchor="end" font-size="11" fill="#555">262</text>
 <line x1="56" y1="40.0" x2="776" y2="40.0" stroke="#eee"/>
-<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">285</text>
-<text x="14" y="165.0" text-anchor="middle" font-size="11" fill="#555" transform="rotate(-90 14 165.0)">CPU %</text>
-<rect x="104.0" y="221.1" width="90.3" height="68.9" fill="#2563eb" rx="2"/>
-<text x="149.2" y="217.1" text-anchor="middle" font-size="10" fill="#333">78</text>
-<rect x="344.0" y="255.7" width="90.3" height="34.3" fill="#2563eb" rx="2"/>
-<text x="389.2" y="251.7" text-anchor="middle" font-size="10" fill="#333">39</text>
-<rect x="584.0" y="186.7" width="90.3" height="103.3" fill="#2563eb" rx="2"/>
-<text x="629.2" y="182.7" text-anchor="middle" font-size="10" fill="#333">118</text>
-<rect x="196.3" y="178.7" width="90.3" height="111.3" fill="#f59e0b" rx="2"/>
-<text x="241.5" y="174.7" text-anchor="middle" font-size="10" fill="#333">127</text>
-<rect x="436.3" y="183.9" width="90.3" height="106.1" fill="#f59e0b" rx="2"/>
-<text x="481.5" y="179.9" text-anchor="middle" font-size="10" fill="#333">121</text>
-<rect x="676.3" y="72.6" width="90.3" height="217.4" fill="#f59e0b" rx="2"/>
-<text x="721.5" y="68.6" text-anchor="middle" font-size="10" fill="#333">248</text>
+<text x="48" y="44.0" text-anchor="end" font-size="11" fill="#555">350</text>
+<text x="14" y="165" text-anchor="middle" font-size="11" fill="#555" transform="rotate(-90 14 165)">CPU %</text>
+<rect x="82.0" y="209.3" width="90.0" height="80.7" fill="#2563eb" rx="2"/>
+<text x="127.0" y="205.3" text-anchor="middle" font-size="10" fill="#333">113</text>
+<rect x="180.0" y="187.1" width="90.0" height="102.9" fill="#f59e0b" rx="2"/>
+<text x="225.0" y="183.1" text-anchor="middle" font-size="10" fill="#333">144</text>
 <text x="176.0" y="322" text-anchor="middle" font-size="11">server</text>
+<rect x="322.0" y="240.7" width="90.0" height="49.3" fill="#2563eb" rx="2"/>
+<text x="367.0" y="236.7" text-anchor="middle" font-size="10" fill="#333">69</text>
+<rect x="420.0" y="186.4" width="90.0" height="103.6" fill="#f59e0b" rx="2"/>
+<text x="465.0" y="182.4" text-anchor="middle" font-size="10" fill="#333">145</text>
 <text x="416.0" y="322" text-anchor="middle" font-size="11">client</text>
+<rect x="562.0" y="160.0" width="90.0" height="130.0" fill="#2563eb" rx="2"/>
+<text x="607.0" y="156.0" text-anchor="middle" font-size="10" fill="#333">182</text>
+<rect x="660.0" y="82.9" width="90.0" height="207.1" fill="#f59e0b" rx="2"/>
+<text x="705.0" y="78.9" text-anchor="middle" font-size="10" fill="#333">290</text>
 <text x="656.0" y="322" text-anchor="middle" font-size="11">server+client</text>
-<rect x="56" y="338" width="12" height="12" fill="#2563eb"/>
-<text x="72" y="348" font-size="12">hy 0.2.0</text>
-<rect x="146" y="338" width="12" height="12" fill="#f59e0b"/>
-<text x="162" y="348" font-size="12">Go v2.8.1</text>
+<rect x="620" y="332" width="12" height="12" fill="#2563eb"/><text x="636" y="343" font-size="12">hy</text>
+<rect x="680" y="332" width="12" height="12" fill="#f59e0b"/><text x="696" y="343" font-size="12">Go</text>
 </svg>

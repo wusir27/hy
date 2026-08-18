@@ -359,7 +359,7 @@ mod tests {
         let cargo = include_str!("../../../Cargo.toml");
 
         assert!(
-            cargo.contains("version = \"0.3.10\""),
+            cargo.contains("version = \"0.0.1\""),
             "P9.X must not bump version"
         );
 

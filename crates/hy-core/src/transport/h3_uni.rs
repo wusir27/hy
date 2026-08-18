@@ -15,6 +15,7 @@
 //! (outbound only after 233) and is never given to h3. HTTP bytes are put back.
 //! After 233 the same wrapper is still polled (`h3.accept`); do not raw-accept.
 
+use crate::p9x::P9xConn;
 use crate::protocol::FRAME_TYPE_TCP_REQUEST;
 use bytes::{Buf, Bytes, BytesMut};
 use h3::quic::{
@@ -58,6 +59,8 @@ where
     authed: Arc<AtomicBool>,
     /// Extra / unknown unis accepted after 233. Must not Drop until QUIC dies.
     held_unis: Vec<C::RecvStream>,
+    /// Diagnostic identity (`side = "hy"` events).
+    p9x: P9xConn,
 }
 
 impl<C> AuthUniFilter<C>
@@ -70,13 +73,14 @@ where
     }
 
     pub fn with_tcp_tx(inner: C, tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>) -> Self {
-        Self::with_tcp_tx_authed(inner, tcp_tx, Arc::new(AtomicBool::new(false)))
+        Self::with_tcp_tx_authed(inner, tcp_tx, Arc::new(AtomicBool::new(false)), P9xConn::default())
     }
 
     pub fn with_tcp_tx_authed(
         inner: C,
         tcp_tx: mpsc::UnboundedSender<(C::BidiStream, Bytes)>,
         authed: Arc<AtomicBool>,
+        p9x: P9xConn,
     ) -> Self {
         Self {
             inner,
@@ -88,6 +92,7 @@ where
             tcp_tx,
             authed,
             held_unis: Vec::new(),
+            p9x,
         }
     }
 
@@ -309,6 +314,7 @@ where
     }
 
     fn close(&mut self, code: h3::error::Code, reason: &[u8]) {
+        self.p9x.close_local(code.value());
         self.inner.close(code, reason);
     }
 }
@@ -366,12 +372,16 @@ where
                 Err(_) if buf.len() < 8 => continue,
                 Err(_) => {
                     let (stream, buf) = self.bidi_peek.take().expect("bidi peek take");
+                    let stream_id = RecvStream::recv_id(&stream).into_inner();
+                    self.p9x.bidi_first(stream_id, None);
                     return Poll::Ready(Ok(restore_bidi(stream, buf.freeze())));
                 }
                 Ok((ty, _)) => {
                     let (stream, buf) = self.bidi_peek.take().expect("bidi peek take");
+                    let stream_id = RecvStream::recv_id(&stream).into_inner();
+                    self.p9x.bidi_first(stream_id, Some(ty));
                     if ty == FRAME_TYPE_TCP_REQUEST {
-                        tracing::info!(
+                        tracing::debug!(
                             stream_id = %RecvStream::recv_id(&stream),
                             "queued 0x401"
                         );
@@ -379,7 +389,7 @@ where
                         continue;
                     }
                     if ty != H3_FRAME_HEADERS {
-                        tracing::info!(
+                        tracing::debug!(
                             stream_id = %RecvStream::recv_id(&stream),
                             frame = ty,
                             "dropping non-http bidi"
@@ -443,6 +453,8 @@ where
                 Err(_) if buf.len() < 8 => continue,
                 Err(_) => {
                     if let Some((stream, _)) = self.peek.take() {
+                        let stream_id = RecvStream::recv_id(&stream).into_inner();
+                        self.p9x.uni(stream_id, None, false);
                         drop_or_hold_uni(
                             &self.authed,
                             &mut self.held_unis,
@@ -455,6 +467,7 @@ where
                 }
                 Ok((ty, _)) => {
                     let (stream, buf) = self.peek.take().expect("peek take");
+                    let stream_id = RecvStream::recv_id(&stream).into_inner();
                     match uni_action(
                         ty,
                         &mut self.saw_control,
@@ -462,12 +475,14 @@ where
                         &mut self.saw_qpack_decoder,
                     ) {
                         UniAction::Deliver => {
+                            self.p9x.uni(stream_id, Some(ty), false);
                             return Poll::Ready(Ok(PrefixedRecv {
                                 inner: stream,
                                 prefix: Some(buf.freeze()),
                             }));
                         }
                         UniAction::DropExtra => {
+                            self.p9x.uni(stream_id, Some(ty), true);
                             drop_or_hold_uni(
                                 &self.authed,
                                 &mut self.held_unis,
@@ -478,6 +493,7 @@ where
                             continue;
                         }
                         UniAction::DropUnknown => {
+                            self.p9x.uni(stream_id, Some(ty), false);
                             drop_or_hold_uni(
                                 &self.authed,
                                 &mut self.held_unis,
@@ -532,12 +548,12 @@ fn drop_or_hold_uni<R: RecvStream>(
 ) {
     if authed.load(Ordering::Acquire) {
         match ty {
-            Some(ty) => tracing::info!(
+            Some(ty) => tracing::debug!(
                 stream_type = ty,
                 stream_id = %stream.recv_id(),
                 "holding extra h3 uni"
             ),
-            None => tracing::info!(
+            None => tracing::debug!(
                 stream_id = %stream.recv_id(),
                 "holding extra h3 uni"
             ),
@@ -547,7 +563,7 @@ fn drop_or_hold_uni<R: RecvStream>(
     }
     if extra {
         if let Some(ty) = ty {
-            tracing::info!(
+            tracing::debug!(
                 stream_type = ty,
                 stream_id = %stream.recv_id(),
                 "dropping extra h3 uni"
@@ -952,7 +968,7 @@ mod tests {
         let stopped = Arc::clone(&conn.stopped);
         let incoming = Arc::clone(&conn.incoming);
         let (tcp_tx, _tcp) = mpsc::unbounded_channel();
-        let mut filter = AuthUniFilter::with_tcp_tx_authed(conn, tcp_tx, Arc::clone(&authed));
+        let mut filter = AuthUniFilter::with_tcp_tx_authed(conn, tcp_tx, Arc::clone(&authed), P9xConn::default());
         let mut got = drain(&mut filter);
         assert_eq!(got.len(), 3);
         assert_eq!(first_bytes(&mut got[0]), &[0x00]);

@@ -29,6 +29,7 @@ pub struct ServerUdpSm {
     idle: Duration,
     sessions: Mutex<HashMap<u32, Arc<Session>>>,
     disable_udp: bool,
+    p9x: crate::p9x::P9xConn,
 }
 
 struct Session {
@@ -54,6 +55,7 @@ impl ServerUdpSm {
         remote: SocketAddr,
         idle: Duration,
         disable_udp: bool,
+        p9x: crate::p9x::P9xConn,
     ) -> Arc<Self> {
         let sm = Arc::new(Self {
             conn: conn.clone(),
@@ -66,6 +68,7 @@ impl ServerUdpSm {
             idle,
             sessions: Mutex::new(HashMap::new()),
             disable_udp,
+            p9x,
         });
         let sm2 = Arc::clone(&sm);
         tokio::spawn(async move {
@@ -399,6 +402,7 @@ impl ServerUdpSm {
         if tl.log_traffic(&self.auth_id, tx, rx) {
             return true;
         }
+        self.p9x.close_local(CLOSE_EXCESSIVE_LOAD as u64);
         self.conn.close(
             quinn::VarInt::from_u32(CLOSE_EXCESSIVE_LOAD as u32),
             b"kicked",

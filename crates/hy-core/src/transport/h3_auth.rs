@@ -2,6 +2,7 @@
 
 use super::h3_uni::{AuthUniFilter, QueuedTcpBidi, ServerAuthH3};
 use crate::error::Error;
+use crate::p9x::P9xConn; // side = "hy"
 use crate::protocol::{
     auth_request_from_headers, auth_request_to_headers, auth_response_from_headers,
     auth_response_to_headers, AuthRequest, AuthResponse, STATUS_AUTH_OK, URL_HOST, URL_PATH,
@@ -120,6 +121,7 @@ pub async fn server_handle_auth_request<S>(
     server_max_rx: u64,
     disable_udp: bool,
     masq: Option<&dyn MasqHandler>,
+    p9x: P9xConn,
 ) -> Result<Option<(String, AuthResponse, crate::congestion::CcChoice)>, Error>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -128,6 +130,7 @@ where
     let method = req.method().as_str();
     let path = req.uri().path();
     let host = request_host(&req);
+    p9x.http_req(method, &host, path);
     let is_auth = is_hysteria_auth_request(method, &host, path);
 
     if is_auth {
@@ -153,7 +156,8 @@ where
                 rx: if ignore_client_bw { 0 } else { server_max_rx },
                 rx_auto: ignore_client_bw,
             };
-            send_auth_ok(&mut stream, &resp).await?;
+            send_auth_ok(&mut stream, &resp, p9x).await?;
+            p9x.auth_233();
             return Ok(Some((id, resp, cc)));
         }
         // Auth HTTP request with a failed password: still masquerade, but log first.
@@ -177,6 +181,7 @@ where
 async fn send_auth_ok<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     resp: &AuthResponse,
+    p9x: P9xConn,
 ) -> Result<(), Error>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -198,6 +203,9 @@ where
         .finish()
         .await
         .map_err(|e| Error::Quic(format!("finish 233: {e}")))?;
+    // HEADERS+FIN are already on the QUIC stream (`write` polls ready; `finish`
+    // is quinn FIN). rust-h3 exposes no extra flush on RequestStream.
+    p9x.auth_233_fin();
     Ok(())
 }
 
@@ -247,6 +255,7 @@ pub async fn server_authenticate(
     server_max_rx: u64,
     disable_udp: bool,
     masq: Option<Arc<dyn MasqHandler>>,
+    p9x: P9xConn,
 ) -> Result<
     (
         Option<(String, AuthResponse, crate::congestion::CcChoice)>,
@@ -258,13 +267,22 @@ pub async fn server_authenticate(
     let remote = conn.remote_address();
     let (tcp_tx, tcp_rx) = tokio::sync::mpsc::unbounded_channel();
     let authed = Arc::new(AtomicBool::new(false));
-    let mut h3_conn = h3::server::Connection::new(AuthUniFilter::with_tcp_tx_authed(
-        h3_quinn::Connection::new(conn),
-        tcp_tx,
-        Arc::clone(&authed),
-    ))
-    .await
-    .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
+    // Official apernet/quic-go newRawServerConn SETTINGS: ExtendedConnect,
+    // MaxFieldSectionSize=1<<20, no grease / datagram / webtransport.
+    let mut b = h3::server::builder();
+    b.enable_extended_connect(true);
+    b.max_field_section_size(1 << 20);
+    b.send_grease(false);
+    let mut h3_conn = b
+        .build(AuthUniFilter::with_tcp_tx_authed(
+            h3_quinn::Connection::new(conn),
+            tcp_tx,
+            Arc::clone(&authed),
+            p9x,
+        ))
+        .await
+        .map_err(|e| Error::Connect(format!("h3 server: {e}")))?;
+    p9x.settings();
 
     let resolver = match h3_conn.accept().await {
         Ok(Some(r)) => r,
@@ -289,6 +307,7 @@ pub async fn server_authenticate(
         server_max_rx,
         disable_udp,
         masq.as_deref(),
+        p9x,
     )
     .await?;
 
@@ -306,6 +325,7 @@ pub async fn server_handle_authed_http<S>(
     mut stream: h3::server::RequestStream<S, Bytes>,
     auth_resp: &AuthResponse,
     masq: Option<&dyn MasqHandler>,
+    p9x: P9xConn,
 ) -> Result<(), Error>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -314,11 +334,15 @@ where
     let method = req.method().as_str();
     let path = req.uri().path();
     let host = request_host(&req);
+    p9x.http_req(method, &host, path);
     if is_hysteria_auth_request(method, &host, path) {
-        match send_auth_ok(&mut stream, auth_resp).await {
-            Ok(()) => return Ok(()),
+        match send_auth_ok(&mut stream, auth_resp, p9x).await {
+            Ok(()) => {
+                p9x.auth_233();
+                return Ok(());
+            }
             Err(e) if later_http_peer_closed(&e) => {
-                tracing::info!(err = %e, "h3 later request send 233");
+                tracing::debug!(err = %e, "h3 later request send 233");
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -336,7 +360,7 @@ where
     match send_masq(&mut stream, masq_resp).await {
         Ok(()) => Ok(()),
         Err(e) if later_http_peer_closed(&e) => {
-            tracing::info!(err = %e, "h3 later request send 233");
+            tracing::debug!(err = %e, "h3 later request send 233");
             Ok(())
         }
         Err(e) => Err(e),
@@ -345,7 +369,7 @@ where
 
 /// Peer closed QUIC with HTTP/3 / QUIC NO_ERROR (`ApplicationClose: 0x0` or
 /// `H3_NO_ERROR`). Later HTTP must not escalate this to a protocol error.
-fn later_http_peer_closed(e: &Error) -> bool {
+pub(crate) fn later_http_peer_closed(e: &Error) -> bool {
     match e {
         Error::Quic(s) | Error::Connect(s) => {
             s.contains("ApplicationClose: 0x0") || s.contains("H3_NO_ERROR")
@@ -396,6 +420,54 @@ mod tests {
         assert!(!is_hysteria_auth_request("POST", "example.com", "/"));
         assert!(!is_hysteria_auth_request("POST", "hysteria", "/"));
         assert!(!is_hysteria_auth_request("POST", "", "/auth"));
+    }
+
+    #[test]
+    fn later_http_auth_logs_method_and_path_before_233() {
+        let src = include_str!("h3_auth.rs");
+        let start = src
+            .find("pub async fn server_handle_authed_http")
+            .expect("later HTTP");
+        let fn_src = &src[start..];
+        let auth_branch = fn_src
+            .find("is_hysteria_auth_request")
+            .expect("later /auth");
+        let before_auth = &fn_src[..auth_branch];
+        assert!(
+            before_auth.contains(".http_req(") && before_auth.contains("method"),
+            "later /auth must log http_req with method before send_auth_ok"
+        );
+        assert!(
+            before_auth.contains("path"),
+            "later /auth http_req must include path"
+        );
+        let after_auth = &fn_src[auth_branch..];
+        let send_ok = after_auth.find("send_auth_ok").expect("send_auth_ok");
+        assert!(
+            !after_auth[..send_ok].contains("send_masq"),
+            "/auth case uses send_auth_ok"
+        );
+    }
+
+    #[test]
+    fn later_http_masq_logs_method_and_path_before_masq() {
+        let src = include_str!("h3_auth.rs");
+        let start = src
+            .find("pub async fn server_handle_authed_http")
+            .expect("later HTTP");
+        let fn_src = &src[start..];
+        let masq_at = fn_src.find("send_masq").expect("non-/auth masq");
+        let before_masq = &fn_src[..masq_at];
+        assert!(
+            before_masq.contains(".http_req(")
+                && before_masq.contains("method")
+                && before_masq.contains("path"),
+            "later non-/auth must log http_req method+path before send_masq"
+        );
+        assert!(
+            before_masq.contains("is_hysteria_auth_request"),
+            "masq is the non-/auth branch"
+        );
     }
 
     #[test]

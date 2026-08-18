@@ -6,10 +6,10 @@ use super::{
 };
 use crate::congestion::apply_cc_mode;
 use crate::error::Error;
+use crate::p9x::{alloc_conn_seq, parse_close_code, P9xConn, TcpByteCounts}; // side = "hy"
 use crate::protocol::varint_decode;
 use crate::protocol::{
-    read_tcp_request_bytes, write_tcp_response_bytes, CLOSE_EXCESSIVE_LOAD, CLOSE_OK,
-    FRAME_TYPE_TCP_REQUEST,
+    read_tcp_request_bytes, write_tcp_response_bytes, CLOSE_OK, FRAME_TYPE_TCP_REQUEST,
 };
 use crate::transport::h3_auth;
 use crate::transport::h3_uni::QueuedTcpBidi;
@@ -75,7 +75,9 @@ impl Server for ServerInner {
                     tokio::spawn(async move {
                         match incoming.await {
                             Ok(conn) => {
-                                if let Err(e) = handle_conn(conn, cfg).await {
+                                let p9x = P9xConn::new(alloc_conn_seq(), conn.remote_address());
+                                p9x.conn_accept();
+                                if let Err(e) = handle_conn(conn, cfg, p9x).await {
                                     tracing_log(&e);
                                 }
                             }
@@ -101,7 +103,12 @@ impl Server for ServerInner {
 }
 
 fn tracing_log(e: &Error) {
-    tracing::info!(err = %e, "server conn error");
+    tracing::error!(err = %e, "server conn error");
+}
+
+fn h3_display_is_peer_normal_close(e: &impl std::fmt::Display) -> bool {
+    let s = e.to_string();
+    s.contains("ApplicationClose: 0x0") || s.contains("H3_NO_ERROR")
 }
 
 struct ServerConnCfg {
@@ -118,7 +125,7 @@ struct ServerConnCfg {
     traffic_logger: Option<Arc<dyn TrafficLogger>>,
 }
 
-async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> {
+async fn handle_conn(conn: Connection, cfg: ServerConnCfg, p9x: P9xConn) -> Result<(), Error> {
     let remote = conn.remote_address();
     let (auth, mut h3_keep, mut tcp_rx) = h3_auth::server_authenticate(
         conn.clone(),
@@ -128,13 +135,16 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
         cfg.max_rx,
         cfg.disable_udp,
         cfg.masq.clone(),
+        p9x,
     )
     .await?;
 
     let Some((auth_id, auth_resp, cc_choice)) = auth else {
         // Unauthenticated: drop queued 0x401 without outbound dial.
         drop(tcp_rx);
-        let _ = conn.closed().await;
+        let err = conn.closed().await;
+        let err_s = err.to_string();
+        p9x.close_remote("remote", parse_close_code(&err_s), &err_s);
         drop(h3_keep);
         return Ok(());
     };
@@ -159,6 +169,7 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
         remote,
         cfg.udp_idle,
         cfg.disable_udp,
+        p9x,
     );
 
     // Drain 0x401 peeked during authenticate. Outbound only after 233.
@@ -174,6 +185,7 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
             cfg.event_logger.clone(),
             cfg.traffic_logger.clone(),
             conn.clone(),
+            p9x,
         );
     }
 
@@ -190,6 +202,7 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
                     Ok(Some(resolver)) => {
                         let auth_resp = auth_resp.clone();
                         let masq = cfg.masq.clone();
+                        let p9x = p9x;
                         tokio::spawn(async move {
                             match resolver.resolve_request().await {
                                 Ok((req, stream)) => {
@@ -198,34 +211,53 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
                                         stream,
                                         &auth_resp,
                                         masq.as_deref(),
+                                        p9x,
                                     )
                                     .await
                                     {
-                                        tracing::info!(err = %e, "h3 later request");
+                                        if h3_auth::later_http_peer_closed(&e) {
+                                            tracing::debug!(err = %e, "h3 later request");
+                                        } else {
+                                            tracing::error!(err = %e, "h3 later request");
+                                        }
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::info!(err = %e, "h3 resolve");
+                                    if h3_display_is_peer_normal_close(&e) {
+                                        tracing::debug!(err = %e, "h3 resolve");
+                                    } else {
+                                        tracing::error!(err = %e, "h3 resolve");
+                                    }
                                 }
                             }
                         });
                     }
                     Ok(None) => {
-                        tracing::info!("h3 accept ended");
+                        tracing::debug!("h3 accept ended");
                         if tcp_started {
                             h3_gone = true;
                         } else {
                             let err = conn.closed().await;
+                            let err_s = err.to_string();
+                            p9x.close_remote("remote", parse_close_code(&err_s), &err_s);
                             emit_disconnect(&cfg, remote, &auth_id, &err);
                             break;
                         }
                     }
                     Err(e) => {
-                        tracing::info!(err = %e, "h3 accept");
+                        if h3_auth::h3_accept_is_peer_normal_close(&e) {
+                            tracing::debug!(err = %e, "h3 accept");
+                        } else {
+                            tracing::error!(err = %e, "h3 accept");
+                        }
                         if tcp_started && h3_auth::h3_accept_is_peer_normal_close(&e) {
+                            let err_s = e.to_string();
+                            p9x.close_remote("remote", parse_close_code(&err_s), &err_s);
                             h3_gone = true;
                         } else {
                             let err = conn.closed().await;
+                            let err_s = err.to_string();
+                            p9x.close_remote("remote", parse_close_code(&err_s), &err_s);
                             emit_disconnect(&cfg, remote, &auth_id, &err);
                             break;
                         }
@@ -244,10 +276,13 @@ async fn handle_conn(conn: Connection, cfg: ServerConnCfg) -> Result<(), Error> 
                         cfg.event_logger.clone(),
                         cfg.traffic_logger.clone(),
                         conn.clone(),
+                        p9x,
                     );
                 }
             }
             err = conn.closed() => {
+                let err_s = err.to_string();
+                p9x.close_remote("remote", parse_close_code(&err_s), &err_s);
                 emit_disconnect(&cfg, remote, &auth_id, &err);
                 break;
             }
@@ -280,6 +315,7 @@ fn spawn_queued_tcp(
     ev: Option<Arc<dyn EventLogger>>,
     tl: Option<Arc<dyn TrafficLogger>>,
     c: Connection,
+    p9x: P9xConn,
 ) {
     let (stream, prefix) = queued;
     let (send, recv) = stream.split();
@@ -296,6 +332,7 @@ fn spawn_queued_tcp(
         ev,
         tl,
         c,
+        p9x,
     );
 }
 
@@ -309,10 +346,15 @@ fn spawn_tcp(
     ev: Option<Arc<dyn EventLogger>>,
     tl: Option<Arc<dyn TrafficLogger>>,
     c: Connection,
+    p9x: P9xConn,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = handle_tcp(send, recv, outbound, hook, remote, &auth_id, ev, tl, c).await {
-            tracing::info!(remote = %remote, id = %auth_id, err = %e, "tcp stream error");
+        if let Err(e) = handle_tcp(
+            send, recv, outbound, hook, remote, &auth_id, ev, tl, c, p9x,
+        )
+        .await
+        {
+            tracing::error!(remote = %remote, id = %auth_id, err = %e, "tcp stream error");
         }
     });
 }
@@ -417,6 +459,7 @@ async fn handle_tcp(
     event_logger: Option<Arc<dyn EventLogger>>,
     traffic_logger: Option<Arc<dyn TrafficLogger>>,
     conn: Connection,
+    p9x: P9xConn,
 ) -> Result<(), Error> {
     let mut buf = Vec::with_capacity(256);
     let mut recv = recv;
@@ -466,6 +509,10 @@ async fn handle_tcp(
         }
     }
 
+    p9x.tcp_start(&addr.to_string(), None);
+    let mut counts = TcpByteCounts::default();
+    counts.add_initial_c2s(&client.leftover, &hook_putback);
+
     if let Some(ref ev) = event_logger {
         ev.tcp_request(remote, auth_id, &addr);
     }
@@ -490,6 +537,8 @@ async fn handle_tcp(
             if let Some(ref ev) = event_logger {
                 ev.tcp_error(remote, auth_id, &addr, Some(&e));
             }
+            let err_s = e.to_string();
+            p9x.tcp_end(&addr.to_string(), counts.c2s, counts.s2c, Some(&err_s), None);
             return Ok(());
         }
         Ok(mut remote_tcp) => {
@@ -502,7 +551,11 @@ async fn handle_tcp(
             );
             if !hooked {
                 let resp = write_tcp_response_bytes(true, "Connected");
-                send.write_all(&resp).await?;
+                if let Err(e) = send.write_all(&resp).await {
+                    let err_s = e.to_string();
+                    p9x.tcp_end(&addr.to_string(), counts.c2s, counts.s2c, Some(&err_s), None);
+                    return Err(e);
+                }
             }
 
             // Hook putback (bytes sniffed from client) plus any unused leftover.
@@ -521,11 +574,24 @@ async fn handle_tcp(
                 remote_tcp.as_mut(),
                 auth_id,
                 traffic_logger.as_deref(),
+                &mut counts,
             )
             .await;
             if matches!(&err, Some(Error::Closed(Some(m))) if m == "kicked") {
-                conn.close(quinn::VarInt::from_u32(CLOSE_EXCESSIVE_LOAD as u32), b"kicked");
+                p9x.close_local(crate::protocol::CLOSE_EXCESSIVE_LOAD as u64);
+                conn.close(
+                    quinn::VarInt::from_u32(crate::protocol::CLOSE_EXCESSIVE_LOAD as u32),
+                    b"kicked",
+                );
             }
+            let err_s = err.as_ref().map(|e| e.to_string());
+            p9x.tcp_end(
+                &addr.to_string(),
+                counts.c2s,
+                counts.s2c,
+                err_s.as_deref(),
+                None,
+            );
             if let Some(ref ev) = event_logger {
                 ev.tcp_error(remote, auth_id, &addr, err.as_ref());
             }
@@ -571,6 +637,7 @@ async fn copy_two_way(
     remote: &mut dyn HyTcpStream,
     auth_id: &str,
     traffic: Option<&dyn TrafficLogger>,
+    counts: &mut TcpByteCounts,
 ) -> Option<Error> {
     let mut c2r_buf = vec![0u8; 32 * 1024];
     let mut r2c_buf = vec![0u8; 32 * 1024];
@@ -589,6 +656,7 @@ async fn copy_two_way(
                         if let Err(e) = remote.write(&c2r_buf[..n]).await {
                             return Some(e);
                         }
+                        counts.add_c2s(n as u64);
                     }
                     Err(e) => return Some(e),
                 }
@@ -605,6 +673,7 @@ async fn copy_two_way(
                         if let Err(e) = send.write_all(&r2c_buf[..n]).await {
                             return Some(e);
                         }
+                        counts.add_s2c(n as u64);
                     }
                     Err(e) => return Some(e),
                 }

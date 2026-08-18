@@ -8,6 +8,7 @@ pub mod congestion;
 pub mod error;
 pub mod frag;
 pub mod io;
+pub(crate) mod p9x;
 pub mod protocol;
 pub mod server;
 

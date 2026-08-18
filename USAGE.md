@@ -1,203 +1,21 @@
-# hy 使用文档
+# hy 使用说明
 
-`hy` 是 [Hysteria 2](https://github.com/apernet/hysteria)（协议 v4）的 Rust 实现，配置字段与官方 YAML 对齐（camelCase）。二进制：`hy`。
+`hy` 是 [Hysteria 2](https://github.com/apernet/hysteria) 的 Rust 版。配置文件用 YAML，字段名和官方一样（驼峰，例如 `fastOpen`）。
 
-本文只写**已实现**的能力。未实现项见文末。
-
----
-
-## 1. 命令行
-
-```
-hy client [-c config.yaml]
-hy server [-c config.yaml]
-hy version
-```
-
-不写子命令时按 **client** 处理（对齐官方）。
-
-| 参数 | 含义 |
-|---|---|
-| `-c` / `--config` | YAML 路径。省略时按当前目录约定查找（与官方一致时用 `-c` 最稳） |
-
-退出：SIGINT / SIGTERM。服务端关闭码 `0x100`。
+下面只写**已经能用**的功能。还不支持的列在文末。
 
 ---
 
-## 2. 环境变量
+## 最快上手
 
-| 变量 | 含义 | 默认 |
-|---|---|---|
-| `HYSTERIA_LOG_LEVEL` | `debug` / `info` / `warn` / `error` | `info` |
-| `HYSTERIA_LOG_FORMAT` | `json` / `console` | `console` |
-| `HYSTERIA_ACME_DIR` | ACME 证书缓存目录 | 实现默认目录 |
-| `HYSTERIA_UDPHOP_DEBUG` | port hop 调试 | 关 |
-
----
-
-## 3. 通用格式
-
-### 3.1 地址
-
-| 写法 | 含义 |
-|---|---|
-| `127.0.0.1:443` | IPv4 |
-| `[::1]:443` | IPv6 |
-| `:443` | 全接口（服务端 listen 常用） |
-| `example.com:443` | 域名（客户端 `server`） |
-| `host:443,10000-20000` | 端口跳跃：逗号**第一项是主端口**，后面是 hop 集合 |
-| `https://TOKEN@realm.example/id` | Realm：userinfo 是 **token**（必填），path 是 realm id |
-
-### 3.2 带宽
-
-`bandwidth.up` / `bandwidth.down`：
-
-- `100mbps`、`1gbps`、`512kbps`、`100m`、`1g`
-- 纯数字按 **B/s**
-
-服务端 `ignoreClientBandwidth: true` 时忽略客户端申报，用本端配置。
-
-### 3.3 时长
-
-Go 风格：`30s`、`10s`、`2s`、`60s`。
-
-### 3.4 认证（服务端 `auth`）
-
-| `type` | 字段 | 行为 |
-|---|---|---|
-| `password` | `password` | 整串相等，用户 id 固定 `user` |
-| `userpass` | `userpass: { 用户: 密码 }` | `user:pass`，用户名小写 |
-| `http` | `http.url`、`http.insecure` | POST JSON `{addr,auth,tx}`，期望 `{ok,id}`，超时 10s |
-| `command` | `command` | 执行命令，argv=`[cmd, addr, auth, tx]`，exit 0 且 stdout 为 id |
-
-客户端 `auth` 是**字符串**（password 或 `user:pass`）。
-
-### 3.5 出站 `direct.mode`
-
-| 值 | 行为 |
-|---|---|
-| `auto` | 双栈竞速，先成功的赢（约 10s 超时） |
-| `64` | 有 AAAA **只连 v6**，没有才 v4 |
-| `46` | 有 A 只连 v4，没有才 v6 |
-| `4` / `6` | 单栈，没有就 Dial 失败 |
-
-### 3.6 ACL 一行一条
-
-```
-outbound(address)
-outbound(address, protoPort)
-outbound(address, protoPort, hijackIP)
-```
-
-- 先写先中；无匹配走名为 `default` 的出站（否则列表第一项）
-- 内置名：`direct`、`reject`、`default`
-- `address`：`*`、域名、`suffix:example.com`、CIDR、单 IP、通配
-- `protoPort`：`tcp`、`udp`、`tcp/443`、`udp/1000-2000`、`*`
-- `geoip:` / `geosite:` 吃 V2Ray `.dat`（`acl.geoip` / `acl.geosite`）。空路径按需下 Loyalsoldier（默认 7 天）。未知码启动失败，不会空匹配
-- `#` 注释；`file` 与 `inline` 互斥
-
-管道顺序锁死：**Speedtest → Resolver → ACL → (direct \| socks5 \| http)**。
-
----
-
-## 4. 客户端字段
-
-| 字段 | 含义 |
-|---|---|
-| `server` | 服务端地址，见 §3.1 |
-| `auth` | 认证串 |
-| `fastOpen` | `true` 时不等 TCP 响应就写（对齐官方） |
-| `lazy` | `true`：进程先听 inbound，**第一条入站**才连服务端 |
-| `tls.sni` | SNI |
-| `tls.insecure` | 跳过证书校验 |
-| `tls.pinSHA256` | 只校验叶子证书指纹 |
-| `tls.ca` | 自定义 CA PEM |
-| `tls.clientCertificate` / `clientKey` | mTLS |
-| `quic.*Window` | 流/连接收窗，默认流 8MB、连接 20MB |
-| `quic.maxIdleTimeout` | 默认 `30s` |
-| `quic.keepAlivePeriod` | 默认 `10s` |
-| `quic.disableChromeParrot` | `false`（默认）发零长 source CID；`true` 回到 8 字节 |
-| `bandwidth` | 见 §3.2 |
-| `congestion.type` | `bbr`（默认，可切 Brutal）或 `reno` |
-| `congestion.bbrProfile` | `standard` / `conservative` / `aggressive`（能解析；当前同一套 quinn BBR） |
-| `obfs.type` | `plain` / `salamander` / `gecko` |
-| `obfs.salamander.password` | PSK，至少 4 字节 |
-| `obfs.gecko.password` | 内层仍是 Salamander；只拆 QUIC 长头 |
-| `obfs.gecko.minPacketSize` / `maxPacketSize` | 默认 512–1200 |
-| `transport.udp.hopInterval` | hop 间隔，默认 `30s` |
-| `realm.*` | STUN / punch，见场景 11 |
-| `mimic.*` | Linux XDP 助手，见场景 12 |
-| `socks5.listen` | 本地 SOCKS5 |
-| `socks5.username` / `password` | 可选；不配则无认证 |
-| `socks5.disableUDP` | 关 ASSOCIATE |
-| `http.listen` | 本地 HTTP 代理（CONNECT / 绝对 URI GET） |
-| `http.username` / `password` / `realm` | 可选 Basic |
-| `tcpForwarding` | `[{ listen, remote }]` |
-| `udpForwarding` | `[{ listen, remote, timeout }]`，timeout 默认 60s |
-| `tcpRedirect` / `tcpTProxy` / `udpTProxy` | Linux 透明入口 |
-| `tun` | 虚拟网卡入口 |
-
-`tls.ech` **拒绝**（客户端顶层或 `tls.ech`；服务端 `tls.ech` / `tls.ech.key` 同样拒，不能吞掉）。
-
----
-
-## 5. 服务端字段
-
-| 字段 | 含义 |
-|---|---|
-| `listen` | UDP 监听，默认 `:443`。hop 语法只绑**第一项**主端口 |
-| `tls.cert` / `tls.key` | PEM；与 `acme` 互斥 |
-| `tls.clientCA` | 要求客户端证书 |
-| `acme` | HTTP-01 / TLS-ALPN-01，见场景 9。`type: dns` 未实现 |
-| `obfs` | 同客户端 |
-| `auth` | 见 §3.4 |
-| `bandwidth` / `ignoreClientBandwidth` | 见 §3.2 |
-| `disableUDP` | 官方字段名（注意大小写）。`true` 时握手 `Hysteria-UDP: false`，UDP 拒、TCP 仍通 |
-| `udpIdleTimeout` | UDP 会话空闲回收，默认 `60s` |
-| `speedTest` | `true` 允许目标 `@speedtest`（仅 TCP） |
-| `resolver.type` | `system` / `tcp` / `udp` / `tls` / `https` |
-| `resolver.*.addr` / `timeout` | 非 system 时的上游 |
-| `sniff.enable` | 嗅探 HTTP Host / TLS SNI / QUIC SNI |
-| `sniff.timeout` | 默认 `4s` |
-| `sniff.rewriteDomain` | `true` 才改写 `req_addr` 的 host |
-| `sniff.tcpPorts` / `udpPorts` | 如 `80,443,8000-9000`；`@` 前缀目标跳过 |
-| `acl.file` / `acl.inline` | 规则；`inline` 是字符串序列；二者互斥 |
-| `acl.geoip` / `acl.geosite` | V2Ray `.dat` 路径。省略则 cwd 下 `geoip.dat` / `geosite.dat`，按需自动下载 |
-| `acl.geoUpdateInterval` | 仅自动下载：文件超过这个时间再下，默认 7 天 |
-| `outbounds` | `direct` / `socks5` / `http` |
-| `trafficStats.listen` / `secret` | 统计 HTTP。`Authorization` 头**等于** secret（不是 Bearer） |
-| `masquerade.type` | 空/`404`、`string`、`file`、`proxy` |
-| `masquerade.listenHTTP` / `listenHTTPS` | 额外 TCP 伪装站，带 `Alt-Svc: h3` |
-| `masquerade.forceHTTPS` | 301 |
-
-`ech` **拒绝**。
-
-统计 API：
-
-| 方法 | 路径 | 含义 |
-|---|---|---|
-| GET | `/` | 说明页 |
-| GET | `/traffic` | 每用户 tx/rx；`?clear=1` 清零 |
-| GET | `/online` | 在线数 |
-| POST | `/kick` | JSON 用户 id 列表，**懒踢**（下次流量才断） |
-| GET | `/dump/streams` | 流状态 |
-
-测速（`speedTest: true`）：SOCKS5 CONNECT `@speedtest`。下行 `0x01 + u32 BE`；上行 `0x02`。UDP 对 `@speedtest` 拒绝。
-
----
-
-## 6. 场景（由简到繁）
-
-以下证书路径请换成自己的 PEM。自签示例：
+先做一张自签证书（仅本机试验）：
 
 ```bash
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout server.key -out server.crt -days 365 -nodes -subj "/CN=localhost"
 ```
 
-### 场景 1 — 最小可跑（password + SOCKS5）
-
-服务端 `server.yaml`：
+**服务端** `server.yaml`：
 
 ```yaml
 listen: 127.0.0.1:443
@@ -209,7 +27,7 @@ auth:
   password: secret
 ```
 
-客户端 `client.yaml`：
+**客户端** `client.yaml`：
 
 ```yaml
 server: 127.0.0.1:443
@@ -224,14 +42,200 @@ socks5:
 ```bash
 hy server -c server.yaml
 hy client -c client.yaml
-# curl -x socks5h://127.0.0.1:1080 https://example.com
+curl -x socks5h://127.0.0.1:1080 https://example.com
 ```
 
-`insecure: true` 只适合自签/试验。生产用 `tls.ca` 或公网证书。
+`insecure: true` 会跳过证书检查，只适合自签或本机试验。正式环境请用受信任的证书，或在客户端指定 `tls.ca`。
 
-### 场景 2 — 延迟连接 + 本机端口转发
+浏览器把 SOCKS5 代理指到 `127.0.0.1:1080` 即可上网。
 
-客户端先听本地口，**第一条流量**才握手（`lazy: true`）：
+---
+
+## 1. 命令
+
+```
+hy client -c 配置.yaml
+hy server -c 配置.yaml
+hy version
+```
+
+不写 `client` / `server` 时，按客户端启动。建议始终加上 `-c`，以免找不到配置文件。
+
+用 Ctrl+C 或发 SIGTERM 退出。
+
+---
+
+## 2. 环境变量
+
+| 变量 | 作用 | 默认 |
+|---|---|---|
+| `HYSTERIA_LOG_LEVEL` | 日志级别：`debug` / `info` / `warn` / `error` | `info` |
+| `HYSTERIA_LOG_FORMAT` | `json` 或 `console` | `console` |
+| `HYSTERIA_ACME_DIR` | 自动签证书时，证书缓存目录 | 程序默认目录 |
+| `HYSTERIA_UDPHOP_DEBUG` | 打开端口跳跃的调试日志 | 关 |
+
+日常把 `HYSTERIA_LOG_LEVEL=info` 即可。排查连不上时再改成 `debug`。
+
+---
+
+## 3. 配置里怎么写
+
+### 3.1 地址
+
+| 写法 | 意思 |
+|---|---|
+| `127.0.0.1:443` | IPv4 |
+| `[::1]:443` | IPv6 |
+| `:443` | 本机所有网卡的 443（服务端常用） |
+| `example.com:443` | 域名（客户端的 `server`） |
+| `host:443,10000-20000` | 端口跳跃：逗号**第一项是主端口**，后面是备用端口范围 |
+| `https://令牌@realm.example/房间id` | Realm 穿透：`@` 前面是令牌（必填），路径是房间 id |
+
+### 3.2 带宽
+
+`bandwidth.up` / `bandwidth.down` 可以写：
+
+- `100mbps`、`1gbps`、`512kbps`
+- `100m`、`1g`（按比特率理解）
+- 纯数字按 **字节/秒**
+
+服务端若写 `ignoreClientBandwidth: true`，就不管客户端报了多少，只用服务端自己的配置。
+
+### 3.3 时间
+
+和常见 Go 程序一样：`30s`、`10s`、`2s`、`60s`、`5m`。
+
+### 3.4 服务端怎么验密码（`auth`）
+
+| `type` | 怎么配 | 效果 |
+|---|---|---|
+| `password` | `password: 一串密码` | 整串对上就算过，用户名记成 `user` |
+| `userpass` | `userpass: { 用户名: 密码 }` | 客户端写成 `用户名:密码`；用户名按小写比 |
+| `http` | `http.url`、可选 `http.insecure` | 向这个 URL POST `{addr,auth,tx}`，期望返回 `{ok,id}`，10 秒超时 |
+| `command` | `command: 可执行文件` | 执行该命令，参数是地址、密码、带宽；退出码 0 且标准输出是用户 id 才算过 |
+
+客户端的 `auth` 就是一个**字符串**：共享密码，或多用户时写成 `alice:wonder`。
+
+### 3.5 服务端直连出站（`direct.mode`）
+
+访问目标网站时，服务端怎么选 IPv4 / IPv6：
+
+| 值 | 行为 |
+|---|---|
+| `auto` | IPv4、IPv6 一起试，谁先通则用谁（大约 10 秒） |
+| `64` | 有 IPv6 地址就只走 IPv6，没有才用 IPv4 |
+| `46` | 有 IPv4 就只走 IPv4，没有才用 IPv6 |
+| `4` / `6` | 只用这一栈，没有对应地址就失败 |
+
+### 3.6 访问控制（ACL）
+
+一行一条规则，**写在上面的先匹配**：
+
+```
+动作(地址)
+动作(地址, 协议或端口)
+动作(地址, 协议或端口, 劫持到这个IP)
+```
+
+- 动作：`direct`（直连）、`reject`（拒绝）、或你在 `outbounds` 里起的名字。没匹配到的走名为 `default` 的出站；没有 `default` 就走列表里第一个。
+- 地址：`*`（任意）、完整域名、`suffix:example.com`（这个后缀）、单个 IP、网段（CIDR）、通配。
+- 协议端口：`tcp`、`udp`、`tcp/443`、`udp/1000-2000`、`*`。
+- `geoip:` / `geosite:` 用 V2Ray 的 `.dat` 库（路径写在 `acl.geoip` / `acl.geosite`）。不写路径时，会按需下载公开规则库（默认每 7 天最多下一次）。库里没有这个国家/站点码会**启动失败**，不会假装没这条规则。
+- `#` 开头是注释。`acl.file`（从文件读）和 `acl.inline`（写在配置里）不能同时用。
+
+请求在服务端的处理顺序固定：测速特殊目标 → DNS 解析 → ACL → 真正出站（直连 / SOCKS5 / HTTP）。
+
+---
+
+## 4. 客户端配置项
+
+| 字段 | 说明 |
+|---|---|
+| `server` | 服务端地址，写法见上面「地址」 |
+| `auth` | 密码，或多用户时的 `用户名:密码` |
+| `fastOpen` | `true`：还没等到服务端确认 TCP 就先传数据，延迟更低 |
+| `lazy` | `true`：程序先在本地听端口，**有第一条流量**才去连服务端 |
+| `tls.sni` | TLS 握手时声明的域名 |
+| `tls.insecure` | `true` 不检查证书（仅试验） |
+| `tls.pinSHA256` | 只认这一枚叶子证书的指纹 |
+| `tls.ca` | 自定义 CA 的 PEM 文件 |
+| `tls.clientCertificate` / `clientKey` | 双向证书认证 |
+| `quic.*Window` | 收包窗口。默认单条流 8MB、整条连接 20MB |
+| `quic.maxIdleTimeout` | 多久没流量就断开，默认 `30s` |
+| `quic.keepAlivePeriod` | 心跳间隔，默认 `10s` |
+| `quic.disableChromeParrot` | 默认 `false`：连接 ID 长度模仿 Chrome；`true` 则用普通 8 字节 |
+| `bandwidth` | 见「带宽」 |
+| `congestion.type` | `bbr`（默认）或 `reno` |
+| `congestion.bbrProfile` | `standard` / `conservative` / `aggressive`（都能识别，目前实际是同一套 BBR） |
+| `obfs.type` | 混淆：`plain`（不混淆）/ `salamander` / `gecko` |
+| `obfs.salamander.password` | 双方相同的密钥，至少 4 个字符 |
+| `obfs.gecko.password` | 内层仍是 Salamander，只改 QUIC 长包头的外观 |
+| `obfs.gecko.minPacketSize` / `maxPacketSize` | 默认 512–1200 |
+| `transport.udp.hopInterval` | 端口跳跃间隔，默认 `30s` |
+| `realm.*` | NAT 穿透，见场景 11 |
+| `mimic.*` | Linux 上把流量伪装成 Chrome QUIC，见场景 12 |
+| `socks5.listen` | 本机 SOCKS5 代理地址 |
+| `socks5.username` / `password` | 可选；不写则本地代理不设密码 |
+| `socks5.disableUDP` | `true` 则 SOCKS5 不支持 UDP |
+| `http.listen` | 本机 HTTP 代理（浏览器 CONNECT） |
+| `http.username` / `password` / `realm` | 可选的 HTTP 基本认证 |
+| `tcpForwarding` | `[{ listen, remote }]`，把本地 TCP 转到对面某个地址 |
+| `udpForwarding` | `[{ listen, remote, timeout }]`，`timeout` 默认 60s |
+| `tcpRedirect` / `tcpTProxy` / `udpTProxy` | Linux 透明代理入口 |
+| `tun` | 虚拟网卡，让系统流量进隧道 |
+
+配置里出现 `tls.ech` 或顶层 `ech` 会直接拒绝启动（服务端同样）。这是刻意不支持，不是漏配。
+
+---
+
+## 5. 服务端配置项
+
+| 字段 | 说明 |
+|---|---|
+| `listen` | 监听的 UDP 地址，默认 `:443`。写端口跳跃时，进程只绑**第一项**主端口 |
+| `tls.cert` / `tls.key` | 证书和私钥（PEM）。和下面的 `acme` 不能一起用 |
+| `tls.clientCA` | 要求客户端也出示证书 |
+| `acme` | 自动向 Let's Encrypt 等申请证书，见场景 9。DNS 验证方式暂不支持 |
+| `obfs` | 和客户端相同 |
+| `auth` | 见「服务端怎么验密码」 |
+| `bandwidth` / `ignoreClientBandwidth` | 见「带宽」 |
+| `disableUDP` | 官方字段名，注意大小写。`true` 时只代理 TCP，UDP 会被拒绝 |
+| `udpIdleTimeout` | UDP 会话闲置多久回收，默认 `60s` |
+| `speedTest` | `true` 允许用特殊目标 `@speedtest` 测速（仅 TCP） |
+| `resolver.type` | DNS：`system` / `tcp` / `udp` / `tls` / `https` |
+| `resolver.*.addr` / `timeout` | 不用系统 DNS 时的上游地址 |
+| `sniff.enable` | 从流量里识别 HTTP Host、TLS/QUIC 的域名 |
+| `sniff.timeout` | 默认 `4s` |
+| `sniff.rewriteDomain` | `true` 时用嗅探到的域名替换原来的目标主机名 |
+| `sniff.tcpPorts` / `udpPorts` | 例如 `80,443,8000-9000`；目标以 `@` 开头的不嗅探 |
+| `acl.file` / `acl.inline` | 访问规则。`inline` 是字符串列表。两者不能同时写 |
+| `acl.geoip` / `acl.geosite` | 地理规则库路径。省略则在运行目录找 `geoip.dat` / `geosite.dat`，没有就自动下载 |
+| `acl.geoUpdateInterval` | 仅自动下载时：文件超过这个时间才再下，默认 7 天 |
+| `outbounds` | 出站列表：`direct` / `socks5` / `http` |
+| `trafficStats.listen` / `secret` | 流量统计网页。请求头 `Authorization` 必须**原样等于** secret（不要加 `Bearer`） |
+| `masquerade.type` | 未通过认证时假装成网站：空/`404`、`string`、`file`、`proxy` |
+| `masquerade.listenHTTP` / `listenHTTPS` | 额外开一个普通网站端口，并提示浏览器还有 HTTP/3 |
+| `masquerade.forceHTTPS` | HTTP 访问时 301 跳到 HTTPS |
+
+统计接口：
+
+| 方法 | 路径 | 作用 |
+|---|---|---|
+| GET | `/` | 简短说明 |
+| GET | `/traffic` | 每用户上传/下载；加 `?clear=1` 会清零计数 |
+| GET | `/online` | 当前在线人数 |
+| POST | `/kick` | JSON 用户 id 列表。不会立刻踢，等该用户下次有流量再断开 |
+| GET | `/dump/streams` | 当前每条流的状态 |
+
+测速：服务端打开 `speedTest: true` 后，用 SOCKS5 连接目标 `@speedtest`（只支持 TCP，不支持 UDP）。
+
+---
+
+## 6. 更多场景
+
+### 场景 2 — 有流量才连服务器 + 端口转发
+
+`lazy: true`：程序先在本地听着，直到有人真正来连，才去握手服务器。
 
 ```yaml
 server: 127.0.0.1:443
@@ -247,9 +251,9 @@ udpForwarding:
     timeout: 60s
 ```
 
-对照：`lazy: false` 且服务端未起时，进程会卡在 connect，不听 inbound。
+如果 `lazy: false` 而服务端还没启动，客户端会卡在连接，本地端口也不会开始听。
 
-### 场景 3 — 带宽协商与拥塞
+### 场景 3 — 带宽和拥塞控制
 
 ```yaml
 # 服务端
@@ -257,7 +261,7 @@ listen: :443
 tls: { cert: server.crt, key: server.key }
 auth: { type: password, password: secret }
 bandwidth: { up: 1gbps, down: 1gbps }
-# ignoreClientBandwidth: true   # 强制用本端
+# ignoreClientBandwidth: true   # 取消注释则强制用服务端数字
 ```
 
 ```yaml
@@ -271,21 +275,20 @@ congestion:
   bbrProfile: standard
 ```
 
-双方都报了带宽且未 `ignoreClientBandwidth` 时走 Brutal；否则 BBR。`bbrProfile` 三档都能解析，当前同一套 quinn BBR，不要按档位调参。
+双方都写了带宽、且服务端没有 `ignoreClientBandwidth` 时，用 Brutal（按声明速率发送）。否则用 BBR。`bbrProfile` 三个词都能写，目前效果相同，不必按档位细调。
 
 ### 场景 4 — Salamander 混淆
 
-PSK 双方相同，至少 4 字节：
+两端密码必须相同，至少 4 个字符。用来让包看起来不像普通 QUIC：
 
 ```yaml
-# 两端都加
 obfs:
   type: salamander
   salamander:
     password: "correct-horse-battery"
 ```
 
-### 场景 5 — 多用户、统计、测速、HTTP 代理
+### 场景 5 — 多用户、看流量、测速、本机 HTTP 代理
 
 ```yaml
 # server.yaml
@@ -322,23 +325,19 @@ http:
 ```
 
 ```bash
-# 统计：Authorization 必须原样等于 secret
+# Authorization 必须和 secret 完全一样，不要写成 Bearer
 curl -H 'Authorization: s3cret' http://127.0.0.1:9999/traffic
 curl -H 'Authorization: s3cret' http://127.0.0.1:9999/online
-# 懒踢
 curl -H 'Authorization: s3cret' -d '["alice"]' http://127.0.0.1:9999/kick
-
-# 测速：SOCKS5 CONNECT 目标 @speedtest（仅 TCP）
 ```
 
-未带正确 `Hysteria-Auth` 的 HTTP/3 请求走伪装（看起来像普通站点）。
+没带正确密码的访问，会看到伪装站点内容，而不是报「认证失败」。
 
-### 场景 6 — 嗅探 + ACL + 多出站 + 指定 DNS
+### 场景 6 — 按域名分流（嗅探 + ACL + DNS）
 
-客户端连的是 IP，但 TLS SNI / HTTP Host 是域名时，打开 sniff 再给 ACL 用：
+客户端有时只告诉服务端一个 IP，真正的网站名在 TLS/HTTP 里头。打开 sniff，ACL 才能按域名判断：
 
 ```yaml
-# server.yaml
 listen: :443
 tls: { cert: /c.pem, key: /k.pem }
 auth: { type: password, password: secret }
@@ -366,51 +365,47 @@ outbounds:
       addr: 127.0.0.1:1080
       username: ""
       password: ""
-  # HTTP 出站用 url，不是 addr：
+  # HTTP 出站用 url，不要写 addr：
   # - name: proxy
   #   type: http
   #   http: { url: http://127.0.0.1:8080, insecure: false }
 ```
 
-- SOCKS5 出站字段是 `socks5.addr`；HTTP 出站字段是 `http.url`（写 `addr` 会拒）。
-- SOCKS5/HTTP **出站**把 hostname 交给上游，不强制本地解析。
-- HTTP 出站不能做 UDP（`http outbound is tcp only`）。
-- 有 ACL 时必须包一层 Resolver（system 或上面的 udp/tcp/tls/https）。
+注意：
 
-### 场景 6b — 服务端按国家 / 站点分流（Geo）
+- SOCKS5 出站写 `socks5.addr`；HTTP 出站写 `http.url`（写成 `addr` 会启动失败）。
+- 走 SOCKS5/HTTP 出站时，域名由上游解析，不强制在本机查 DNS。
+- HTTP 出站不能转发 UDP。
+- 只要配了 ACL，就必须有 DNS（`resolver`，或至少用系统 DNS）。
 
-只在**服务端** ACL 里写。客户端没有 `acl.geoip`。`geoip:` 看的是解析后的 IP，所以前面必须有 Resolver（有 ACL 时本来就会包一层）。
+### 场景 6b — 按国家或网站列表分流
+
+这些规则只写在**服务端**。客户端没有 `acl.geoip`。`geoip:` 看的是解析后的 IP，所以必须先有 DNS。
 
 ```yaml
-# server.yaml
 listen: :443
 tls: { cert: /c.pem, key: /k.pem }
 auth: { type: password, password: secret }
 acl:
   inline:
     - "reject(geoip:cn)"           # 中国 IP 拒绝
-    - "direct(geosite:google@cn)"  # google 列表里带 cn 属性的域名直连
+    - "direct(geosite:google@cn)"  # Google 列表里带 cn 标记的域名直连
     - "direct(geosite:google)"
     - "default(*)"
-  geoip: /var/lib/hy/geoip.dat      # 指定路径：只读这份，不下载
+  geoip: /var/lib/hy/geoip.dat      # 指定文件：只用这份，不会自动下载
   geosite: /var/lib/hy/geosite.dat
-  # geoUpdateInterval: 168h         # 仅路径省略时有用
 ```
 
-路径**省略**时，进程工作目录找 `geoip.dat` / `geosite.dat`；没有或超过 7 天，会从 Loyalsoldier 下：
+不写路径时，在运行目录找 `geoip.dat` / `geosite.dat`；没有或超过 7 天，会下载：
 
-`https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat`  
-`https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat`
+- https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat
+- https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat
 
-写法：
+写法：`geoip:cn`、`geoip:us`、`geoip:private`（大小写无所谓）；`geosite:google`、`geosite:google@cn`（多个 `@` 条件要同时满足）。库里没有这个码、或文件打不开：启动失败，并告诉你是哪一行。
 
-- `geoip:cn` / `geoip:us` / `geoip:private`（码小写；`geoip:JP` 也可以，编译时会折成小写）
-- `geosite:google`、`geosite:google@cn`（多个 `@attr` 是 AND）
-- 库里没有这个码、文件读不开：启动失败，带行号。不会当成「没这条规则」
+`geoip` 只匹配已经是 IP 的目标；还是域名、尚未解析时不会命中。`geosite` 只匹配域名。
 
-先写先中。`geoip` 只匹配 IP，域名还没解析出地址时不中（除非 dat 里是 inverse）。`geosite` 只匹配域名。
-
-### 场景 7 — 文件/反代伪装 + Alt-Svc
+### 场景 7 — 把未认证访问伪装成网站
 
 ```yaml
 masquerade:
@@ -422,7 +417,7 @@ masquerade:
   forceHTTPS: true
 ```
 
-或反代：
+或反代到别的网站：
 
 ```yaml
 masquerade:
@@ -434,15 +429,16 @@ masquerade:
   listenHTTP: :80
 ```
 
-未认证 GET `/` 返回伪装内容，并带 `Alt-Svc: h3=":<quic端口>"; ma=2592000`。已认证 233 不受影响。
+没通过认证的人打开会看到这些内容。正常用户登录不受影响。
 
-### 场景 8 — 端口跳跃 + Gecko
+### 场景 8 — 端口跳跃 + Gecko 混淆
 
-服务端只绑**主端口**（逗号第一项）。其余端口靠 iptables/nft DNAT 到主端口（本进程不做 iptables）。
-客户端 hop **从主端口起跳**；没有 DNAT 时只有打到第一项才能通，随机打到 hop 口会丢。本机试验可以只写主端口、或 hop 集合但保证第一项就是实际监听口。
+服务端进程只监听**主端口**（逗号前面那一个）。其它端口需要你自己用防火墙规则转到主端口，hy 不会改系统防火墙。
+
+客户端会从主端口开始，按间隔换端口试。如果系统没有把 hop 端口转到主端口，只有打到第一项才能连上。本机试验可以只写主端口。
 
 ```yaml
-# server.yaml
+# 服务端
 listen: :443,10000-20000
 tls: { cert: /c.pem, key: /k.pem }
 auth: { type: password, password: secret }
@@ -455,7 +451,7 @@ obfs:
 ```
 
 ```yaml
-# client.yaml
+# 客户端
 server: example.com:443,10000-20000
 auth: secret
 tls: { sni: example.com }
@@ -470,11 +466,11 @@ obfs:
 socks5: { listen: 127.0.0.1:1080 }
 ```
 
-Gecko 只拆 QUIC **长头**，短头原样；内层仍是 Salamander。`mimic` 与 hop **互斥**。
+Gecko 只改 QUIC 连接刚开始的长包头，后续短包不变；里面仍是 Salamander。`mimic` 和端口跳跃不能同时开。
 
-### 场景 9 — ACME（HTTP-01 / TLS-ALPN-01）
+### 场景 9 — 自动申请证书
 
-与 `tls.cert` / `tls.key` **互斥**。需要公网域名指到本机，80（http）或 443（tls）可被 CA 访问。
+不能和手写的 `tls.cert` / `tls.key` 一起用。域名的 DNS 要指到这台机器，并且 80（http 验证）或 443（tls 验证）能被证书颁发机构访问到。
 
 ```yaml
 listen: :443
@@ -482,7 +478,7 @@ acme:
   domains: [hy.example.com]
   email: you@example.com
   ca: letsencrypt
-  type: http          # 或 tls
+  type: http          # 也可以写 tls
 auth:
   type: password
   password: secret
@@ -493,22 +489,21 @@ export HYSTERIA_ACME_DIR=/var/lib/hy/acme
 hy server -c server.yaml
 ```
 
-`type: dns` 及 Cloudflare 等提供方：**未实现**，会明确报错。
+通过 DNS 记录验证、以及 Cloudflare 等 DNS 服务商：**目前不支持**，配置了会明确报错。
 
-### 场景 10 — Linux 透明代理 / TUN
+### 场景 10 — Linux 透明代理 / 虚拟网卡
 
-需要 `CAP_NET_ADMIN`。TPROXY 还要内核 `xt_TPROXY`（或等价 nft）。
+需要管理员权限（`CAP_NET_ADMIN`）。TPROXY 还需要内核支持。
 
-**REDIRECT**（iptables 改目的端口，进程用 `SO_ORIGINAL_DST`）：
+**REDIRECT**（用 iptables 把目的端口改过来）：
 
 ```yaml
-# client.yaml 片段
 tcpRedirect:
   listen: 127.0.0.1:12345
 ```
 
 ```bash
-# 示例：把到 80 的流量 REDIRECT 到 hy
+# 示例：本机访问 80 端口的 TCP，转到 hy
 iptables -t nat -A OUTPUT -p tcp --dport 80 -j REDIRECT --to-ports 12345
 ```
 
@@ -519,9 +514,9 @@ tcpTProxy: { listen: :12345 }
 udpTProxy: { listen: :12345, timeout: 60s }
 ```
 
-非 Linux 配置这些键会 `not supported`。
+在非 Linux 系统上写这些项，会提示不支持。
 
-**TUN**：
+**Linux 虚拟网卡（TUN）**：
 
 ```yaml
 tun:
@@ -535,9 +530,9 @@ tun:
     ipv4: [0.0.0.0/0]
 ```
 
-无特权时会打明确错误（如 `failed to create tun interface`），不会静默空转。ICMP 不代理。
+没有权限时会打出明确错误（例如创建网卡失败），不会假装已经在工作。ping（ICMP）不会走隧道。
 
-**Darwin utun**（P6.D1，对齐官方 Darwin CLI）：`name` 必须是 `utun` 加数字（`utun123`），不能写 `hy0`。创建走 `com.apple.net.utun_control`。配地址 / 加路由需要 `sudo`；失败要明确报错，不会留空接口。
+**macOS 虚拟网卡**：名字必须是 `utun` 加数字，例如 `utun123`，不能写成 `hy0`。配地址和加路由需要 `sudo`。失败会报错，不会留下半残网卡。
 
 ```yaml
 tun:
@@ -548,17 +543,17 @@ tun:
     ipv4: 100.100.100.101/30
     ipv6: "2001::ffff:ffff:ffff:fff1/126"
   route:
-    ipv4Exclude: ["<server-ip>/32"]   # 防环路；不自动填
+    ipv4Exclude: ["<服务器公网IP>/32"]   # 避免流量绕回自己；不会自动填写
 ```
 
-没有 `route:` 只建接口、不加路由。有 `route:` 但没写 `ipv4` 时，官方 Darwin 会装 `1.0.0.0/8`…`128.0.0.0/1`（不含 `0.0.0.0/8`），不是直接改默认路由。显式 `route.ipv4: [0.0.0.0/0]` 才会装默认路由，这时必须自己 exclude 服务器地址。
+不写 `route:` 就只建网卡、不加路由。写了 `route:` 但没写 `ipv4` 时，会加上一批拆开的默认路由（和官方 macOS 客户端一样），不是直接改「默认网关」那一条。只有显式写 `route.ipv4: [0.0.0.0/0]` 才会装真正的默认路由，这时务必把服务器 IP 写进 `ipv4Exclude`，否则会环路。
 
-### 场景 11 — Realm（NAT 穿透）
+### 场景 11 — Realm（两台都在 NAT 后面时打洞）
 
-`server` / `listen` 写成 Realm URL。本实现**不自带**信令服务，只做 hy 侧 STUN → 官方 `/v1/{id}` → punch。
+把 `server` 或 `listen` 写成 Realm 地址。hy **不自带**中转信令服务，需要你另有一套 Realm 服务：本机先问 STUN 自己的公网地址，再找信令交换，然后打洞。
 
 ```yaml
-# 客户端。token 写在 userinfo，缺了会报 realm token is required
+# 客户端。令牌写在 https:// 后面、@ 前面，漏了会提示 token is required
 server: https://your-token@realm.example/your-id
 auth: secret
 realm:
@@ -570,19 +565,18 @@ realm:
 socks5: { listen: 127.0.0.1:1080 }
 ```
 
-Punch 与 QUIC 共用同一 UDP。`PunchPacketConn` 只拦截已注册的 punch 包，STUN / QUIC 从 `recv_from` 原样出来。
+打洞和代理共用同一个 UDP 端口。
 
-### 场景 12 — Mimic（Linux XDP）+ Chrome 指纹
+### 场景 12 — 在 Linux 上伪装成 Chrome 的 QUIC
 
-需要单独安装 [hack3ric/mimic](https://github.com/hack3ric/mimic)，hy **只拉起进程**，不重写 XDP。
+需要另外安装 [hack3ric/mimic](https://github.com/hack3ric/mimic)。hy 只负责把它拉起来，不代替它改内核。
 
 ```yaml
-# 客户端；不要同时开 hop
 server: 203.0.113.10:443
 auth: secret
 tls: { sni: example.com }
 quic:
-  disableChromeParrot: false    # 默认：零长 source CID
+  disableChromeParrot: false
 mimic:
   enabled: true
   interface: eth0
@@ -592,49 +586,49 @@ mimic:
 socks5: { listen: 127.0.0.1:1080 }
 ```
 
-实际 argv：
+实际执行类似：
 
 ```
 /usr/bin/mimic run eth0 -f remote=203.0.113.10:443 --xdp-mode native
 ```
 
-服务端 filter 为 `local=ip:port,handshake=0:3`。`enabled: false` 不启动。`path` 空则找 `PATH` 里的 `mimic`。非 Linux / 找不到二进制会明确报错。
+`enabled: false` 不启动。`path` 留空则在系统 PATH 里找 `mimic`。不是 Linux、或找不到这个程序，会明确报错。不要和端口跳跃一起开。
 
 ---
 
-## 7. 互操作注意
+## 7. 和官方程序互用
 
-- 官方客户端/服务端可以和 hy 互打 TCP/UDP（含 ≥1400B UDP）。
-- QUIC datagram **对外广告**固定 `max_datagram_frame_size=1200`，本端收窗另算。不要改这个。
-- 字段名必须官方写法：`disableUDP`、`fastOpen`、`speedTest`、`bbrProfile`、`hopInterval`。
-- SOCKS5 认证：对的 user/pass 通；错的 `01 01`；不带 `05 ff`。
-- HTTP 统计：`Authorization: s3cret` 为 200，`Bearer s3cret` 为 401。
+- 官方客户端可以连 hy 服务端，hy 客户端也可以连官方服务端（TCP、UDP 都可以，较大的 UDP 包也行）。
+- 单个 UDP 包对外按最多 1200 字节来发。
+- 字段名必须按官方拼写：`disableUDP`、`fastOpen`、`speedTest`、`bbrProfile`、`hopInterval`。
+- 本机 SOCKS5 若设了用户名密码：对的会通过，错的会被拒绝。
+- 流量统计：`Authorization: s3cret` 可以，`Authorization: Bearer s3cret` 不行。
 
 ---
 
-## 8. 本实现明确不做
+## 8. 目前不支持
 
-| 项 | 行为 |
+| 项目 | 会怎样 |
 |---|---|
-| `tls.ech` / `ech` | 拒绝 |
-| ACME `type: dns` | `unimplemented` |
-| 出站链式多跳 | 只有单跳 socks5/http |
-| Chrome 以外的 QUIC 指纹 | 不做 |
+| `tls.ech` / `ech` | 拒绝启动 |
+| ACME 的 DNS 验证（`type: dns`） | 报不支持 |
+| 出站再套一层、再套一层（多跳） | 只有一跳出站 |
+| 除 Chrome 以外的 QUIC 外观 | 不做 |
 
 ---
 
-## 9. 最小对照表
+## 9. 我想做……
 
-| 你想做 | 打开这些 |
+| 目标 | 打开这些 |
 |---|---|
-| 浏览器走代理 | 服务端 password + 客户端 `socks5` 或 `http` |
-| 只转一个端口 | `tcpForwarding` / `udpForwarding` |
-| 抗探测 | `obfs.salamander` 或 `gecko` + `masquerade` |
-| 限制网站 | `acl.inline` + `resolver` + 可选 `sniff` |
-| 按国家/站点分流 | 服务端 `acl.geoip` / `geosite` + `reject(geoip:cn)` / `direct(geosite:google)` |
-| 看用量 / 踢人 | `trafficStats` |
-| 测速 | `speedTest: true`，连 `@speedtest` |
-| 证书自动签 | `acme.type: http` 或 `tls`（要公网域名） |
-| 全局接管 | Linux `tun` / `tcpRedirect` / `tproxy`；Darwin `tun.name: utunN`（要 sudo） |
-| NAT 两边直连 | Realm URL + 外部信令 |
-| 伪装成 Chrome QUIC | 默认 parrot；Linux 再加 `mimic` |
+| 浏览器走代理 | 服务端设密码 + 客户端 `socks5` 或 `http` |
+| 只转发某一个端口 | `tcpForwarding` / `udpForwarding` |
+| 不那么像代理协议 | `obfs` 用 salamander 或 gecko，再加 `masquerade` |
+| 限制能访问的网站 | 服务端 `acl.inline` + `resolver`，需要时再开 `sniff` |
+| 按国家或网站列表分流 | 服务端 `acl` 里写 `geoip:` / `geosite:` |
+| 看用量、踢人 | `trafficStats` |
+| 测速 | `speedTest: true`，连接目标 `@speedtest` |
+| 证书自动续期 | `acme.type: http` 或 `tls`（域名要能从公网访问到本机） |
+| 整台设备走隧道 | Linux 用 `tun` / `tcpRedirect` / `tproxy`；macOS 用 `tun.name: utun数字`（需要管理员权限） |
+| 两边都在路由器后面直连 | Realm 地址 + 外部信令服务 |
+| 看起来更像 Chrome 的联网 | 默认已模仿；Linux 上再加 `mimic` |

@@ -66,3 +66,7 @@ hy version
 | server / client RSS | 12 / 12 MB | 23 / 23 MB |
 
 同速 hy CPU 约 Go 的 63%，RSS 约一半。数字只代表本沙箱 loopback。
+
+## License
+
+[MIT](LICENSE)

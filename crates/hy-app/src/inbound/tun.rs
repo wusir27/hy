@@ -473,32 +473,47 @@ fn configure_device(cfg: &TunConfig) -> std::io::Result<()> {
     }
     run_ip(&["link", "set", "dev", &cfg.name, "up"])?;
 
-    if let Some(ref route) = cfg.route {
-        if route.strict {
-            tracing::info!("tun route.strict requested (best-effort)");
-        }
-        let mut prefixes = route.ipv4.clone();
-        if prefixes.is_empty() {
-            prefixes.push("0.0.0.0/0".into());
-        }
-        for p in &prefixes {
-            if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
-                tracing::error!(prefix = %p, error = %e, "tun auto-route failed");
+        if let Some(ref route) = cfg.route {
+            if route.strict {
+                tracing::info!("tun route.strict requested (best-effort)");
+            }
+            match crate::inbound::tun_plan::linux_ipv4_install_list(
+                &route.ipv4,
+                &route.ipv4_exclude,
+                cfg.apply_exclude,
+            ) {
+                Ok(prefixes) => {
+                    for p in &prefixes {
+                        if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
+                            tracing::error!(prefix = %p, error = %e, "tun auto-route failed");
+                        }
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "tun ipv4 route list"),
+            }
+            match crate::inbound::tun_plan::linux_ipv6_install_list(
+                &route.ipv6,
+                &route.ipv6_exclude,
+                cfg.apply_exclude,
+            ) {
+                Ok(prefixes) => {
+                    for p in &prefixes {
+                        if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
+                            tracing::error!(prefix = %p, error = %e, "tun auto-route (ipv6) failed");
+                        }
+                    }
+                }
+                Err(e) => tracing::error!(error = %e, "tun ipv6 route list"),
+            }
+            if !cfg.apply_exclude {
+                for p in &route.ipv4_exclude {
+                    tracing::warn!(prefix = %p, "tun route ipv4Exclude ignored (no sing-tun)");
+                }
+                for p in &route.ipv6_exclude {
+                    tracing::warn!(prefix = %p, "tun route ipv6Exclude ignored (no sing-tun)");
+                }
             }
         }
-        for p in &route.ipv6 {
-            if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
-                tracing::error!(prefix = %p, error = %e, "tun auto-route (ipv6) failed");
-            }
-        }
-        for p in &route.ipv4_exclude {
-            // Best-effort: unreachable / higher-prio local exclude is OS-specific; log only.
-            tracing::warn!(prefix = %p, "tun route ipv4Exclude ignored (no sing-tun)");
-        }
-        for p in &route.ipv6_exclude {
-            tracing::warn!(prefix = %p, "tun route ipv6Exclude ignored (no sing-tun)");
-        }
-    }
     Ok(())
 }
 
@@ -1168,6 +1183,7 @@ mod tests {
             ipv4: "100.100.100.101/30".into(),
             ipv6: None,
             route: None,
+            apply_exclude: false,
         };
         let r = run(
             cfg,

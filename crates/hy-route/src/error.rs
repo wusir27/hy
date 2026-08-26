@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-/// Compile / I/O errors for a local Shadowrocket-style rules file.
+/// Compile / I/O / direct-dial errors for client routing.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("line {line}: {msg}")]
@@ -11,6 +11,8 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    #[error("direct: {0}")]
+    Direct(String),
 }
 
 impl Error {
@@ -19,5 +21,9 @@ impl Error {
             line,
             msg: msg.into(),
         }
+    }
+
+    pub(crate) fn direct(msg: impl Into<String>) -> Self {
+        Self::Direct(msg.into())
     }
 }

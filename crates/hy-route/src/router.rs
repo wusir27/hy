@@ -28,9 +28,24 @@ pub struct Router {
 
 impl Router {
     /// Highest-priority Direct CIDRs from `bypass-tun` / `tun-excluded-routes`.
-    /// Stored this step; system exclude is not installed.
     pub fn bypass_cidrs(&self) -> &[(IpAddr, u8)] {
         &self.bypass_cidrs
+    }
+
+    /// `skip-proxy` CIDRs (always Direct). Domains are not TUN-excludable.
+    pub fn skip_cidrs(&self) -> &[(IpAddr, u8)] {
+        &self.skip_cidrs
+    }
+
+    /// CIDRs to merge into TUN exclude: skip-proxy (always-direct) + bypass-tun.
+    pub fn tun_exclude_cidrs(&self) -> Vec<(IpAddr, u8)> {
+        let mut out = self.skip_cidrs.clone();
+        for c in &self.bypass_cidrs {
+            if !out.contains(c) {
+                out.push(*c);
+            }
+        }
+        out
     }
 
     /// `[General] dns-server` values (store only).
@@ -581,6 +596,13 @@ FINAL,PROXY
         assert_eq!(r.dns_servers(), ["8.8.8.8", "https://dns.example/dns-query"]);
         assert!(r.bypass_cidrs().iter().any(|(ip, p)| {
             *ip == IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)) && *p == 16
+        }));
+        let excl = r.tun_exclude_cidrs();
+        assert!(excl.iter().any(|(ip, p)| {
+            *ip == IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)) && *p == 16
+        }));
+        assert!(excl.iter().any(|(ip, p)| {
+            *ip == IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)) && *p == 8
         }));
     }
 

@@ -112,6 +112,9 @@ pub struct TunConfig {
     pub ipv4: String,
     pub ipv6: Option<String>,
     pub route: Option<TunRouteConfig>,
+    /// When client-route is on, Linux actually excludes `ipv4Exclude` (subtract
+    /// from default). Off: keep D3 ignore.
+    pub apply_exclude: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -481,6 +484,9 @@ pub struct ClientApp {
     pub lazy: bool,
     /// Present only when `mimic.enabled: true` passed fill. Spawn via [`ClientApp::start`].
     pub mimic: Option<MimicSpec>,
+    /// Plain salamander (no hop/gecko/realm). Used to wrap a marked StdUdp inner.
+    #[allow(dead_code)] // read from main.rs when `client-route` is on
+    pub salamander_only_psk: Option<Vec<u8>>,
 }
 
 impl ClientApp {
@@ -578,6 +584,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
 
     let mut salamander_psk: Option<Vec<u8>> = None;
     let mut gecko_opts: Option<(Vec<u8>, usize, usize)> = None;
+    let mut salamander_only_psk: Option<Vec<u8>> = None;
     if let Some(o) = &y.obfs {
         let ty = o.ty.as_deref().unwrap_or("plain");
         if ty == "salamander" {
@@ -653,7 +660,11 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
             }
             cfg.conn_factory = Some(std::sync::Arc::new(fac));
         } else if let Some(psk) = salamander_psk {
-            cfg.conn_factory = Some(std::sync::Arc::new(SalamanderFactory { psk }));
+            salamander_only_psk = Some(psk.clone());
+            cfg.conn_factory = Some(std::sync::Arc::new(SalamanderFactory {
+                psk,
+                inner: std::sync::Arc::new(StdUdpFactory),
+            }));
         }
     }
     if mimic.is_some() {
@@ -672,6 +683,7 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         tun,
         lazy: y.lazy.unwrap_or(false),
         mimic,
+        salamander_only_psk,
     })
 }
 
@@ -759,7 +771,34 @@ fn fill_tun(y: Option<&TunYaml>) -> Result<Option<TunConfig>, Error> {
             ipv4,
             ipv6: Some(ipv6_raw),
             route,
+            apply_exclude: false,
         }))
+    }
+}
+
+/// Merge skip-proxy / bypass CIDRs into TUN exclude and turn on Linux exclude install.
+pub fn merge_tun_exclude(tun: &mut Option<TunConfig>, cidrs: &[(std::net::IpAddr, u8)]) {
+    let Some(t) = tun else {
+        return;
+    };
+    t.apply_exclude = true;
+    let Some(route) = t.route.as_mut() else {
+        return;
+    };
+    for &(ip, pfx) in cidrs {
+        let s = format!("{ip}/{pfx}");
+        match ip {
+            std::net::IpAddr::V4(_) => {
+                if !route.ipv4_exclude.contains(&s) {
+                    route.ipv4_exclude.push(s);
+                }
+            }
+            std::net::IpAddr::V6(_) => {
+                if !route.ipv6_exclude.contains(&s) {
+                    route.ipv6_exclude.push(s);
+                }
+            }
+        }
     }
 }
 
@@ -949,14 +988,15 @@ fn hop_interval_from_transport(transport: Option<&serde_yaml::Value>) -> Result<
     Ok(interval)
 }
 
-struct SalamanderFactory {
-    psk: Vec<u8>,
+pub(crate) struct SalamanderFactory {
+    pub psk: Vec<u8>,
+    pub inner: Arc<dyn hy_core::io::ConnFactory>,
 }
 
 #[async_trait::async_trait]
 impl hy_core::io::ConnFactory for SalamanderFactory {
     async fn open(&self, server: std::net::SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
-        let inner = StdUdpFactory.open(server).await?;
+        let inner = self.inner.open(server).await?;
         Ok(Arc::new(ObfsSalamander::new(inner, &self.psk)?))
     }
 }
@@ -1741,6 +1781,33 @@ congestion: {{ type: bbr, bbrProfile: turbo }}
             t.ipv6.as_deref(),
             Some("2001::ffff:ffff:ffff:fff1/126")
         );
+        assert!(!t.apply_exclude);
+    }
+
+    #[test]
+    fn merge_tun_exclude_sets_apply_and_cidrs() {
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\ntun:\n  name: hy0\n  route:\n    ipv4Exclude: [1.1.1.1/32]\n",
+        )
+        .unwrap();
+        let mut app = fill_client(&y).unwrap();
+        let cidrs = [(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 0, 0)),
+            16u8,
+        )];
+        merge_tun_exclude(&mut app.tun, &cidrs);
+        let t = app.tun.as_ref().unwrap();
+        assert!(t.apply_exclude);
+        let r = t.route.as_ref().unwrap();
+        assert!(r.ipv4_exclude.iter().any(|s| s == "1.1.1.1/32"));
+        assert!(r.ipv4_exclude.iter().any(|s| s == "192.168.0.0/16"));
+        let got = crate::inbound::tun_plan::linux_ipv4_install_list(
+            &r.ipv4,
+            &r.ipv4_exclude,
+            true,
+        )
+        .unwrap();
+        assert!(!got.iter().any(|s| s == "0.0.0.0/0"));
     }
 
     #[test]

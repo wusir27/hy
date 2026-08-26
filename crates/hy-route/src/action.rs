@@ -3,7 +3,7 @@
 pub enum Action {
     /// Unique hy tunnel (`-c` main server).
     Proxy,
-    /// Local direct dial (not implemented this step).
+    /// Local direct dial (physical NIC, not the hy tunnel).
     Direct,
     /// Reject: do not open a tunnel.
     Reject,

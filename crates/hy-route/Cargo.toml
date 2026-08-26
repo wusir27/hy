@@ -9,3 +9,6 @@ description = "Hysteria 2 client routing"
 hy-extras = { path = "../hy-extras" }
 thiserror.workspace = true
 tracing.workspace = true
+tokio = { workspace = true }
+socket2 = "0.6"
+libc = "0.2"

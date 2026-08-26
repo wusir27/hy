@@ -5,7 +5,10 @@ mod geoloader;
 mod inbound;
 mod listen;
 mod mimic;
+mod policy_route;
 mod route_glue;
+#[cfg(feature = "client-route")]
+mod marked_udp;
 
 use clap::{Parser, Subcommand};
 use config::{fill_client, fill_server, parse_client_yaml, parse_server_yaml};
@@ -38,6 +41,9 @@ enum Cmd {
         /// GeoIP database for `--route` (default: cwd geoip.dat / geoloader).
         #[arg(long = "route-geoip", value_name = "PATH")]
         route_geoip: Option<PathBuf>,
+        /// Linux DIRECT / QUIC `SO_MARK` (hex, default 0x162). Ignored on non-Linux.
+        #[arg(long = "route-fwmark", value_name = "HEX")]
+        route_fwmark: Option<String>,
     },
     Server,
     Version,
@@ -62,14 +68,16 @@ async fn main() {
             no_client_route,
             route,
             route_geoip,
+            route_fwmark,
         }) => run_client(
             cli.config.as_ref(),
             no_client_route,
             route.as_ref(),
             route_geoip.as_ref(),
+            route_fwmark.as_deref(),
         )
         .await,
-        None => run_client(cli.config.as_ref(), false, None, None).await,
+        None => run_client(cli.config.as_ref(), false, None, None, None).await,
     };
     if let Err(e) = r {
         eprintln!("{e}");
@@ -147,29 +155,80 @@ fn load_route_geoip(explicit: Option<&Path>) -> Result<hy_extras::acl::GeoIpMap,
         .map_err(|e| Error::config("route-geoip", e))
 }
 
-fn build_flow_dial(
-    client: Arc<dyn Client>,
+#[cfg(feature = "client-route")]
+struct PreparedRoute {
+    router: hy_route::Router,
+    direct: hy_route::DirectDialer,
+}
+
+/// Resolve route file, compile, inject marked QUIC factory + policy routing.
+/// Must run before `connect_reconnectable`.
+#[cfg(feature = "client-route")]
+fn prepare_client_route(
+    app: &mut config::ClientApp,
     no_client_route: bool,
     route: Option<&Path>,
     route_geoip: Option<&Path>,
     yaml_file: Option<&str>,
-) -> Result<Arc<dyn FlowDial>, Error> {
-    let route_file = resolve_route_file(no_client_route, route, yaml_file);
+    route_fwmark: Option<&str>,
+) -> Result<Option<PreparedRoute>, Error> {
+    let Some(path) = resolve_route_file(no_client_route, route, yaml_file) else {
+        return Ok(None);
+    };
+    let geo = load_route_geoip(route_geoip)?;
+    let router = hy_route::compile_file(&path, Some(&geo))
+        .map_err(|e| Error::config("route", e.to_string()))?;
+    tracing::info!(path = %path.display(), "client-route enabled");
+
+    let fwmark = crate::policy_route::parse_fwmark(route_fwmark)
+        .map_err(|e| Error::config("route-fwmark", e))?;
+    let direct = hy_route::DirectDialer::new(fwmark)
+        .map_err(|e| Error::config("route", e.to_string()))?;
+
+    let marked = std::sync::Arc::new(crate::marked_udp::MarkedUdpFactory::new(direct.clone()));
+    crate::marked_udp::inject_marked_udp(
+        &mut app.core,
+        marked,
+        app.salamander_only_psk.as_deref(),
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = crate::policy_route::install_linux_policy_routing(fwmark) {
+            tracing::error!("{e}");
+            eprintln!("{e}");
+            return Err(Error::config("route", e.to_string()));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fwmark;
+    }
+
+    config::merge_tun_exclude(&mut app.tun, &router.tun_exclude_cidrs());
+    Ok(Some(PreparedRoute { router, direct }))
+}
+
+fn build_flow_dial(
+    client: Arc<dyn Client>,
+    #[cfg(feature = "client-route")] prepared: Option<PreparedRoute>,
+) -> Arc<dyn FlowDial> {
     #[cfg(not(feature = "client-route"))]
     {
-        let _ = (route_file, route_geoip);
-        return Ok(Arc::new(PassthroughDial { client }));
+        return Arc::new(PassthroughDial { client });
     }
     #[cfg(feature = "client-route")]
     {
-        let Some(path) = route_file else {
-            return Ok(Arc::new(PassthroughDial { client }));
-        };
-        let geo = load_route_geoip(route_geoip)?;
-        let router = hy_route::compile_file(&path, Some(&geo))
-            .map_err(|e| Error::config("route", e.to_string()))?;
-        tracing::info!(path = %path.display(), "client-route enabled");
-        Ok(Arc::new(route_glue::RouteDial { router, client }))
+        match prepared {
+            Some(PreparedRoute { router, direct }) => {
+                Arc::new(route_glue::RouteDial {
+                    router,
+                    client,
+                    direct,
+                })
+            }
+            None => Arc::new(PassthroughDial { client }),
+        }
     }
 }
 
@@ -178,25 +237,43 @@ async fn run_client(
     no_client_route: bool,
     route: Option<&PathBuf>,
     route_geoip: Option<&PathBuf>,
+    route_fwmark: Option<&str>,
 ) -> Result<(), Error> {
     let y = parse_client_yaml(&read_cfg(path)?)?;
     let mut app = fill_client(&y)?;
     let _mimic = app.start()?;
     let lazy = app.lazy;
+    let yaml_route = y.route.as_ref().and_then(|r| r.file.as_deref());
+
+    #[cfg(feature = "client-route")]
+    let prepared = prepare_client_route(
+        &mut app,
+        no_client_route,
+        route.map(|p| p.as_path()),
+        route_geoip.map(|p| p.as_path()),
+        yaml_route,
+        route_fwmark,
+    )?;
+    #[cfg(not(feature = "client-route"))]
+    {
+        let _ = (no_client_route, route, route_geoip, yaml_route, route_fwmark);
+        let _ = resolve_route_file(
+            no_client_route,
+            route.map(|p| p.as_path()),
+            yaml_route,
+        );
+    }
+
     let cli = client::connect_reconnectable(app.core, lazy).await?;
     if lazy {
         tracing::info!("lazy: connect on first inbound");
     } else {
         tracing::info!("connected");
     }
-    let yaml_route = y.route.as_ref().and_then(|r| r.file.as_deref());
-    let dial = build_flow_dial(
-        Arc::clone(&cli),
-        no_client_route,
-        route.map(|p| p.as_path()),
-        route_geoip.map(|p| p.as_path()),
-        yaml_route,
-    )?;
+    #[cfg(feature = "client-route")]
+    let dial = build_flow_dial(Arc::clone(&cli), prepared);
+    #[cfg(not(feature = "client-route"))]
+    let dial = build_flow_dial(Arc::clone(&cli));
     let mut tasks = Vec::new();
     if let Some(s) = app.socks5.take() {
         let c = Arc::clone(&dial);
@@ -379,10 +456,12 @@ mod tests {
                 no_client_route,
                 route,
                 route_geoip,
+                route_fwmark,
             }) => {
                 assert!(no_client_route);
                 assert!(route.is_none());
                 assert!(route_geoip.is_none());
+                assert!(route_fwmark.is_none());
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -398,10 +477,12 @@ mod tests {
                 no_client_route,
                 route,
                 route_geoip,
+                route_fwmark,
             }) => {
                 assert!(!no_client_route);
                 assert_eq!(route.as_deref(), Some(std::path::Path::new("/tmp/sr_cnip.conf")));
                 assert!(route_geoip.is_none());
+                assert!(route_fwmark.is_none());
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -424,10 +505,12 @@ mod tests {
                 no_client_route,
                 route,
                 route_geoip,
+                route_fwmark,
             }) => {
                 assert!(no_client_route);
                 assert_eq!(route.as_deref(), Some(std::path::Path::new("rules.conf")));
                 assert!(route_geoip.is_none());
+                assert!(route_fwmark.is_none());
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -525,6 +608,56 @@ mod tests {
         let m = load_route_geoip(Some(&p)).unwrap();
         assert!(m.contains_key("cn"), "fixture country must be present");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn client_accepts_route_fwmark() {
+        let c = Cli::try_parse_from([
+            "hy",
+            "client",
+            "-c",
+            "client.yaml",
+            "--route-fwmark",
+            "0x162",
+        ])
+        .unwrap();
+        match c.cmd {
+            Some(Cmd::Client { route_fwmark, .. }) => {
+                assert_eq!(route_fwmark.as_deref(), Some("0x162"));
+            }
+            other => panic!("expected Client, got {other:?}"),
+        }
+        assert_eq!(
+            crate::policy_route::parse_fwmark(Some("0x162")).unwrap(),
+            0x162
+        );
+    }
+
+    #[test]
+    fn no_client_route_no_mark_no_exclude_install() {
+        assert!(
+            resolve_route_file(true, Some(Path::new("r.conf")), None).is_none(),
+            "--no-client-route must not enable routing"
+        );
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\ntun:\n  name: hy0\n  route:\n    ipv4Exclude: [10.0.0.0/8]\n",
+        )
+        .unwrap();
+        let app = fill_client(&y).unwrap();
+        let t = app.tun.expect("tun");
+        assert!(
+            !t.apply_exclude,
+            "--no-client-route / fill must leave exclude ignored"
+        );
+        let route = t.route.as_ref().expect("route");
+        let got = crate::inbound::tun_plan::linux_ipv4_install_list(
+            &route.ipv4,
+            &route.ipv4_exclude,
+            t.apply_exclude,
+        )
+        .unwrap();
+        assert_eq!(got, vec!["0.0.0.0/0".to_string()]);
+        assert!(app.core.conn_factory.is_none());
     }
 }
 

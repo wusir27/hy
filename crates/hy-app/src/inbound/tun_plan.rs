@@ -253,3 +253,91 @@ pub fn darwin_ipv6_install_list(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(subtract_ipv6(&bases, &ex))
 }
+
+fn fmt_v4(a: Ipv4Addr, bits: u8) -> String {
+    format!("{a}/{bits}")
+}
+
+fn fmt_v6(a: Ipv6Addr, bits: u8) -> String {
+    format!("{a}/{bits}")
+}
+
+/// Linux TUN prefixes to install. When `apply_exclude`, subtract excludes from
+/// the user set (empty user → `0.0.0.0/0`). When not, return user-or-default
+/// and the caller still ignores exclude (D3).
+pub fn linux_ipv4_install_list(
+    user: &[String],
+    exclude: &[String],
+    apply_exclude: bool,
+) -> Result<Vec<String>, String> {
+    let bases = if user.is_empty() {
+        vec![(Ipv4Addr::UNSPECIFIED, 0)]
+    } else {
+        user.iter()
+            .map(|s| parse_v4_prefix(s))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let nets = if apply_exclude {
+        let ex = exclude
+            .iter()
+            .map(|s| parse_v4_prefix(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        subtract_ipv4(&bases, &ex)
+    } else {
+        bases
+    };
+    Ok(nets.into_iter().map(|(a, b)| fmt_v4(a, b)).collect())
+}
+
+pub fn linux_ipv6_install_list(
+    user: &[String],
+    exclude: &[String],
+    apply_exclude: bool,
+) -> Result<Vec<String>, String> {
+    if user.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bases = user
+        .iter()
+        .map(|s| parse_v6_prefix(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let nets = if apply_exclude {
+        let ex = exclude
+            .iter()
+            .map(|s| parse_v6_prefix(s))
+            .collect::<Result<Vec<_>, _>>()?;
+        subtract_ipv6(&bases, &ex)
+    } else {
+        bases
+    };
+    Ok(nets.into_iter().map(|(a, b)| fmt_v6(a, b)).collect())
+}
+
+#[cfg(test)]
+mod linux_exclude_tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn linux_ignore_exclude_when_off() {
+        let got = linux_ipv4_install_list(&[], &["10.0.0.0/8".into()], false).unwrap();
+        assert_eq!(got, vec!["0.0.0.0/0".to_string()]);
+    }
+
+    #[test]
+    fn linux_subtract_exclude_when_on() {
+        let got = linux_ipv4_install_list(&[], &["10.0.0.0/8".into()], true).unwrap();
+        assert!(!got.is_empty());
+        assert!(!got.iter().any(|s| s == "0.0.0.0/0"));
+        let host = Ipv4Addr::new(10, 1, 2, 3);
+        for s in &got {
+            let (a, bits) = parse_v4_prefix(s).unwrap();
+            let mask = if bits == 0 { 0 } else { !0u32 << (32 - bits) };
+            assert_ne!(
+                u32::from(a) & mask,
+                u32::from(host) & mask,
+                "10.0.0.0/8 leaked into {s}"
+            );
+        }
+    }
+}

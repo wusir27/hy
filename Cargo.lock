@@ -718,7 +718,10 @@ name = "hy-route"
 version = "0.0.1"
 dependencies = [
  "hy-extras",
+ "libc",
+ "socket2",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

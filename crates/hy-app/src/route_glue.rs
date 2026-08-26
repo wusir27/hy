@@ -44,11 +44,60 @@ impl FlowDial for PassthroughDial {
     }
 }
 
-/// Decide then PROXY (unique Client) / REJECT / DIRECT-not-implemented.
+/// Decide then PROXY (unique Client) / REJECT / DIRECT (local marked/bound).
 #[cfg(feature = "client-route")]
 pub struct RouteDial {
     pub router: hy_route::Router,
     pub client: Arc<dyn Client>,
+    pub direct: hy_route::DirectDialer,
+}
+
+#[cfg(feature = "client-route")]
+struct DirectTcp {
+    inner: tokio::sync::Mutex<tokio::net::TcpStream>,
+}
+
+#[cfg(feature = "client-route")]
+#[async_trait]
+impl HyTcpConn for DirectTcp {
+    async fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        use tokio::io::AsyncReadExt;
+        self.inner.lock().await.read(buf).await.map_err(Error::Io)
+    }
+    async fn write(&self, buf: &[u8]) -> Result<usize, Error> {
+        use tokio::io::AsyncWriteExt;
+        self.inner.lock().await.write(buf).await.map_err(Error::Io)
+    }
+    async fn close(&self) -> Result<(), Error> {
+        use tokio::io::AsyncWriteExt;
+        self.inner.lock().await.shutdown().await.map_err(Error::Io)
+    }
+}
+
+#[cfg(feature = "client-route")]
+struct DirectUdp {
+    sock: tokio::net::UdpSocket,
+}
+
+#[cfg(feature = "client-route")]
+#[async_trait]
+impl HyUdpConn for DirectUdp {
+    async fn receive(&self) -> Result<(Vec<u8>, String), Error> {
+        let mut buf = vec![0u8; 65535];
+        let (n, src) = self.sock.recv_from(&mut buf).await.map_err(Error::Io)?;
+        buf.truncate(n);
+        Ok((buf, src.to_string()))
+    }
+    async fn send(&self, data: &[u8], addr: &str) -> Result<(), Error> {
+        let dest: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| Error::Dial(format!("direct udp dest {addr}: {e}")))?;
+        self.sock.send_to(data, dest).await.map_err(Error::Io)?;
+        Ok(())
+    }
+    async fn close(&self) -> Result<(), Error> {
+        Ok(())
+    }
 }
 
 #[cfg(feature = "client-route")]
@@ -61,7 +110,16 @@ impl FlowDial for RouteDial {
                 self.client.tcp(&s).await
             }
             hy_route::Action::Reject => Err(Error::Dial("rejected".into())),
-            hy_route::Action::Direct => Err(Error::config("route", "DIRECT not implemented")),
+            hy_route::Action::Direct => {
+                let s = self
+                    .direct
+                    .tcp(&dest)
+                    .await
+                    .map_err(|e| Error::Dial(e.to_string()))?;
+                Ok(Box::new(DirectTcp {
+                    inner: tokio::sync::Mutex::new(s),
+                }))
+            }
         }
     }
 
@@ -69,7 +127,15 @@ impl FlowDial for RouteDial {
         match self.router.decide(&dest) {
             hy_route::Action::Proxy => self.client.udp().await,
             hy_route::Action::Reject => Err(Error::Dial("rejected".into())),
-            hy_route::Action::Direct => Err(Error::config("route", "DIRECT not implemented")),
+            hy_route::Action::Direct => {
+                let v6 = dest.ip.map(|i| i.is_ipv6()).unwrap_or(false);
+                let sock = self
+                    .direct
+                    .udp_bind(v6)
+                    .await
+                    .map_err(|e| Error::Dial(e.to_string()))?;
+                Ok(Box::new(DirectUdp { sock }))
+            }
         }
     }
 }
@@ -200,7 +266,7 @@ mod tests {
 
     #[cfg(feature = "client-route")]
     #[tokio::test]
-    async fn route_dial_proxy_reject_direct_not_faked() {
+    async fn route_dial_proxy_reject_unchanged() {
         let rec = Arc::new(RecClient::new());
         let router = hy_route::compile(
             "[Rule]\nDOMAIN,proxy.example,PROXY\nDOMAIN,rej.example,REJECT\nDOMAIN,dir.example,DIRECT\nFINAL,PROXY\n",
@@ -210,6 +276,7 @@ mod tests {
         let dial = RouteDial {
             router,
             client: rec.clone(),
+            direct: hy_route::DirectDialer::relaxed(0x162),
         };
 
         let _ = dial
@@ -246,33 +313,67 @@ mod tests {
             Error::Dial(s) => assert!(s.contains("reject"), "{s}"),
             other => panic!("expected Dial reject, got {other:?}"),
         }
+        assert_eq!(rec.udp_calls.load(Ordering::SeqCst), 0);
+    }
 
-        let dir = match dial
-            .tcp(Dest {
-                host: Some("dir.example".into()),
-                ip: None,
-                port: 443,
-                proto: Proto::Tcp,
-            })
-            .await
-        {
-            Ok(_) => panic!("DIRECT must fail"),
-            Err(e) => e,
+    #[cfg(feature = "client-route")]
+    #[tokio::test]
+    async fn route_dial_direct_local_does_not_call_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            s.read_exact(&mut buf).await.unwrap();
+            s.write_all(&buf).await.unwrap();
+        });
+
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let eaddr = echo.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 16];
+            let (n, src) = echo.recv_from(&mut buf).await.unwrap();
+            let _ = echo.send_to(&buf[..n], src).await;
+        });
+
+        let rec = Arc::new(RecClient::new());
+        let router = hy_route::compile(
+            "[Rule]\nIP-CIDR,127.0.0.0/8,DIRECT\nFINAL,PROXY\n",
+            None,
+        )
+        .unwrap();
+        let dial = RouteDial {
+            router,
+            client: rec.clone(),
+            direct: hy_route::DirectDialer::relaxed(0x162),
         };
+
+        let conn = dial
+            .tcp(Dest::from_socket_addr(addr, Proto::Tcp))
+            .await
+            .expect("DIRECT tcp local");
+        conn.write(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        let n = conn.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping");
         assert!(
             rec.tcp_addrs.lock().unwrap().is_empty(),
-            "DIRECT must not fake via the hy tunnel"
+            "DIRECT must not call Client::tcp"
         );
-        match dir {
-            Error::Config { field, reason } => {
-                assert_eq!(field, "route");
-                assert!(
-                    reason.contains("DIRECT not implemented"),
-                    "{reason}"
-                );
-            }
-            other => panic!("expected config DIRECT not implemented, got {other:?}"),
-        }
-        assert_eq!(rec.udp_calls.load(Ordering::SeqCst), 0);
+
+        let u = dial
+            .udp(Dest::from_socket_addr(eaddr, Proto::Udp))
+            .await
+            .expect("DIRECT udp local");
+        u.send(b"hi", &eaddr.to_string()).await.unwrap();
+        let (got, _) = u.receive().await.unwrap();
+        assert_eq!(got, b"hi");
+        assert_eq!(
+            rec.udp_calls.load(Ordering::SeqCst),
+            0,
+            "DIRECT must not call Client::udp"
+        );
     }
 }

@@ -13,6 +13,8 @@ pub enum Error {
     },
     #[error("direct: {0}")]
     Direct(String),
+    #[error("dns: {0}")]
+    Dns(String),
 }
 
 impl Error {
@@ -25,5 +27,9 @@ impl Error {
 
     pub(crate) fn direct(msg: impl Into<String>) -> Self {
         Self::Direct(msg.into())
+    }
+
+    pub(crate) fn dns(msg: impl Into<String>) -> Self {
+        Self::Dns(msg.into())
     }
 }

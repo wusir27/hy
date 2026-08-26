@@ -84,8 +84,23 @@ struct RecvPacket {
 }
 
 struct SockSlot {
-    sock: Arc<StdUdp>,
+    sock: Arc<dyn DatagramIo>,
     recv: JoinHandle<()>,
+}
+
+async fn hop_bind(
+    inner: &Option<Arc<dyn ConnFactory>>,
+    server_ip: IpAddr,
+) -> std::io::Result<Arc<dyn DatagramIo>> {
+    if let Some(f) = inner {
+        f.open(SocketAddr::new(server_ip, 0))
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    } else {
+        Ok(Arc::new(
+            StdUdp::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?,
+        ))
+    }
 }
 
 struct HopSocks {
@@ -98,6 +113,7 @@ pub struct UdpHop {
     server_ip: IpAddr,
     ports: Vec<u16>,
     interval: HopInterval,
+    bind_inner: Option<Arc<dyn ConnFactory>>,
     addr_index: AtomicUsize,
     /// Logical addr returned from recv_from (first hop port), like official `Addr`.
     logical_addr: SocketAddr,
@@ -117,13 +133,23 @@ impl UdpHop {
         ports: Vec<u16>,
         interval: HopInterval,
     ) -> std::io::Result<Arc<Self>> {
+        Self::new_with_inner(server_ip, ports, interval, None).await
+    }
+
+    /// Bind hop sockets via `inner` (`MarkedUdpFactory`) when set.
+    pub async fn new_with_inner(
+        server_ip: IpAddr,
+        ports: Vec<u16>,
+        interval: HopInterval,
+        inner: Option<Arc<dyn ConnFactory>>,
+    ) -> std::io::Result<Arc<Self>> {
         if ports.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "udphop: empty port list",
             ));
         }
-        let sock = Arc::new(StdUdp::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await?);
+        let sock = hop_bind(&inner, server_ip).await?;
         let local = sock.local_addr()?;
         // First dest is the declared main port so hop syntax reaches a
         // server that only binds ports[0] (no DNAT required for the first interval).
@@ -136,6 +162,7 @@ impl UdpHop {
             server_ip,
             ports,
             interval,
+            bind_inner: inner,
             addr_index: AtomicUsize::new(addr_index),
             logical_addr,
             cached_local: std::sync::Mutex::new(local),
@@ -168,7 +195,7 @@ impl UdpHop {
         SocketAddr::new(self.server_ip, self.ports[idx])
     }
 
-    fn spawn_recv(self: &Arc<Self>, sock: Arc<StdUdp>) -> JoinHandle<()> {
+    fn spawn_recv(self: &Arc<Self>, sock: Arc<dyn DatagramIo>) -> JoinHandle<()> {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             let mut buf = vec![0u8; UDP_BUFFER_SIZE];
@@ -214,8 +241,8 @@ impl UdpHop {
         if self.closed.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let new_sock = match StdUdp::bind(SocketAddr::from(([0, 0, 0, 0], 0))).await {
-            Ok(s) => Arc::new(s),
+        let new_sock = match hop_bind(&self.bind_inner, self.server_ip).await {
+            Ok(s) => s,
             Err(_) => return Ok(()),
         };
         if let Ok(la) = new_sock.local_addr() {
@@ -339,12 +366,11 @@ impl DatagramIo for UdpHop {
 /// `ConnFactory` that builds a fresh `UdpHop` per reconnect.
 ///
 /// Compose with salamander like official: hop first, then wrap via
-/// [`UdpHopFactory::with_salamander`]. `inner` is reserved for optional chaining.
+/// [`UdpHopFactory::with_salamander`]. `inner` binds hop sockets (marked UDP).
 pub struct UdpHopFactory {
     pub ports: Vec<u16>,
     pub interval: HopInterval,
-    /// Optional next (`ConnFactory`); unused for listen — salamander uses
-    /// [`UdpHopFactory::with_salamander`].
+    /// Innermost bind factory (`MarkedUdpFactory` when client-route is on).
     pub inner: Option<Arc<dyn ConnFactory>>,
     salamander_psk: Option<Vec<u8>>,
 }
@@ -359,6 +385,11 @@ impl UdpHopFactory {
         }
     }
 
+    pub fn with_inner(mut self, inner: Arc<dyn ConnFactory>) -> Self {
+        self.inner = Some(inner);
+        self
+    }
+
     pub fn with_salamander(mut self, psk: Vec<u8>) -> Self {
         self.salamander_psk = Some(psk);
         self
@@ -368,15 +399,19 @@ impl UdpHopFactory {
 #[async_trait]
 impl ConnFactory for UdpHopFactory {
     async fn open(&self, server: SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
-        let hop = UdpHop::new(server.ip(), self.ports.clone(), self.interval)
-            .await
-            .map_err(Error::Io)?;
+        let hop = UdpHop::new_with_inner(
+            server.ip(),
+            self.ports.clone(),
+            self.interval,
+            self.inner.clone(),
+        )
+        .await
+        .map_err(Error::Io)?;
         let io: Arc<dyn DatagramIo> = hop;
         if let Some(psk) = &self.salamander_psk {
             let wrapped = crate::obfs::ObfsSalamander::new(io, psk)?;
             return Ok(Arc::new(wrapped));
         }
-        let _ = &self.inner;
         Ok(io)
     }
 }
@@ -423,5 +458,38 @@ mod tests {
         }
         assert!(changed, "dest port should change after hop interval");
         drop(hop);
+    }
+
+    #[tokio::test]
+    async fn hop_factory_inner_bind_is_used() {
+        use hy_core::io::StdUdpFactory;
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingFactory {
+            inner: Arc<dyn ConnFactory>,
+            opens: AtomicUsize,
+        }
+        #[async_trait]
+        impl ConnFactory for CountingFactory {
+            async fn open(&self, server: SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
+                self.opens.fetch_add(1, Ordering::SeqCst);
+                self.inner.open(server).await
+            }
+        }
+
+        let counting = Arc::new(CountingFactory {
+            inner: Arc::new(StdUdpFactory),
+            opens: AtomicUsize::new(0),
+        });
+        let fac = UdpHopFactory::new(vec![443], HopInterval::fixed(Duration::from_secs(60)))
+            .with_inner(counting.clone());
+        let _io = fac
+            .open("127.0.0.1:1".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            counting.opens.load(Ordering::SeqCst) >= 1,
+            "hop must bind via inner factory"
+        );
     }
 }

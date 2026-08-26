@@ -50,6 +50,7 @@ pub struct RouteDial {
     pub router: hy_route::Router,
     pub client: Arc<dyn Client>,
     pub direct: hy_route::DirectDialer,
+    pub dns_cache: Arc<hy_route::dns::DnsCache>,
 }
 
 #[cfg(feature = "client-route")]
@@ -103,7 +104,8 @@ impl HyUdpConn for DirectUdp {
 #[cfg(feature = "client-route")]
 #[async_trait]
 impl FlowDial for RouteDial {
-    async fn tcp(&self, dest: Dest) -> Result<Box<dyn HyTcpConn>, Error> {
+    async fn tcp(&self, mut dest: Dest) -> Result<Box<dyn HyTcpConn>, Error> {
+        hy_route::dns::fill_host_from_cache(&mut dest, &self.dns_cache);
         match self.router.decide(&dest) {
             hy_route::Action::Proxy => {
                 let s = dest.addr_string();
@@ -123,7 +125,8 @@ impl FlowDial for RouteDial {
         }
     }
 
-    async fn udp(&self, dest: Dest) -> Result<Box<dyn HyUdpConn>, Error> {
+    async fn udp(&self, mut dest: Dest) -> Result<Box<dyn HyUdpConn>, Error> {
+        hy_route::dns::fill_host_from_cache(&mut dest, &self.dns_cache);
         match self.router.decide(&dest) {
             hy_route::Action::Proxy => self.client.udp().await,
             hy_route::Action::Reject => Err(Error::Dial("rejected".into())),
@@ -277,6 +280,7 @@ mod tests {
             router,
             client: rec.clone(),
             direct: hy_route::DirectDialer::relaxed(0x162),
+            dns_cache: Arc::new(hy_route::dns::DnsCache::new()),
         };
 
         let _ = dial
@@ -348,6 +352,7 @@ mod tests {
             router,
             client: rec.clone(),
             direct: hy_route::DirectDialer::relaxed(0x162),
+            dns_cache: Arc::new(hy_route::dns::DnsCache::new()),
         };
 
         let conn = dial
@@ -374,6 +379,44 @@ mod tests {
             rec.udp_calls.load(Ordering::SeqCst),
             0,
             "DIRECT must not call Client::udp"
+        );
+    }
+
+    #[cfg(feature = "client-route")]
+    #[tokio::test]
+    async fn route_dial_fills_host_from_dns_cache_before_decide() {
+        let rec = Arc::new(RecClient::new());
+        let router = hy_route::compile(
+            "[Rule]\nDOMAIN-SUFFIX,ads.example,REJECT\nFINAL,PROXY\n",
+            None,
+        )
+        .unwrap();
+        let cache = Arc::new(hy_route::dns::DnsCache::new());
+        let ip: std::net::IpAddr = "9.9.9.9".parse().unwrap();
+        cache.insert("tracker.ads.example", hy_route::dns::TYPE_A, &[ip], 60);
+        let dial = RouteDial {
+            router,
+            client: rec.clone(),
+            direct: hy_route::DirectDialer::relaxed(0x162),
+            dns_cache: cache,
+        };
+        let err = dial
+            .tcp(Dest {
+                host: None,
+                ip: Some(ip),
+                port: 443,
+                proto: Proto::Tcp,
+            })
+            .await
+            .err()
+            .expect("REJECT");
+        match err {
+            Error::Dial(s) => assert!(s.contains("reject"), "{s}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            rec.tcp_addrs.lock().unwrap().is_empty(),
+            "cached suffix REJECT must not open a tunnel"
         );
     }
 }

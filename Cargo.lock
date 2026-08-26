@@ -717,12 +717,17 @@ dependencies = [
 name = "hy-route"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "hy-extras",
  "libc",
+ "rustls 0.23.43",
+ "rustls-native-certs",
  "socket2",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tracing",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]

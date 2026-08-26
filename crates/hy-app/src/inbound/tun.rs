@@ -11,15 +11,16 @@ pub use crate::inbound::tun_plan::parse_utun_unit;
 use crate::route_glue::{Dest, FlowDial, Proto};
 use hy_core::client::HyTcpConn;
 use hy_core::Error;
-use std::collections::HashMap;
+use async_trait::async_trait;
+use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use std::os::fd::{FromRawFd, RawFd};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 const IP_PROTO_ICMP: u8 = 1;
 const IP_PROTO_TCP: u8 = 6;
@@ -380,8 +381,26 @@ fn build_tcp_v6(
 
 type PacketTx = mpsc::Sender<Vec<u8>>;
 
+/// TUN DNS stub. When present, dest port 53 never goes through [`FlowDial`].
+#[async_trait]
+pub trait DnsAnswerer: Send + Sync {
+    async fn answer(&self, query: &[u8]) -> Option<Vec<u8>>;
+}
+
+#[cfg(feature = "client-route")]
+#[async_trait]
+impl DnsAnswerer for hy_route::dns::DnsStub {
+    async fn answer(&self, query: &[u8]) -> Option<Vec<u8>> {
+        hy_route::dns::DnsStub::answer(self, query).await.ok()
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub async fn run(cfg: TunConfig, client: Arc<dyn FlowDial>) -> Result<(), Error> {
+pub async fn run(
+    cfg: TunConfig,
+    client: Arc<dyn FlowDial>,
+    dns: Option<Arc<dyn DnsAnswerer>>,
+) -> Result<(), Error> {
     let fd = match open_tun_fd(&cfg.name) {
         Ok(fd) => fd,
         Err(e) => {
@@ -402,11 +421,15 @@ pub async fn run(cfg: TunConfig, client: Arc<dyn FlowDial>) -> Result<(), Error>
     }
 
     tracing::info!(iface = %cfg.name, "TUN listening");
-    run_dataplane(fd, cfg, client, false, false).await
+    run_dataplane(fd, cfg, client, false, false, dns).await
 }
 
 #[cfg(target_os = "macos")]
-pub async fn run(cfg: TunConfig, client: Arc<dyn FlowDial>) -> Result<(), Error> {
+pub async fn run(
+    cfg: TunConfig,
+    client: Arc<dyn FlowDial>,
+    dns: Option<Arc<dyn DnsAnswerer>>,
+) -> Result<(), Error> {
     let fd = match crate::inbound::tun_darwin::open_and_configure(&cfg) {
         Ok(fd) => fd,
         Err(e) => {
@@ -418,11 +441,15 @@ pub async fn run(cfg: TunConfig, client: Arc<dyn FlowDial>) -> Result<(), Error>
         }
     };
     tracing::info!(iface = %cfg.name, "TUN listening");
-    run_dataplane(fd, cfg, client, true, true).await
+    run_dataplane(fd, cfg, client, true, true, dns).await
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub async fn run(_cfg: TunConfig, _client: Arc<dyn FlowDial>) -> Result<(), Error> {
+pub async fn run(
+    _cfg: TunConfig,
+    _client: Arc<dyn FlowDial>,
+    _dns: Option<Arc<dyn DnsAnswerer>>,
+) -> Result<(), Error> {
     Err(Error::config("tun", "not supported"))
 }
 
@@ -611,6 +638,7 @@ async fn run_dataplane(
     client: Arc<dyn FlowDial>,
     family_hdr: bool,
     enable_v6: bool,
+    dns: Option<Arc<dyn DnsAnswerer>>,
 ) -> Result<(), Error> {
     // Split into owned read/write via dup so concurrent writer task works.
     let write_fd = unsafe { libc::dup(fd) };
@@ -688,14 +716,19 @@ async fn run_dataplane(
                     let _ = tx.try_send(payload);
                     continue;
                 }
-                let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
-                let _ = tx.try_send(payload);
-                udp_txs.insert(key, tx);
-                let client = Arc::clone(&client);
-                let pkt_tx = pkt_tx.clone();
-                tokio::spawn(async move {
-                    let _ = udp_session(client, rx, pkt_tx, src, dst, idle).await;
-                });
+                if spawn_udp_or_dns(
+                    Arc::clone(&client),
+                    dns.clone(),
+                    payload,
+                    pkt_tx.clone(),
+                    src,
+                    dst,
+                    idle,
+                    &mut udp_txs,
+                    key,
+                ) {
+                    continue;
+                }
             }
             IP_PROTO_TCP => {
                 let Some(tcp) = parse_tcp(pkt, &ip) else {
@@ -715,14 +748,14 @@ async fn run_dataplane(
                     continue;
                 }
                 let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
-                // First segment includes the TCP header+payload for the session task.
                 let frame = pkt[ip.header_len..ip.total_len].to_vec();
                 let _ = tx.try_send(frame);
                 tcp_txs.insert(key, tx);
                 let client = Arc::clone(&client);
                 let pkt_tx = pkt_tx.clone();
+                let dns = dns.clone();
                 tokio::spawn(async move {
-                    let _ = tcp_session(client, rx, pkt_tx, src, dst, idle).await;
+                    let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle).await;
                 });
             }
             _ => {}
@@ -744,14 +777,19 @@ async fn run_dataplane(
                             let _ = tx.try_send(payload);
                             continue;
                         }
-                        let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
-                        let _ = tx.try_send(payload);
-                        udp_txs.insert(key, tx);
-                        let client = Arc::clone(&client);
-                        let pkt_tx = pkt_tx.clone();
-                        tokio::spawn(async move {
-                            let _ = udp_session(client, rx, pkt_tx, src, dst, idle).await;
-                        });
+                        if spawn_udp_or_dns(
+                            Arc::clone(&client),
+                            dns.clone(),
+                            payload,
+                            pkt_tx.clone(),
+                            src,
+                            dst,
+                            idle,
+                            &mut udp_txs,
+                            key,
+                        ) {
+                            continue;
+                        }
                     }
                     IP_PROTO_TCP => {
                         let Some(tcp) = parse_tcp6(pkt, &ip6) else { continue };
@@ -773,8 +811,9 @@ async fn run_dataplane(
                         tcp_txs.insert(key, tx);
                         let client = Arc::clone(&client);
                         let pkt_tx = pkt_tx.clone();
+                        let dns = dns.clone();
                         tokio::spawn(async move {
-                            let _ = tcp_session(client, rx, pkt_tx, src, dst, idle).await;
+                            let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle).await;
                         });
                     }
                     _ => {}
@@ -782,6 +821,37 @@ async fn run_dataplane(
             }
         }
     }
+}
+
+fn spawn_udp_or_dns(
+    client: Arc<dyn FlowDial>,
+    dns: Option<Arc<dyn DnsAnswerer>>,
+    payload: Vec<u8>,
+    pkt_tx: PacketTx,
+    src: SocketAddr,
+    dst: SocketAddr,
+    idle: Duration,
+    udp_txs: &mut HashMap<(SocketAddr, SocketAddr), mpsc::Sender<Vec<u8>>>,
+    key: (SocketAddr, SocketAddr),
+) -> bool {
+    if dst.port() == 53 {
+        if let Some(dns) = dns {
+            tokio::spawn(async move {
+                if let Some(resp) = dns.answer(&payload).await {
+                    let pkt = build_udp_packet(dst, src, &resp);
+                    let _ = pkt_tx.send(pkt).await;
+                }
+            });
+            return true;
+        }
+    }
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(64);
+    let _ = tx.try_send(payload);
+    udp_txs.insert(key, tx);
+    tokio::spawn(async move {
+        let _ = udp_session(client, rx, pkt_tx, src, dst, idle).await;
+    });
+    true
 }
 
 async fn udp_session(
@@ -831,6 +901,7 @@ async fn udp_session(
 
 async fn tcp_session(
     client: Arc<dyn FlowDial>,
+    dns: Option<Arc<dyn DnsAnswerer>>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
     client_addr: SocketAddr,
@@ -894,7 +965,7 @@ async fn tcp_session(
                     }
                 }
                 return tcp_established(
-                    client, rx, pkt_tx, client_addr, remote_addr,
+                    client, dns, rx, pkt_tx, client_addr, remote_addr,
                     snd_nxt, rcv_nxt, early, idle,
                 ).await;
             }
@@ -904,6 +975,7 @@ async fn tcp_session(
 
 async fn tcp_established(
     client: Arc<dyn FlowDial>,
+    dns: Option<Arc<dyn DnsAnswerer>>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
     client_addr: SocketAddr,
@@ -913,16 +985,29 @@ async fn tcp_established(
     early: Vec<u8>,
     idle: Duration,
 ) -> Result<(), Error> {
-    let dest = Dest::from_socket_addr(remote_addr, Proto::Tcp);
-    let hy = match client.tcp(dest).await {
-        Ok(c) => c,
-        Err(_) => {
-            let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
-            let _ = pkt_tx.send(rst).await;
-            return Ok(());
+    let hy: Arc<dyn HyTcpConn> = if remote_addr.port() == 53 {
+        if let Some(dns) = dns {
+            Arc::from(Box::new(DnsHyTcp::new(dns)) as Box<dyn HyTcpConn>)
+        } else {
+            match client.tcp(Dest::from_socket_addr(remote_addr, Proto::Tcp)).await {
+                Ok(c) => Arc::from(c),
+                Err(_) => {
+                    let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
+                    let _ = pkt_tx.send(rst).await;
+                    return Ok(());
+                }
+            }
+        }
+    } else {
+        match client.tcp(Dest::from_socket_addr(remote_addr, Proto::Tcp)).await {
+            Ok(c) => Arc::from(c),
+            Err(_) => {
+                let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
+                let _ = pkt_tx.send(rst).await;
+                return Ok(());
+            }
         }
     };
-    let hy: Arc<dyn HyTcpConn> = Arc::from(hy);
 
     if !early.is_empty() {
         let _ = hy.write(&early).await;
@@ -1017,6 +1102,81 @@ async fn tcp_established(
                 }
             }
         }
+    }
+}
+
+struct DnsHyTcp {
+    dns: Arc<dyn DnsAnswerer>,
+    incoming: Mutex<Vec<u8>>,
+    outgoing: Mutex<VecDeque<u8>>,
+    notify: Notify,
+    closed: AtomicBool,
+}
+
+impl DnsHyTcp {
+    fn new(dns: Arc<dyn DnsAnswerer>) -> Self {
+        Self {
+            dns,
+            incoming: Mutex::new(Vec::new()),
+            outgoing: Mutex::new(VecDeque::new()),
+            notify: Notify::new(),
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+#[async_trait]
+impl HyTcpConn for DnsHyTcp {
+    async fn read(&self, buf: &mut [u8]) -> Result<usize, Error> {
+        loop {
+            {
+                let mut q = self.outgoing.lock().await;
+                if !q.is_empty() {
+                    let n = std::cmp::min(buf.len(), q.len());
+                    for b in buf.iter_mut().take(n) {
+                        *b = q.pop_front().unwrap();
+                    }
+                    return Ok(n);
+                }
+            }
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(0);
+            }
+            self.notify.notified().await;
+        }
+    }
+    async fn write(&self, buf: &[u8]) -> Result<usize, Error> {
+        {
+            let mut acc = self.incoming.lock().await;
+            acc.extend_from_slice(buf);
+        }
+        loop {
+            let query = {
+                let mut acc = self.incoming.lock().await;
+                if acc.len() < 2 {
+                    break;
+                }
+                let n = u16::from_be_bytes([acc[0], acc[1]]) as usize;
+                if acc.len() < 2 + n {
+                    break;
+                }
+                let q = acc[2..2 + n].to_vec();
+                acc.drain(..2 + n);
+                q
+            };
+            if let Some(resp) = self.dns.answer(&query).await {
+                let mut out = self.outgoing.lock().await;
+                out.extend(&(resp.len() as u16).to_be_bytes());
+                out.extend(&resp);
+                self.notify.notify_one();
+            }
+        }
+        Ok(buf.len())
+    }
+    async fn close(&self) -> Result<(), Error> {
+        self.closed.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        Ok(())
     }
 }
 
@@ -1173,6 +1333,109 @@ mod tests {
         }
     }
 
+    struct CountDial {
+        udp: std::sync::atomic::AtomicUsize,
+        tcp: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl FlowDial for CountDial {
+        async fn tcp(&self, _dest: Dest) -> Result<Box<dyn HyTcpConn>, Error> {
+            self.tcp.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Dial("count".into()))
+        }
+        async fn udp(&self, _dest: Dest) -> Result<Box<dyn hy_core::client::HyUdpConn>, Error> {
+            self.udp.fetch_add(1, Ordering::SeqCst);
+            Err(Error::Dial("count".into()))
+        }
+    }
+
+    struct FixedDns(Vec<u8>);
+
+    #[async_trait]
+    impl DnsAnswerer for FixedDns {
+        async fn answer(&self, _query: &[u8]) -> Option<Vec<u8>> {
+            Some(self.0.clone())
+        }
+    }
+
+    fn sample_dns_query() -> Vec<u8> {
+        // id=1 RD, example.com A
+        let mut q = vec![0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(&[7]);
+        q.extend_from_slice(b"example");
+        q.extend_from_slice(&[3]);
+        q.extend_from_slice(b"com");
+        q.push(0);
+        q.extend_from_slice(&[0, 1, 0, 1]);
+        q
+    }
+
+    #[tokio::test]
+    async fn tun_udp_53_hijack_never_calls_flowdial() {
+        let dial = Arc::new(CountDial {
+            udp: std::sync::atomic::AtomicUsize::new(0),
+            tcp: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(8);
+        let mut udp_txs = HashMap::new();
+        let src: SocketAddr = "10.0.0.2:12345".parse().unwrap();
+        let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        let q = sample_dns_query();
+        let dns: Option<Arc<dyn DnsAnswerer>> = Some(Arc::new(FixedDns(q.clone())));
+        spawn_udp_or_dns(
+            dial.clone(),
+            dns,
+            q,
+            pkt_tx,
+            src,
+            dst,
+            Duration::from_secs(1),
+            &mut udp_txs,
+            (src, dst),
+        );
+        let pkt = tokio::time::timeout(Duration::from_secs(2), pkt_rx.recv())
+            .await
+            .expect("dns reply")
+            .expect("pkt");
+        assert_eq!(dial.udp.load(Ordering::SeqCst), 0, ":53 must not enter hy tunnel");
+        assert_eq!(dial.tcp.load(Ordering::SeqCst), 0);
+        let ip = parse_ipv4(&pkt).expect("ipv4 reply");
+        assert_eq!(ip.proto, IP_PROTO_UDP);
+        let udp = parse_udp(&pkt, &ip).expect("udp");
+        assert_eq!(udp.src_port, 53);
+        assert_eq!(udp.dst_port, 12345);
+    }
+
+    #[tokio::test]
+    async fn tun_udp_53_no_hijack_calls_flowdial() {
+        let dial = Arc::new(CountDial {
+            udp: std::sync::atomic::AtomicUsize::new(0),
+            tcp: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (pkt_tx, _pkt_rx) = mpsc::channel::<Vec<u8>>(8);
+        let mut udp_txs = HashMap::new();
+        let src: SocketAddr = "10.0.0.2:12345".parse().unwrap();
+        let dst: SocketAddr = "1.1.1.1:53".parse().unwrap();
+        spawn_udp_or_dns(
+            dial.clone(),
+            None,
+            sample_dns_query(),
+            pkt_tx,
+            src,
+            dst,
+            Duration::from_millis(50),
+            &mut udp_txs,
+            (src, dst),
+        );
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(
+            dial.udp.load(Ordering::SeqCst),
+            1,
+            "--route-no-hijack-dns / no --route: :53 still FlowDial"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn run_without_usable_tun_returns_err() {
@@ -1190,6 +1453,7 @@ mod tests {
             Arc::new(PassthroughDial {
                 client: Arc::new(DummyClient),
             }),
+            None,
         )
         .await;
         assert!(r.is_err(), "expected Err without NET_ADMIN, got Ok(())");

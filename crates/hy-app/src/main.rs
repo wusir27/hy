@@ -44,6 +44,12 @@ enum Cmd {
         /// Linux DIRECT / QUIC `SO_MARK` (hex, default 0x162). Ignored on non-Linux.
         #[arg(long = "route-fwmark", value_name = "HEX")]
         route_fwmark: Option<String>,
+        /// Comma-separated DoH URLs and `ip` / `ip:53`. Wins over conf `dns-server`.
+        #[arg(long = "route-dns", value_name = "LIST")]
+        route_dns: Option<String>,
+        /// Do not intercept TUN dest port 53 (no stub).
+        #[arg(long = "route-no-hijack-dns")]
+        route_no_hijack_dns: bool,
     },
     Server,
     Version,
@@ -69,15 +75,19 @@ async fn main() {
             route,
             route_geoip,
             route_fwmark,
+            route_dns,
+            route_no_hijack_dns,
         }) => run_client(
             cli.config.as_ref(),
             no_client_route,
             route.as_ref(),
             route_geoip.as_ref(),
             route_fwmark.as_deref(),
+            route_dns.as_deref(),
+            route_no_hijack_dns,
         )
         .await,
-        None => run_client(cli.config.as_ref(), false, None, None, None).await,
+        None => run_client(cli.config.as_ref(), false, None, None, None, None, false).await,
     };
     if let Err(e) = r {
         eprintln!("{e}");
@@ -159,6 +169,8 @@ fn load_route_geoip(explicit: Option<&Path>) -> Result<hy_extras::acl::GeoIpMap,
 struct PreparedRoute {
     router: hy_route::Router,
     direct: hy_route::DirectDialer,
+    dns_cache: std::sync::Arc<hy_route::dns::DnsCache>,
+    dns: Option<std::sync::Arc<hy_route::dns::DnsStub>>,
 }
 
 /// Resolve route file, compile, inject marked QUIC factory + policy routing.
@@ -171,6 +183,8 @@ fn prepare_client_route(
     route_geoip: Option<&Path>,
     yaml_file: Option<&str>,
     route_fwmark: Option<&str>,
+    route_dns: Option<&str>,
+    route_no_hijack_dns: bool,
 ) -> Result<Option<PreparedRoute>, Error> {
     let Some(path) = resolve_route_file(no_client_route, route, yaml_file) else {
         return Ok(None);
@@ -186,11 +200,22 @@ fn prepare_client_route(
         .map_err(|e| Error::config("route", e.to_string()))?;
 
     let marked = std::sync::Arc::new(crate::marked_udp::MarkedUdpFactory::new(direct.clone()));
-    crate::marked_udp::inject_marked_udp(
-        &mut app.core,
-        marked,
-        app.salamander_only_psk.as_deref(),
-    );
+    let kind = crate::marked_udp::mark_kind_from_app(app);
+    crate::marked_udp::inject_marked_udp(&mut app.core, marked, kind);
+
+    let dns_cache = std::sync::Arc::new(hy_route::dns::DnsCache::new());
+    let dns = if route_no_hijack_dns {
+        None
+    } else {
+        let specs = hy_route::dns::resolve_server_list(route_dns, router.dns_servers())
+            .map_err(|e| Error::config("route-dns", e.to_string()))?;
+        let upstreams = hy_route::dns::build_upstreams(&specs, direct.clone())
+            .map_err(|e| Error::config("route-dns", e.to_string()))?;
+        Some(std::sync::Arc::new(hy_route::dns::DnsStub::new(
+            std::sync::Arc::clone(&dns_cache),
+            upstreams,
+        )))
+    };
 
     #[cfg(target_os = "linux")]
     {
@@ -206,7 +231,12 @@ fn prepare_client_route(
     }
 
     config::merge_tun_exclude(&mut app.tun, &router.tun_exclude_cidrs());
-    Ok(Some(PreparedRoute { router, direct }))
+    Ok(Some(PreparedRoute {
+        router,
+        direct,
+        dns_cache,
+        dns,
+    }))
 }
 
 fn build_flow_dial(
@@ -220,13 +250,17 @@ fn build_flow_dial(
     #[cfg(feature = "client-route")]
     {
         match prepared {
-            Some(PreparedRoute { router, direct }) => {
-                Arc::new(route_glue::RouteDial {
-                    router,
-                    client,
-                    direct,
-                })
-            }
+            Some(PreparedRoute {
+                router,
+                direct,
+                dns_cache,
+                dns: _,
+            }) => Arc::new(route_glue::RouteDial {
+                router,
+                client,
+                direct,
+                dns_cache,
+            }),
             None => Arc::new(PassthroughDial { client }),
         }
     }
@@ -238,6 +272,8 @@ async fn run_client(
     route: Option<&PathBuf>,
     route_geoip: Option<&PathBuf>,
     route_fwmark: Option<&str>,
+    route_dns: Option<&str>,
+    route_no_hijack_dns: bool,
 ) -> Result<(), Error> {
     let y = parse_client_yaml(&read_cfg(path)?)?;
     let mut app = fill_client(&y)?;
@@ -253,10 +289,12 @@ async fn run_client(
         route_geoip.map(|p| p.as_path()),
         yaml_route,
         route_fwmark,
+        route_dns,
+        route_no_hijack_dns,
     )?;
     #[cfg(not(feature = "client-route"))]
     {
-        let _ = (no_client_route, route, route_geoip, yaml_route, route_fwmark);
+        let _ = (no_client_route, route, route_geoip, yaml_route, route_fwmark, route_dns, route_no_hijack_dns);
         let _ = resolve_route_file(
             no_client_route,
             route.map(|p| p.as_path()),
@@ -270,6 +308,16 @@ async fn run_client(
     } else {
         tracing::info!("connected");
     }
+    #[cfg(feature = "client-route")]
+    let dns_hijack: Option<Arc<dyn inbound::tun::DnsAnswerer>> = prepared
+        .as_ref()
+        .and_then(|p| {
+            p.dns
+                .clone()
+                .map(|s| s as Arc<dyn inbound::tun::DnsAnswerer>)
+        });
+    #[cfg(not(feature = "client-route"))]
+    let dns_hijack: Option<Arc<dyn inbound::tun::DnsAnswerer>> = None;
     #[cfg(feature = "client-route")]
     let dial = build_flow_dial(Arc::clone(&cli), prepared);
     #[cfg(not(feature = "client-route"))]
@@ -333,7 +381,14 @@ async fn run_client(
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(t) = app.tun.take() {
         let c = Arc::clone(&dial);
-        tasks.push(tokio::spawn(async move { inbound::tun::run(t, c).await }));
+        let dns = dns_hijack;
+        tasks.push(tokio::spawn(async move { inbound::tun::run(t, c, dns).await }));
+    } else {
+        let _ = dns_hijack;
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = dns_hijack;
     }
     if tasks.is_empty() {
         tracing::warn!("no inbound configured");
@@ -457,11 +512,15 @@ mod tests {
                 route,
                 route_geoip,
                 route_fwmark,
+                route_dns,
+                route_no_hijack_dns,
             }) => {
                 assert!(no_client_route);
                 assert!(route.is_none());
                 assert!(route_geoip.is_none());
                 assert!(route_fwmark.is_none());
+                assert!(route_dns.is_none());
+                assert!(!route_no_hijack_dns);
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -478,11 +537,15 @@ mod tests {
                 route,
                 route_geoip,
                 route_fwmark,
+                route_dns,
+                route_no_hijack_dns,
             }) => {
                 assert!(!no_client_route);
                 assert_eq!(route.as_deref(), Some(std::path::Path::new("/tmp/sr_cnip.conf")));
                 assert!(route_geoip.is_none());
                 assert!(route_fwmark.is_none());
+                assert!(route_dns.is_none());
+                assert!(!route_no_hijack_dns);
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -506,11 +569,15 @@ mod tests {
                 route,
                 route_geoip,
                 route_fwmark,
+                route_dns,
+                route_no_hijack_dns,
             }) => {
                 assert!(no_client_route);
                 assert_eq!(route.as_deref(), Some(std::path::Path::new("rules.conf")));
                 assert!(route_geoip.is_none());
                 assert!(route_fwmark.is_none());
+                assert!(route_dns.is_none());
+                assert!(!route_no_hijack_dns);
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -631,6 +698,34 @@ mod tests {
             crate::policy_route::parse_fwmark(Some("0x162")).unwrap(),
             0x162
         );
+    }
+
+    #[test]
+    fn client_accepts_route_dns_and_no_hijack() {
+        let c = Cli::try_parse_from([
+            "hy",
+            "client",
+            "-c",
+            "client.yaml",
+            "--route-dns",
+            "https://dns.google/dns-query,1.1.1.1",
+            "--route-no-hijack-dns",
+        ])
+        .unwrap();
+        match c.cmd {
+            Some(Cmd::Client {
+                route_dns,
+                route_no_hijack_dns,
+                ..
+            }) => {
+                assert_eq!(
+                    route_dns.as_deref(),
+                    Some("https://dns.google/dns-query,1.1.1.1")
+                );
+                assert!(route_no_hijack_dns);
+            }
+            other => panic!("expected Client, got {other:?}"),
+        }
     }
 
     #[test]

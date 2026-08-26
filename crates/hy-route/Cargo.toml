@@ -10,5 +10,10 @@ hy-extras = { path = "../hy-extras" }
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true }
+async-trait = { workspace = true }
 socket2 = "0.6"
 libc = "0.2"
+rustls = { workspace = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"

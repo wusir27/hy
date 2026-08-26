@@ -487,6 +487,12 @@ pub struct ClientApp {
     /// Plain salamander (no hop/gecko/realm). Used to wrap a marked StdUdp inner.
     #[allow(dead_code)] // read from main.rs when `client-route` is on
     pub salamander_only_psk: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    pub hop_mark: Option<(Vec<u16>, HopInterval, Option<Vec<u8>>)>,
+    #[allow(dead_code)]
+    pub gecko_mark: Option<(Vec<u8>, usize, usize, Option<Vec<u16>>, HopInterval)>,
+    #[allow(dead_code)]
+    pub realm_mark: Option<(hy_extras::realm::Addr, RealmOptions)>,
 }
 
 impl ClientApp {
@@ -585,6 +591,9 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
     let mut salamander_psk: Option<Vec<u8>> = None;
     let mut gecko_opts: Option<(Vec<u8>, usize, usize)> = None;
     let mut salamander_only_psk: Option<Vec<u8>> = None;
+    let mut hop_mark = None;
+    let mut gecko_mark = None;
+    let mut realm_mark = None;
     if let Some(o) = &y.obfs {
         let ty = o.ty.as_deref().unwrap_or("plain");
         if ty == "salamander" {
@@ -627,9 +636,10 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         }
         // Placeholder; RealmFactory.open writes the punched peer into server_addr_slot.
         cfg.server_addr = Some(std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-        let (fac, slot) = RealmFactory::new(raddr, realm_opts);
+        let (fac, slot) = RealmFactory::new(raddr.clone(), realm_opts.clone());
         cfg.server_addr_slot = Some(slot);
         cfg.conn_factory = Some(std::sync::Arc::new(fac));
+        realm_mark = Some((raddr, realm_opts));
         let _ = (salamander_psk, gecko_opts); // obfs on realm path: wrap later if needed
         mimic = fill_mimic(
             y.mimic.as_ref(),
@@ -648,16 +658,20 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         )?;
 
         if let Some((psk, min, max)) = gecko_opts {
-            let mut fac = GeckoFactory::new(psk, min, max);
+            let mut fac = GeckoFactory::new(psk.clone(), min, max);
+            let hop_ports = parsed.hop_ports.clone();
             if let Some(ports) = parsed.hop_ports {
                 fac = fac.with_hop(ports, hop_interval);
             }
+            gecko_mark = Some((psk, min, max, hop_ports, hop_interval));
             cfg.conn_factory = Some(std::sync::Arc::new(fac));
         } else if let Some(ports) = parsed.hop_ports {
-            let mut fac = UdpHopFactory::new(ports, hop_interval);
-            if let Some(psk) = salamander_psk.take() {
+            let mut fac = UdpHopFactory::new(ports.clone(), hop_interval);
+            let sal = salamander_psk.take();
+            if let Some(psk) = sal.clone() {
                 fac = fac.with_salamander(psk);
             }
+            hop_mark = Some((ports, hop_interval, sal));
             cfg.conn_factory = Some(std::sync::Arc::new(fac));
         } else if let Some(psk) = salamander_psk {
             salamander_only_psk = Some(psk.clone());
@@ -684,6 +698,9 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         lazy: y.lazy.unwrap_or(false),
         mimic,
         salamander_only_psk,
+        hop_mark,
+        gecko_mark,
+        realm_mark,
     })
 }
 

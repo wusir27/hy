@@ -57,6 +57,8 @@ pub struct RealmFactory {
     pub addr: Addr,
     pub opts: RealmOptions,
     pub peer_slot: PeerSlot,
+    /// Innermost UDP bind (`MarkedUdpFactory` when client-route is on).
+    pub inner: Option<Arc<dyn ConnFactory>>,
 }
 
 impl RealmFactory {
@@ -67,9 +69,24 @@ impl RealmFactory {
                 addr,
                 opts,
                 peer_slot: peer_slot.clone(),
+                inner: None,
             },
             peer_slot,
         )
+    }
+
+    pub fn with_inner(mut self, inner: Arc<dyn ConnFactory>) -> Self {
+        self.inner = Some(inner);
+        self
+    }
+
+    pub fn with_slot(addr: Addr, opts: RealmOptions, peer_slot: PeerSlot) -> Self {
+        Self {
+            addr,
+            opts,
+            peer_slot,
+            inner: None,
+        }
     }
 }
 
@@ -81,10 +98,14 @@ impl ConnFactory for RealmFactory {
         } else {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
         };
-        let udp = StdUdp::bind(bind).await.map_err(Error::Io)?;
+        let udp: Arc<dyn DatagramIo> = if let Some(inner) = &self.inner {
+            inner.open(bind).await?
+        } else {
+            Arc::new(StdUdp::bind(bind).await.map_err(Error::Io)?)
+        };
         let local = udp.local_addr().map_err(Error::Io)?;
         let punch_conn = Arc::new(
-            PunchPacketConn::new(Arc::new(udp), 0)
+            PunchPacketConn::new(udp, 0)
                 .map_err(|e| Error::config("realm", e.to_string()))?,
         );
 
@@ -348,5 +369,39 @@ mod tests {
         let o = RealmOptions::default();
         assert!(o.stun_servers.iter().any(|s| s.contains("nextcloud")));
         assert!(o.stun_servers.iter().any(|s| s.contains("cloudflare")));
+    }
+
+    #[tokio::test]
+    async fn realm_bind_uses_inner_factory() {
+        use crate::realm::addr::parse_addr;
+        use hy_core::io::StdUdpFactory;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingFactory {
+            inner: Arc<dyn ConnFactory>,
+            opens: AtomicUsize,
+        }
+        #[async_trait]
+        impl ConnFactory for CountingFactory {
+            async fn open(&self, server: SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
+                self.opens.fetch_add(1, Ordering::SeqCst);
+                self.inner.open(server).await
+            }
+        }
+
+        let counting = Arc::new(CountingFactory {
+            inner: Arc::new(StdUdpFactory),
+            opens: AtomicUsize::new(0),
+        });
+        let addr = parse_addr("realm://tok@127.0.0.1:9/myid").unwrap();
+        let mut opts = RealmOptions::default();
+        opts.inject_local_addrs = Some(vec!["127.0.0.1:1".parse().unwrap()]);
+        let (fac, _slot) = RealmFactory::new(addr, opts);
+        let fac = fac.with_inner(counting.clone());
+        let _ = fac.open("127.0.0.1:1".parse().unwrap()).await;
+        assert!(
+            counting.opens.load(Ordering::SeqCst) >= 1,
+            "realm must bind via inner before STUN/connect"
+        );
     }
 }

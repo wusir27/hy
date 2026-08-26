@@ -1,11 +1,12 @@
 //! Client-side routing (rules, DNS, direct dial).
 //!
-//! This step: compile + [`Router::decide`] + [`DirectDialer`]. No RULE-SET
-//! download, DNS, or ICMP.
+//! This step: compile + [`Router::decide`] + [`DirectDialer`] + [`dns`].
+//! No RULE-SET download, SNI peek, or ICMP.
 
 mod action;
 mod dest;
 mod direct;
+pub mod dns;
 mod error;
 mod router;
 mod suffix;

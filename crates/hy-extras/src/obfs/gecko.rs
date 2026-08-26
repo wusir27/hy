@@ -330,6 +330,8 @@ pub struct GeckoFactory {
     pub max_packet_size: usize,
     pub hop_ports: Option<Vec<u16>>,
     pub hop_interval: HopInterval,
+    /// Innermost UDP bind (`MarkedUdpFactory` when client-route is on).
+    pub inner: Option<Arc<dyn ConnFactory>>,
 }
 
 impl GeckoFactory {
@@ -340,6 +342,7 @@ impl GeckoFactory {
             max_packet_size,
             hop_ports: None,
             hop_interval: HopInterval::default_30s(),
+            inner: None,
         }
     }
 
@@ -348,15 +351,27 @@ impl GeckoFactory {
         self.hop_interval = interval;
         self
     }
+
+    pub fn with_inner(mut self, inner: Arc<dyn ConnFactory>) -> Self {
+        self.inner = Some(inner);
+        self
+    }
 }
 
 #[async_trait]
 impl ConnFactory for GeckoFactory {
     async fn open(&self, server: SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
         let inner: Arc<dyn DatagramIo> = if let Some(ports) = &self.hop_ports {
-            UdpHop::new(server.ip(), ports.clone(), self.hop_interval)
-                .await
-                .map_err(Error::Io)?
+            UdpHop::new_with_inner(
+                server.ip(),
+                ports.clone(),
+                self.hop_interval,
+                self.inner.clone(),
+            )
+            .await
+            .map_err(Error::Io)?
+        } else if let Some(fac) = &self.inner {
+            fac.open(server).await?
         } else {
             StdUdpFactory.open(server).await?
         };
@@ -478,6 +493,32 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn gecko_factory_inner_bind_is_used() {
+        use hy_core::io::StdUdpFactory;
+        struct CountingFactory {
+            inner: Arc<dyn ConnFactory>,
+            opens: AtomicUsize,
+        }
+        #[async_trait]
+        impl ConnFactory for CountingFactory {
+            async fn open(&self, server: SocketAddr) -> Result<Arc<dyn DatagramIo>, Error> {
+                self.opens.fetch_add(1, Ordering::SeqCst);
+                self.inner.open(server).await
+            }
+        }
+        let counting = Arc::new(CountingFactory {
+            inner: Arc::new(StdUdpFactory),
+            opens: AtomicUsize::new(0),
+        });
+        let fac = GeckoFactory::new(b"test".to_vec(), 0, 0).with_inner(counting.clone());
+        let _io = fac
+            .open("127.0.0.1:1".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(counting.opens.load(Ordering::SeqCst), 1);
     }
 
     struct DummyIo;

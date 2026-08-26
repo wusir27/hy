@@ -5,12 +5,14 @@ mod geoloader;
 mod inbound;
 mod listen;
 mod mimic;
+mod route_glue;
 
 use clap::{Parser, Subcommand};
 use config::{fill_client, fill_server, parse_client_yaml, parse_server_yaml};
 use hy_core::client;
 use hy_core::server;
 use hy_core::Error;
+use route_glue::{FlowDial, PassthroughDial};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +28,14 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    Client,
+    Client {
+        /// Disable client routing (passthrough to the main server).
+        #[arg(long = "no-client-route")]
+        no_client_route: bool,
+        /// Local Shadowrocket-style rules file. Accepted this step; unused.
+        #[arg(long = "route", value_name = "PATH")]
+        route: Option<PathBuf>,
+    },
     Server,
     Version,
 }
@@ -46,7 +55,11 @@ async fn main() {
             Ok(())
         }
         Some(Cmd::Server) => run_server(cli.config.as_ref()).await,
-        Some(Cmd::Client) | None => run_client(cli.config.as_ref()).await,
+        Some(Cmd::Client {
+            no_client_route,
+            route,
+        }) => run_client(cli.config.as_ref(), no_client_route, route.as_ref()).await,
+        None => run_client(cli.config.as_ref(), false, None).await,
     };
     if let Err(e) = r {
         eprintln!("{e}");
@@ -76,7 +89,11 @@ async fn shutdown_signal() -> Result<(), Error> {
     }
 }
 
-async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
+async fn run_client(
+    path: Option<&PathBuf>,
+    no_client_route: bool,
+    _route: Option<&PathBuf>,
+) -> Result<(), Error> {
     let y = parse_client_yaml(&read_cfg(path)?)?;
     let mut app = fill_client(&y)?;
     let _mimic = app.start()?;
@@ -87,13 +104,19 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
     } else {
         tracing::info!("connected");
     }
+    if no_client_route {
+        tracing::info!("client-route disabled by flag");
+    }
+    let dial: Arc<dyn FlowDial> = Arc::new(PassthroughDial {
+        client: Arc::clone(&cli),
+    });
     let mut tasks = Vec::new();
     if let Some(s) = app.socks5.take() {
-        let c = Arc::clone(&cli);
+        let c = Arc::clone(&dial);
         tasks.push(tokio::spawn(async move { inbound::socks5::run(&s, c).await }));
     }
     if let Some(h) = app.http.take() {
-        let c = Arc::clone(&cli);
+        let c = Arc::clone(&dial);
         tasks.push(tokio::spawn(async move { inbound::http::run(&h, c).await }));
     }
     for f in app.tcp_fwd {
@@ -145,7 +168,7 @@ async fn run_client(path: Option<&PathBuf>) -> Result<(), Error> {
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if let Some(t) = app.tun.take() {
-        let c = Arc::clone(&cli);
+        let c = Arc::clone(&dial);
         tasks.push(tokio::spawn(async move { inbound::tun::run(t, c).await }));
     }
     if tasks.is_empty() {
@@ -254,3 +277,65 @@ async fn select_all_join(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_accepts_no_client_route() {
+        let c = Cli::try_parse_from(["hy", "client", "--no-client-route", "-c", "client.yaml"]).unwrap();
+        match c.cmd {
+            Some(Cmd::Client {
+                no_client_route,
+                route,
+            }) => {
+                assert!(no_client_route);
+                assert!(route.is_none());
+            }
+            other => panic!("expected Client, got {other:?}"),
+        }
+        assert_eq!(c.config.as_deref(), Some(std::path::Path::new("client.yaml")));
+    }
+
+    #[test]
+    fn client_accepts_route_path() {
+        let c = Cli::try_parse_from(["hy", "client", "--route", "/tmp/sr_cnip.conf", "-c", "client.yaml"])
+            .unwrap();
+        match c.cmd {
+            Some(Cmd::Client {
+                no_client_route,
+                route,
+            }) => {
+                assert!(!no_client_route);
+                assert_eq!(route.as_deref(), Some(std::path::Path::new("/tmp/sr_cnip.conf")));
+            }
+            other => panic!("expected Client, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_accepts_no_client_route_and_route_together() {
+        let c = Cli::try_parse_from([
+            "hy",
+            "client",
+            "-c",
+            "client.yaml",
+            "--no-client-route",
+            "--route",
+            "rules.conf",
+        ])
+        .unwrap();
+        match c.cmd {
+            Some(Cmd::Client {
+                no_client_route,
+                route,
+            }) => {
+                assert!(no_client_route);
+                assert_eq!(route.as_deref(), Some(std::path::Path::new("rules.conf")));
+            }
+            other => panic!("expected Client, got {other:?}"),
+        }
+    }
+}
+

@@ -9,9 +9,14 @@ description = "Hysteria 2 CLI"
 name = "hy"
 path = "src/main.rs"
 
+[features]
+default = ["client-route"]
+client-route = ["dep:hy-route"]
+
 [dependencies]
 hy-core = { path = "../hy-core" }
 hy-extras = { path = "../hy-extras" }
+hy-route = { path = "../hy-route", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
 async-trait = { workspace = true }
 serde = { workspace = true }

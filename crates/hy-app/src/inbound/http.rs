@@ -1,12 +1,13 @@
 use crate::inbound::forward::relay_tcp;
 use crate::listen::parse_listen;
-use hy_core::client::{Client, HyTcpConn};
+use crate::route_glue::{Dest, FlowDial, Proto};
+use hy_core::client::HyTcpConn;
 use hy_core::Error;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-pub async fn run(cfg: &crate::config::HttpYaml, client: Arc<dyn Client>) -> Result<(), Error> {
+pub async fn run(cfg: &crate::config::HttpYaml, client: Arc<dyn FlowDial>) -> Result<(), Error> {
     let listen = cfg.listen.as_deref().ok_or_else(|| Error::config("http.listen", "must be set"))?;
     let addr = parse_listen(listen, "http.listen")?;
     let ln = TcpListener::bind(addr).await.map_err(Error::Io)?;
@@ -28,7 +29,7 @@ pub async fn run(cfg: &crate::config::HttpYaml, client: Arc<dyn Client>) -> Resu
 
 async fn handle(
     s: TcpStream,
-    client: Arc<dyn Client>,
+    client: Arc<dyn FlowDial>,
     user: &str,
     pass: &str,
     realm: &str,
@@ -86,7 +87,8 @@ async fn handle(
         }
     }
     let mut s = r.into_inner();
-    match client.tcp(&dest).await {
+    let dest = Dest::from_addr_string(&dest, Proto::Tcp);
+    match client.tcp(dest).await {
         Ok(mut out) => {
             if is_connect {
                 s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")

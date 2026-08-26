@@ -651,6 +651,7 @@ dependencies = [
  "clap",
  "hy-core",
  "hy-extras",
+ "hy-route",
  "instant-acme",
  "libc",
  "rcgen 0.14.7",
@@ -711,6 +712,10 @@ dependencies = [
  "tokio",
  "webpki-roots 0.26.11",
 ]
+
+[[package]]
+name = "hy-route"
+version = "0.0.1"
 
 [[package]]
 name = "hyper"

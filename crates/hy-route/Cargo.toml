@@ -1,0 +1,8 @@
+[package]
+name = "hy-route"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hysteria 2 client routing"
+
+[dependencies]

@@ -2,14 +2,15 @@
 
 use crate::inbound::forward::relay_tcp;
 use crate::listen::parse_listen;
-use hy_core::client::{Client, HyUdpConn};
+use crate::route_glue::{Dest, FlowDial, Proto};
+use hy_core::client::HyUdpConn;
 use hy_core::Error;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-pub async fn run(cfg: &crate::config::Socks5Yaml, client: Arc<dyn Client>) -> Result<(), Error> {
+pub async fn run(cfg: &crate::config::Socks5Yaml, client: Arc<dyn FlowDial>) -> Result<(), Error> {
     let listen = cfg.listen.as_deref().ok_or_else(|| Error::config("socks5.listen", "must be set"))?;
     let addr = parse_listen(listen, "socks5.listen")?;
     let ln = TcpListener::bind(addr).await.map_err(Error::Io)?;
@@ -30,7 +31,7 @@ pub async fn run(cfg: &crate::config::Socks5Yaml, client: Arc<dyn Client>) -> Re
 
 async fn handle(
     mut s: TcpStream,
-    client: Arc<dyn Client>,
+    client: Arc<dyn FlowDial>,
     user: &str,
     pass: &str,
     disable_udp: bool,
@@ -77,7 +78,8 @@ async fn handle(
     match req[1] {
         1 => {
             // CONNECT
-            match client.tcp(&dest).await {
+            let dest = Dest::from_addr_string(&dest, Proto::Tcp);
+            match client.tcp(dest).await {
                 Ok(out) => {
                     s.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).await.map_err(Error::Io)?;
                     relay_tcp(s, out).await
@@ -88,7 +90,10 @@ async fn handle(
                 }
             }
         }
-        3 if !disable_udp => associate(s, client).await,
+        3 if !disable_udp => {
+            let dest = Dest::from_addr_string(&dest, Proto::Udp);
+            associate(s, client, dest).await
+        }
         _ => {
             s.write_all(&[5, 7, 0, 1, 0, 0, 0, 0, 0, 0]).await.map_err(Error::Io)?;
             Ok(())
@@ -96,8 +101,8 @@ async fn handle(
     }
 }
 
-async fn associate(mut s: TcpStream, client: Arc<dyn Client>) -> Result<(), Error> {
-    let udp = match client.udp().await {
+async fn associate(mut s: TcpStream, client: Arc<dyn FlowDial>, dest: Dest) -> Result<(), Error> {
+    let udp = match client.udp(dest).await {
         Ok(u) => u,
         Err(_) => {
             s.write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0]).await.map_err(Error::Io)?;

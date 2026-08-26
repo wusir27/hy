@@ -8,7 +8,8 @@
 use crate::config::TunConfig;
 use crate::inbound::tun_plan::{prepend_family, strip_family};
 pub use crate::inbound::tun_plan::parse_utun_unit;
-use hy_core::client::{Client, HyTcpConn};
+use crate::route_glue::{Dest, FlowDial, Proto};
+use hy_core::client::HyTcpConn;
 use hy_core::Error;
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -380,7 +381,7 @@ fn build_tcp_v6(
 type PacketTx = mpsc::Sender<Vec<u8>>;
 
 #[cfg(target_os = "linux")]
-pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
+pub async fn run(cfg: TunConfig, client: Arc<dyn FlowDial>) -> Result<(), Error> {
     let fd = match open_tun_fd(&cfg.name) {
         Ok(fd) => fd,
         Err(e) => {
@@ -405,7 +406,7 @@ pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
 }
 
 #[cfg(target_os = "macos")]
-pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
+pub async fn run(cfg: TunConfig, client: Arc<dyn FlowDial>) -> Result<(), Error> {
     let fd = match crate::inbound::tun_darwin::open_and_configure(&cfg) {
         Ok(fd) => fd,
         Err(e) => {
@@ -421,7 +422,7 @@ pub async fn run(cfg: TunConfig, client: Arc<dyn Client>) -> Result<(), Error> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub async fn run(_cfg: TunConfig, _client: Arc<dyn Client>) -> Result<(), Error> {
+pub async fn run(_cfg: TunConfig, _client: Arc<dyn FlowDial>) -> Result<(), Error> {
     Err(Error::config("tun", "not supported"))
 }
 
@@ -592,7 +593,7 @@ impl TunDev {
 async fn run_dataplane(
     fd: RawFd,
     cfg: TunConfig,
-    client: Arc<dyn Client>,
+    client: Arc<dyn FlowDial>,
     family_hdr: bool,
     enable_v6: bool,
 ) -> Result<(), Error> {
@@ -769,14 +770,15 @@ async fn run_dataplane(
 }
 
 async fn udp_session(
-    client: Arc<dyn Client>,
+    client: Arc<dyn FlowDial>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
     src: SocketAddr,
     dst: SocketAddr,
     idle: Duration,
 ) -> Result<(), Error> {
-    let mut hy = client.udp().await?;
+    let dest = Dest::from_socket_addr(dst, Proto::Udp);
+    let mut hy = client.udp(dest).await?;
     let dst_s = dst.to_string();
     while let Some(payload) = rx.recv().await {
         hy.send(&payload, &dst_s).await?;
@@ -813,7 +815,7 @@ async fn udp_session(
 }
 
 async fn tcp_session(
-    client: Arc<dyn Client>,
+    client: Arc<dyn FlowDial>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
     client_addr: SocketAddr,
@@ -886,7 +888,7 @@ async fn tcp_session(
 }
 
 async fn tcp_established(
-    client: Arc<dyn Client>,
+    client: Arc<dyn FlowDial>,
     mut rx: mpsc::Receiver<Vec<u8>>,
     pkt_tx: PacketTx,
     client_addr: SocketAddr,
@@ -896,7 +898,8 @@ async fn tcp_established(
     early: Vec<u8>,
     idle: Duration,
 ) -> Result<(), Error> {
-    let hy = match client.tcp(&remote_addr.to_string()).await {
+    let dest = Dest::from_socket_addr(remote_addr, Proto::Tcp);
+    let hy = match client.tcp(dest).await {
         Ok(c) => c,
         Err(_) => {
             let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
@@ -1005,8 +1008,9 @@ async fn tcp_established(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::route_glue::PassthroughDial;
     use async_trait::async_trait;
-    use hy_core::client::{HyTcpConn, HyUdpConn};
+    use hy_core::client::{Client, HyTcpConn, HyUdpConn};
 
     #[test]
     fn parse_ipv4_udp_headers() {
@@ -1165,7 +1169,13 @@ mod tests {
             ipv6: None,
             route: None,
         };
-        let r = run(cfg, Arc::new(DummyClient)).await;
+        let r = run(
+            cfg,
+            Arc::new(PassthroughDial {
+                client: Arc::new(DummyClient),
+            }),
+        )
+        .await;
         assert!(r.is_err(), "expected Err without NET_ADMIN, got Ok(())");
         match r {
             Err(Error::Config { field, reason }) => {

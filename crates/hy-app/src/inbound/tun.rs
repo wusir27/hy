@@ -2,8 +2,10 @@
 //!
 //! Opens `/dev/net/tun` (IFF_TUN|IFF_NO_PI), configures address/MTU/routes, then
 //! runs a userspace IPv4 TCP/UDP stack that dials via `client.tcp` / `client.udp`.
-//! ICMP is ignored (official does not proxy ICMP). Privilege failures are logged
-//! and returned — never swallowed.
+//! ICMP is never sent into the hy tunnel. When client-route is on and
+//! `--route-no-icmp-reply` is not set, echo requests get a local TUN reply;
+//! otherwise ICMP is ignored. Privilege failures are logged and returned —
+//! never swallowed.
 
 use crate::config::TunConfig;
 use crate::inbound::tun_plan::{prepend_family, strip_family};
@@ -23,6 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, Mutex, Notify};
 
 const IP_PROTO_ICMP: u8 = 1;
+const IP_PROTO_ICMPV6: u8 = 58;
 const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
 
@@ -414,6 +417,7 @@ pub async fn run(
     client: Arc<dyn FlowDial>,
     dns: Option<Arc<dyn DnsAnswerer>>,
     sni_peek: bool,
+    icmp_reply: bool,
 ) -> Result<(), Error> {
     let fd = match open_tun_fd(&cfg.name) {
         Ok(fd) => fd,
@@ -435,7 +439,17 @@ pub async fn run(
     }
 
     tracing::info!(iface = %cfg.name, "TUN listening");
-    run_dataplane(fd, cfg, client, false, false, dns, sni_peek_deadline(sni_peek)).await
+    run_dataplane(
+        fd,
+        cfg,
+        client,
+        false,
+        false,
+        dns,
+        sni_peek_deadline(sni_peek),
+        icmp_reply,
+    )
+    .await
 }
 
 #[cfg(target_os = "macos")]
@@ -444,6 +458,7 @@ pub async fn run(
     client: Arc<dyn FlowDial>,
     dns: Option<Arc<dyn DnsAnswerer>>,
     sni_peek: bool,
+    icmp_reply: bool,
 ) -> Result<(), Error> {
     let fd = match crate::inbound::tun_darwin::open_and_configure(&cfg) {
         Ok(fd) => fd,
@@ -456,7 +471,17 @@ pub async fn run(
         }
     };
     tracing::info!(iface = %cfg.name, "TUN listening");
-    run_dataplane(fd, cfg, client, true, true, dns, sni_peek_deadline(sni_peek)).await
+    run_dataplane(
+        fd,
+        cfg,
+        client,
+        true,
+        true,
+        dns,
+        sni_peek_deadline(sni_peek),
+        icmp_reply,
+    )
+    .await
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -465,8 +490,10 @@ pub async fn run(
     _client: Arc<dyn FlowDial>,
     _dns: Option<Arc<dyn DnsAnswerer>>,
     sni_peek: bool,
+    icmp_reply: bool,
 ) -> Result<(), Error> {
     let _ = sni_peek;
+    let _ = icmp_reply;
     Err(Error::config("tun", "not supported"))
 }
 
@@ -657,6 +684,7 @@ async fn run_dataplane(
     enable_v6: bool,
     dns: Option<Arc<dyn DnsAnswerer>>,
     sni_peek: Option<Duration>,
+    icmp_reply: bool,
 ) -> Result<(), Error> {
     // Split into owned read/write via dup so concurrent writer task works.
     let write_fd = unsafe { libc::dup(fd) };
@@ -719,7 +747,8 @@ async fn run_dataplane(
         if let Some(ip) = parse_ipv4(pkt) {
         match ip.proto {
             IP_PROTO_ICMP => {
-                // Official does not proxy ICMP.
+                // Local echo reply only; never proxy ICMP into FlowDial / the hy tunnel.
+                maybe_send_icmp_echo(pkt, icmp_reply, false, &pkt_tx).await;
             }
             IP_PROTO_UDP => {
                 let Some(udp) = parse_udp(pkt, &ip) else {
@@ -784,7 +813,9 @@ async fn run_dataplane(
         if enable_v6 {
             if let Some(ip6) = parse_ipv6(pkt) {
                 match ip6.next {
-                    IP_PROTO_ICMP | 58 => {}
+                    IP_PROTO_ICMP | IP_PROTO_ICMPV6 => {
+                        maybe_send_icmp_echo(pkt, icmp_reply, true, &pkt_tx).await;
+                    }
                     IP_PROTO_UDP => {
                         let Some(udp) = parse_udp6(pkt, &ip6) else { continue };
                         let src = SocketAddr::V6(SocketAddrV6::new(ip6.src, udp.src_port, 0, 0));
@@ -840,6 +871,28 @@ async fn run_dataplane(
                 }
             }
         }
+    }
+}
+
+/// Local ICMP echo reply onto `pkt_tx`. Never dials FlowDial.
+async fn maybe_send_icmp_echo(pkt: &[u8], icmp_reply: bool, v6: bool, pkt_tx: &PacketTx) {
+    if !icmp_reply {
+        return;
+    }
+    #[cfg(feature = "client-route")]
+    {
+        let reply = if v6 {
+            hy_route::icmp::echo_reply_v6(pkt)
+        } else {
+            hy_route::icmp::echo_reply_v4(pkt)
+        };
+        if let Some(reply) = reply {
+            let _ = pkt_tx.send(reply).await;
+        }
+    }
+    #[cfg(not(feature = "client-route"))]
+    {
+        let _ = (pkt, v6, pkt_tx);
     }
 }
 
@@ -1517,6 +1570,68 @@ mod tests {
         );
     }
 
+    fn craft_icmp_echo_v4(src: [u8; 4], dst: [u8; 4], id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+        let total = 20 + 8 + payload.len();
+        let mut pkt = vec![0u8; total];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+        pkt[8] = 64;
+        pkt[9] = IP_PROTO_ICMP;
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[20] = 8; // echo request
+        pkt[24..26].copy_from_slice(&id.to_be_bytes());
+        pkt[26..28].copy_from_slice(&seq.to_be_bytes());
+        pkt[28..].copy_from_slice(payload);
+        // Checksums left zero; echo_reply_v4 does not require valid input checksums.
+        pkt
+    }
+
+    #[cfg(feature = "client-route")]
+    #[tokio::test]
+    async fn tun_icmp_echo_reply_when_routing_on() {
+        let dial = Arc::new(CountDial {
+            udp: std::sync::atomic::AtomicUsize::new(0),
+            tcp: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(8);
+        let pkt = craft_icmp_echo_v4([10, 0, 0, 2], [1, 1, 1, 1], 0x11, 0x22, b"ping");
+        maybe_send_icmp_echo(&pkt, true, false, &pkt_tx).await;
+        let reply = tokio::time::timeout(Duration::from_secs(2), pkt_rx.recv())
+            .await
+            .expect("icmp reply")
+            .expect("pkt");
+        assert_eq!(dial.udp.load(Ordering::SeqCst), 0, "ICMP must not enter hy tunnel");
+        assert_eq!(dial.tcp.load(Ordering::SeqCst), 0);
+        let ip = parse_ipv4(&reply).expect("ipv4 reply");
+        assert_eq!(ip.proto, IP_PROTO_ICMP);
+        assert_eq!(ip.src, Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(ip.dst, Ipv4Addr::new(10, 0, 0, 2));
+        assert_eq!(reply[ip.header_len], 0, "echo reply type 0");
+        assert_eq!(&reply[ip.header_len + 4..ip.header_len + 6], &0x11u16.to_be_bytes());
+        assert_eq!(&reply[ip.header_len + 6..ip.header_len + 8], &0x22u16.to_be_bytes());
+        assert_eq!(&reply[ip.header_len + 8..], b"ping");
+    }
+
+    #[tokio::test]
+    async fn tun_icmp_ignored_when_routing_off_or_no_icmp_reply() {
+        let dial = Arc::new(CountDial {
+            udp: std::sync::atomic::AtomicUsize::new(0),
+            tcp: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(8);
+        let pkt = craft_icmp_echo_v4([10, 0, 0, 2], [8, 8, 8, 8], 1, 1, b"ping");
+        // no --route / --route-no-icmp-reply / feature off: ignore
+        maybe_send_icmp_echo(&pkt, false, false, &pkt_tx).await;
+        let got = tokio::time::timeout(Duration::from_millis(50), pkt_rx.recv()).await;
+        assert!(
+            got.is_err(),
+            "no --route / --route-no-icmp-reply must not write an ICMP reply"
+        );
+        assert_eq!(dial.udp.load(Ordering::SeqCst), 0, "ICMP must not enter hy tunnel");
+        assert_eq!(dial.tcp.load(Ordering::SeqCst), 0);
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn run_without_usable_tun_returns_err() {
@@ -1535,6 +1650,7 @@ mod tests {
                 client: Arc::new(DummyClient),
             }),
             None,
+            false,
             false,
         )
         .await;

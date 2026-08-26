@@ -32,6 +32,19 @@ const TCP_RST: u8 = 0x04;
 const TCP_PSH: u8 = 0x08;
 const TCP_ACK: u8 = 0x10;
 
+/// Default SNI peek deadline after local SYN-ACK (hy-client-route.md §8).
+#[cfg(feature = "client-route")]
+const SNI_PEEK_TIMEOUT: Duration = Duration::from_secs(4);
+
+fn sni_peek_deadline(on: bool) -> Option<Duration> {
+    #[cfg(feature = "client-route")]
+    if on {
+        return Some(SNI_PEEK_TIMEOUT);
+    }
+    let _ = on;
+    None
+}
+
 /// Parsed IPv4 header fields used by the dataplane and unit tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ipv4Info {
@@ -400,6 +413,7 @@ pub async fn run(
     cfg: TunConfig,
     client: Arc<dyn FlowDial>,
     dns: Option<Arc<dyn DnsAnswerer>>,
+    sni_peek: bool,
 ) -> Result<(), Error> {
     let fd = match open_tun_fd(&cfg.name) {
         Ok(fd) => fd,
@@ -421,7 +435,7 @@ pub async fn run(
     }
 
     tracing::info!(iface = %cfg.name, "TUN listening");
-    run_dataplane(fd, cfg, client, false, false, dns).await
+    run_dataplane(fd, cfg, client, false, false, dns, sni_peek_deadline(sni_peek)).await
 }
 
 #[cfg(target_os = "macos")]
@@ -429,6 +443,7 @@ pub async fn run(
     cfg: TunConfig,
     client: Arc<dyn FlowDial>,
     dns: Option<Arc<dyn DnsAnswerer>>,
+    sni_peek: bool,
 ) -> Result<(), Error> {
     let fd = match crate::inbound::tun_darwin::open_and_configure(&cfg) {
         Ok(fd) => fd,
@@ -441,7 +456,7 @@ pub async fn run(
         }
     };
     tracing::info!(iface = %cfg.name, "TUN listening");
-    run_dataplane(fd, cfg, client, true, true, dns).await
+    run_dataplane(fd, cfg, client, true, true, dns, sni_peek_deadline(sni_peek)).await
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -449,7 +464,9 @@ pub async fn run(
     _cfg: TunConfig,
     _client: Arc<dyn FlowDial>,
     _dns: Option<Arc<dyn DnsAnswerer>>,
+    sni_peek: bool,
 ) -> Result<(), Error> {
+    let _ = sni_peek;
     Err(Error::config("tun", "not supported"))
 }
 
@@ -639,6 +656,7 @@ async fn run_dataplane(
     family_hdr: bool,
     enable_v6: bool,
     dns: Option<Arc<dyn DnsAnswerer>>,
+    sni_peek: Option<Duration>,
 ) -> Result<(), Error> {
     // Split into owned read/write via dup so concurrent writer task works.
     let write_fd = unsafe { libc::dup(fd) };
@@ -754,8 +772,9 @@ async fn run_dataplane(
                 let client = Arc::clone(&client);
                 let pkt_tx = pkt_tx.clone();
                 let dns = dns.clone();
+                let sni_peek = sni_peek;
                 tokio::spawn(async move {
-                    let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle).await;
+                    let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle, sni_peek).await;
                 });
             }
             _ => {}
@@ -812,8 +831,9 @@ async fn run_dataplane(
                         let client = Arc::clone(&client);
                         let pkt_tx = pkt_tx.clone();
                         let dns = dns.clone();
+                        let sni_peek = sni_peek;
                         tokio::spawn(async move {
-                            let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle).await;
+                            let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle, sni_peek).await;
                         });
                     }
                     _ => {}
@@ -899,6 +919,39 @@ async fn udp_session(
     Ok(())
 }
 
+/// Wait up to `timeout` for the first TCP payload after the handshake ACK.
+/// Empty vector means timeout (treat as pure IP). `Err(())` = RST or channel closed.
+#[cfg(feature = "client-route")]
+async fn collect_first_tcp_payload(
+    rx: &mut mpsc::Receiver<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Vec<u8>, ()> {
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => return Ok(Vec::new()),
+            frame = rx.recv() => {
+                let Some(frame) = frame else { return Err(()); };
+                if frame.len() < 20 {
+                    continue;
+                }
+                let flags = frame[13];
+                if flags & TCP_RST != 0 {
+                    return Err(());
+                }
+                let data_off = ((frame[12] >> 4) as usize) * 4;
+                if frame.len() > data_off {
+                    let payload = &frame[data_off..];
+                    if !payload.is_empty() {
+                        return Ok(payload.to_vec());
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn tcp_session(
     client: Arc<dyn FlowDial>,
     dns: Option<Arc<dyn DnsAnswerer>>,
@@ -907,6 +960,7 @@ async fn tcp_session(
     client_addr: SocketAddr,
     remote_addr: SocketAddr,
     idle: Duration,
+    sni_peek: Option<Duration>,
 ) -> Result<(), Error> {
     // Consume initial SYN.
     let Some(first) = rx.recv().await else {
@@ -966,7 +1020,7 @@ async fn tcp_session(
                 }
                 return tcp_established(
                     client, dns, rx, pkt_tx, client_addr, remote_addr,
-                    snd_nxt, rcv_nxt, early, idle,
+                    snd_nxt, rcv_nxt, early, idle, sni_peek,
                 ).await;
             }
         }
@@ -984,12 +1038,39 @@ async fn tcp_established(
     mut rcv_nxt: u32,
     early: Vec<u8>,
     idle: Duration,
+    sni_peek: Option<Duration>,
 ) -> Result<(), Error> {
-    let hy: Arc<dyn HyTcpConn> = if remote_addr.port() == 53 {
+    #[allow(unused_mut)]
+    let mut dest = Dest::from_socket_addr(remote_addr, Proto::Tcp);
+    #[allow(unused_mut)]
+    let mut peeked = early;
+
+    // SNI peek: after local SYN-ACK, before FlowDial::tcp. Not MITM.
+    #[cfg(feature = "client-route")]
+    if let Some(timeout) = sni_peek {
+        if dest.port == 443 && dest.host.is_none() {
+            if peeked.is_empty() {
+                match collect_first_tcp_payload(&mut rx, timeout).await {
+                    Ok(p) => peeked = p,
+                    Err(()) => return Ok(()),
+                }
+            }
+            if let Some(sni) = hy_route::sni::extract_sni(&peeked) {
+                dest.host = Some(sni);
+            }
+        }
+    }
+    #[cfg(not(feature = "client-route"))]
+    {
+        let _ = sni_peek;
+    }
+
+    let hy: Arc<dyn HyTcpConn> = if dest.port == 53 {
         if let Some(dns) = dns {
+            let _ = dest;
             Arc::from(Box::new(DnsHyTcp::new(dns)) as Box<dyn HyTcpConn>)
         } else {
-            match client.tcp(Dest::from_socket_addr(remote_addr, Proto::Tcp)).await {
+            match client.tcp(dest).await {
                 Ok(c) => Arc::from(c),
                 Err(_) => {
                     let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
@@ -999,7 +1080,7 @@ async fn tcp_established(
             }
         }
     } else {
-        match client.tcp(Dest::from_socket_addr(remote_addr, Proto::Tcp)).await {
+        match client.tcp(dest).await {
             Ok(c) => Arc::from(c),
             Err(_) => {
                 let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
@@ -1009,9 +1090,9 @@ async fn tcp_established(
         }
     };
 
-    if !early.is_empty() {
-        let _ = hy.write(&early).await;
-        rcv_nxt = rcv_nxt.wrapping_add(early.len() as u32);
+    if !peeked.is_empty() {
+        let _ = hy.write(&peeked).await;
+        rcv_nxt = rcv_nxt.wrapping_add(peeked.len() as u32);
         let ack = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_ACK, &[]);
         let _ = pkt_tx.send(ack).await;
     }
@@ -1454,6 +1535,7 @@ mod tests {
                 client: Arc::new(DummyClient),
             }),
             None,
+            false,
         )
         .await;
         assert!(r.is_err(), "expected Err without NET_ADMIN, got Ok(())");
@@ -1468,5 +1550,281 @@ mod tests {
             Err(Error::Io(_)) => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    struct RecTcp {
+        writes: Arc<std::sync::Mutex<Vec<u8>>>,
+        closed: AtomicBool,
+        notify: Notify,
+    }
+
+    #[async_trait]
+    impl HyTcpConn for RecTcp {
+        async fn read(&self, _buf: &mut [u8]) -> Result<usize, Error> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Ok(0);
+                }
+                self.notify.notified().await;
+            }
+        }
+        async fn write(&self, buf: &[u8]) -> Result<usize, Error> {
+            self.writes.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closed.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+            Ok(())
+        }
+    }
+
+    struct RecDial {
+        dests: std::sync::Mutex<Vec<Dest>>,
+        writes: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl RecDial {
+        fn new() -> Self {
+            Self {
+                dests: std::sync::Mutex::new(Vec::new()),
+                writes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FlowDial for RecDial {
+        async fn tcp(&self, dest: Dest) -> Result<Box<dyn HyTcpConn>, Error> {
+            self.dests.lock().unwrap().push(dest);
+            Ok(Box::new(RecTcp {
+                writes: Arc::clone(&self.writes),
+                closed: AtomicBool::new(false),
+                notify: Notify::new(),
+            }))
+        }
+        async fn udp(&self, _dest: Dest) -> Result<Box<dyn HyUdpConn>, Error> {
+            Err(Error::Dial("rec udp".into()))
+        }
+    }
+
+    const TEST_SYN_SEQ: u32 = 1000;
+
+    fn tcp_hdr(seq: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![0u8; 20 + payload.len()];
+        f[4..8].copy_from_slice(&seq.to_be_bytes());
+        f[12] = 0x50;
+        f[13] = flags;
+        f[20..].copy_from_slice(payload);
+        f
+    }
+
+    fn craft_client_hello_with_sni(sni: &str) -> Vec<u8> {
+        let sni_bytes = sni.as_bytes();
+        let mut sni_ext = Vec::new();
+        let name_entry_len = 1 + 2 + sni_bytes.len();
+        sni_ext.extend_from_slice(&(name_entry_len as u16).to_be_bytes());
+        sni_ext.push(0);
+        sni_ext.extend_from_slice(&(sni_bytes.len() as u16).to_be_bytes());
+        sni_ext.extend_from_slice(sni_bytes);
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&0u16.to_be_bytes());
+        extensions.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_ext);
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&[0x00, 0x2f]);
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+        let mut handshake = Vec::new();
+        handshake.push(0x01);
+        let len = body.len();
+        handshake.push(((len >> 16) & 0xff) as u8);
+        handshake.push(((len >> 8) & 0xff) as u8);
+        handshake.push((len & 0xff) as u8);
+        handshake.extend_from_slice(&body);
+        let mut record = Vec::new();
+        record.push(0x16);
+        record.extend_from_slice(&[0x03, 0x01]);
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+        record
+    }
+
+    async fn wait_first_dest(dial: &RecDial) -> Dest {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(d) = dial.dests.lock().unwrap().first().cloned() {
+                    return d;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("FlowDial::tcp was not called")
+    }
+
+    async fn drive_syn_then(
+        dial: Arc<RecDial>,
+        dst: SocketAddr,
+        after_synack: Vec<Vec<u8>>,
+        sni_peek: Option<Duration>,
+    ) -> Dest {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(16);
+        let src: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+        tx.try_send(tcp_hdr(TEST_SYN_SEQ, TCP_SYN, &[])).unwrap();
+        let session = tokio::spawn(tcp_session(
+            dial.clone(),
+            None,
+            rx,
+            pkt_tx,
+            src,
+            dst,
+            Duration::from_secs(5),
+            sni_peek,
+        ));
+        let synack = tokio::time::timeout(Duration::from_secs(1), pkt_rx.recv())
+            .await
+            .expect("SYN-ACK")
+            .expect("pkt");
+        assert!(!synack.is_empty(), "expected SYN-ACK packet");
+        for frame in after_synack {
+            tx.send(frame).await.unwrap();
+        }
+        let dest = wait_first_dest(&dial).await;
+        let _ = tx.send(tcp_hdr(TEST_SYN_SEQ.wrapping_add(1), TCP_RST, &[])).await;
+        let _ = session.await;
+        dest
+    }
+
+    #[cfg(feature = "client-route")]
+    #[tokio::test]
+    async fn tun_sni_peek_rewrites_host_and_putback() {
+        let hello = craft_client_hello_with_sni("example.org");
+        let dial = Arc::new(RecDial::new());
+        let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        // SYN-ACK, then ACK, then ClientHello on a later segment.
+        let dest = drive_syn_then(
+            dial.clone(),
+            dst,
+            vec![
+                tcp_hdr(TEST_SYN_SEQ + 1, TCP_ACK, &[]),
+                tcp_hdr(TEST_SYN_SEQ + 1, TCP_ACK | TCP_PSH, &hello),
+            ],
+            Some(Duration::from_millis(200)),
+        )
+        .await;
+        assert_eq!(dest.host.as_deref(), Some("example.org"));
+        assert_eq!(dest.ip, Some(dst.ip()));
+        assert_eq!(dest.port, 443);
+        let wrote = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let w = dial.writes.lock().unwrap().clone();
+                if w == hello {
+                    return w;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("peeked ClientHello must be written outbound");
+        assert_eq!(wrote, hello);
+    }
+
+    #[cfg(feature = "client-route")]
+    #[tokio::test]
+    async fn tun_sni_peek_piggybacked_clienthello() {
+        let hello = craft_client_hello_with_sni("example.org");
+        let dial = Arc::new(RecDial::new());
+        let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let dest = drive_syn_then(
+            dial.clone(),
+            dst,
+            vec![tcp_hdr(TEST_SYN_SEQ + 1, TCP_ACK | TCP_PSH, &hello)],
+            Some(Duration::from_millis(200)),
+        )
+        .await;
+        assert_eq!(dest.host.as_deref(), Some("example.org"));
+        assert_eq!(dest.ip, Some(dst.ip()));
+        let wrote = dial.writes.lock().unwrap().clone();
+        // Putback may still be in flight; wait if needed.
+        if wrote != hello {
+            let wrote = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let w = dial.writes.lock().unwrap().clone();
+                    if w == hello {
+                        return w;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("putback");
+            assert_eq!(wrote, hello);
+        }
+    }
+
+    #[cfg(feature = "client-route")]
+    #[tokio::test]
+    async fn tun_sni_peek_timeout_pure_ip() {
+        let dial = Arc::new(RecDial::new());
+        let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        let dest = drive_syn_then(
+            dial.clone(),
+            dst,
+            vec![tcp_hdr(TEST_SYN_SEQ + 1, TCP_ACK, &[])],
+            Some(Duration::from_millis(30)),
+        )
+        .await;
+        assert!(
+            dest.host.is_none(),
+            "timeout with no payload must stay pure IP, got {:?}",
+            dest.host
+        );
+        assert_eq!(dest.ip, Some(dst.ip()));
+        assert_eq!(dest.port, 443);
+        assert!(
+            dial.writes.lock().unwrap().is_empty(),
+            "no ClientHello to put back"
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_sni_peek_off_does_not_rewrite_host() {
+        let hello = craft_client_hello_with_sni("example.org");
+        let dial = Arc::new(RecDial::new());
+        let dst: SocketAddr = "1.2.3.4:443".parse().unwrap();
+        // --route-no-sniff / no --route: dial immediately, host stays empty.
+        let dest = drive_syn_then(
+            dial.clone(),
+            dst,
+            vec![tcp_hdr(TEST_SYN_SEQ + 1, TCP_ACK | TCP_PSH, &hello)],
+            None,
+        )
+        .await;
+        assert!(
+            dest.host.is_none(),
+            "--route-no-sniff / no --route must not rewrite dest.host, got {:?}",
+            dest.host
+        );
+        assert_eq!(dest.ip, Some(dst.ip()));
+        let wrote = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let w = dial.writes.lock().unwrap().clone();
+                if w == hello {
+                    return w;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("early payload still written when sniff is off");
+        assert_eq!(wrote, hello);
     }
 }

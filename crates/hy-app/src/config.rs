@@ -117,7 +117,7 @@ pub struct TunConfig {
     pub apply_exclude: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TunRouteConfig {
     pub strict: bool,
     pub ipv4: Vec<String>,
@@ -794,14 +794,14 @@ fn fill_tun(y: Option<&TunYaml>) -> Result<Option<TunConfig>, Error> {
 }
 
 /// Merge skip-proxy / bypass CIDRs into TUN exclude and turn on Linux exclude install.
+/// Called only when client-route is on. If `tun.route` is omitted, create a default
+/// (empty ipv4 → install base `0.0.0.0/0`) so exclude is actually subtracted.
 pub fn merge_tun_exclude(tun: &mut Option<TunConfig>, cidrs: &[(std::net::IpAddr, u8)]) {
     let Some(t) = tun else {
         return;
     };
     t.apply_exclude = true;
-    let Some(route) = t.route.as_mut() else {
-        return;
-    };
+    let route = t.route.get_or_insert_with(TunRouteConfig::default);
     for &(ip, pfx) in cidrs {
         let s = format!("{ip}/{pfx}");
         match ip {
@@ -1825,6 +1825,93 @@ congestion: {{ type: bbr, bbrProfile: turbo }}
         )
         .unwrap();
         assert!(!got.iter().any(|s| s == "0.0.0.0/0"));
+    }
+
+    #[cfg(feature = "client-route")]
+    fn host_covered_by_linux_list(got: &[String], host: std::net::Ipv4Addr) -> bool {
+        got.iter().any(|s| {
+            let (a, bits) = crate::inbound::tun_plan::parse_v4_prefix(s).unwrap();
+            let mask = if bits == 0 { 0 } else { !0u32 << (32 - bits) };
+            (u32::from(a) & mask) == (u32::from(host) & mask)
+        })
+    }
+
+    #[test]
+    fn fill_only_apply_exclude_false_omitted_or_present() {
+        for extra in [
+            "",
+            "  route: {}\n",
+            "  route:\n    ipv4Exclude: [10.0.0.0/8]\n",
+        ] {
+            let y = parse_client_yaml(&format!(
+                "server: 127.0.0.1:1\nauth: x\ntun:\n  name: hy0\n{extra}"
+            ))
+            .unwrap();
+            let app = fill_client(&y).expect("fill");
+            let t = app.tun.expect("tun");
+            assert!(
+                !t.apply_exclude,
+                "--no-client-route / fill only must leave apply_exclude false (extra={extra:?})"
+            );
+            if extra.is_empty() {
+                assert!(t.route.is_none(), "omitted route must stay None");
+            } else {
+                let r = t.route.as_ref().expect("route present");
+                let got = crate::inbound::tun_plan::linux_ipv4_install_list(
+                    &r.ipv4,
+                    &r.ipv4_exclude,
+                    t.apply_exclude,
+                )
+                .unwrap();
+                assert_eq!(got, vec!["0.0.0.0/0".to_string()]);
+            }
+        }
+    }
+
+    #[cfg(feature = "client-route")]
+    #[test]
+    fn merge_bypass_tun_into_omitted_and_empty_route() {
+        let router = hy_route::compile(
+            "[General]\nbypass-tun = 10.0.0.0/8\nskip-proxy = localhost, 192.168.0.0/16\n[Rule]\nFINAL,PROXY\n",
+            None,
+        )
+        .unwrap();
+        let cidrs = router.tun_exclude_cidrs();
+        assert!(cidrs.iter().any(|(ip, p)| {
+            *ip == std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)) && *p == 8
+        }));
+        for yaml in [
+            "server: 127.0.0.1:1\nauth: x\ntun: { name: hy0 }\n",
+            "server: 127.0.0.1:1\nauth: x\ntun:\n  name: hy0\n  route: {}\n",
+        ] {
+            let y = parse_client_yaml(yaml).unwrap();
+            let mut app = fill_client(&y).unwrap();
+            merge_tun_exclude(&mut app.tun, &cidrs);
+            let t = app.tun.as_ref().unwrap();
+            assert!(t.apply_exclude, "routing ON must apply exclude ({yaml})");
+            let r = t.route.as_ref().expect("default route when omitted");
+            assert!(r.ipv4_exclude.iter().any(|s| s == "10.0.0.0/8"));
+            assert!(r.ipv4_exclude.iter().any(|s| s == "192.168.0.0/16"));
+            let got = crate::inbound::tun_plan::linux_ipv4_install_list(
+                &r.ipv4,
+                &r.ipv4_exclude,
+                t.apply_exclude,
+            )
+            .unwrap();
+            assert!(!got.is_empty());
+            assert!(
+                !got.iter().any(|s| s == "0.0.0.0/0" || s == "10.0.0.0/8"),
+                "install list must subtract bypass, got {got:?}"
+            );
+            assert!(
+                !host_covered_by_linux_list(&got, std::net::Ipv4Addr::new(10, 1, 2, 3)),
+                "10.1.2.3 must not fall in any installed prefix: {got:?}"
+            );
+            assert!(
+                !host_covered_by_linux_list(&got, std::net::Ipv4Addr::new(192, 168, 1, 1)),
+                "skip-proxy 192.168.0.0/16 must be subtracted: {got:?}"
+            );
+        }
     }
 
     #[test]

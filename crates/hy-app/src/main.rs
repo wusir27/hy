@@ -849,25 +849,30 @@ mod tests {
             resolve_route_file(true, Some(Path::new("r.conf")), None).is_none(),
             "--no-client-route must not enable routing"
         );
-        let y = parse_client_yaml(
+        for yaml in [
             "server: 127.0.0.1:1\nauth: x\ntun:\n  name: hy0\n  route:\n    ipv4Exclude: [10.0.0.0/8]\n",
-        )
-        .unwrap();
-        let app = fill_client(&y).unwrap();
-        let t = app.tun.expect("tun");
-        assert!(
-            !t.apply_exclude,
-            "--no-client-route / fill must leave exclude ignored"
-        );
-        let route = t.route.as_ref().expect("route");
-        let got = crate::inbound::tun_plan::linux_ipv4_install_list(
-            &route.ipv4,
-            &route.ipv4_exclude,
-            t.apply_exclude,
-        )
-        .unwrap();
-        assert_eq!(got, vec!["0.0.0.0/0".to_string()]);
-        assert!(app.core.conn_factory.is_none());
+            "server: 127.0.0.1:1\nauth: x\ntun: { name: hy0 }\n",
+        ] {
+            let y = parse_client_yaml(yaml).unwrap();
+            let app = fill_client(&y).unwrap();
+            let t = app.tun.expect("tun");
+            assert!(
+                !t.apply_exclude,
+                "--no-client-route / fill must leave exclude ignored"
+            );
+            if let Some(route) = t.route.as_ref() {
+                let got = crate::inbound::tun_plan::linux_ipv4_install_list(
+                    &route.ipv4,
+                    &route.ipv4_exclude,
+                    t.apply_exclude,
+                )
+                .unwrap();
+                assert_eq!(got, vec!["0.0.0.0/0".to_string()]);
+            } else {
+                assert!(t.route.is_none());
+            }
+            assert!(app.core.conn_factory.is_none());
+        }
     }
 }
 

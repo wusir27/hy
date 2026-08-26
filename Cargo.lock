@@ -716,6 +716,11 @@ dependencies = [
 [[package]]
 name = "hy-route"
 version = "0.0.1"
+dependencies = [
+ "hy-extras",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "hyper"

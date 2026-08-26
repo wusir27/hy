@@ -9,11 +9,11 @@ mod route_glue;
 
 use clap::{Parser, Subcommand};
 use config::{fill_client, fill_server, parse_client_yaml, parse_server_yaml};
-use hy_core::client;
+use hy_core::client::{self, Client};
 use hy_core::server;
 use hy_core::Error;
 use route_glue::{FlowDial, PassthroughDial};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,9 +32,12 @@ enum Cmd {
         /// Disable client routing (passthrough to the main server).
         #[arg(long = "no-client-route")]
         no_client_route: bool,
-        /// Local Shadowrocket-style rules file. Accepted this step; unused.
+        /// Local Shadowrocket-style rules file.
         #[arg(long = "route", value_name = "PATH")]
         route: Option<PathBuf>,
+        /// GeoIP database for `--route` (default: cwd geoip.dat / geoloader).
+        #[arg(long = "route-geoip", value_name = "PATH")]
+        route_geoip: Option<PathBuf>,
     },
     Server,
     Version,
@@ -58,8 +61,15 @@ async fn main() {
         Some(Cmd::Client {
             no_client_route,
             route,
-        }) => run_client(cli.config.as_ref(), no_client_route, route.as_ref()).await,
-        None => run_client(cli.config.as_ref(), false, None).await,
+            route_geoip,
+        }) => run_client(
+            cli.config.as_ref(),
+            no_client_route,
+            route.as_ref(),
+            route_geoip.as_ref(),
+        )
+        .await,
+        None => run_client(cli.config.as_ref(), false, None, None).await,
     };
     if let Err(e) = r {
         eprintln!("{e}");
@@ -89,10 +99,85 @@ async fn shutdown_signal() -> Result<(), Error> {
     }
 }
 
+/// `--no-client-route` wins. If `--route` is also set, warn then still disable.
+/// Command line `--route` wins over `route.file` in client.yaml.
+fn resolve_route_file(
+    no_client_route: bool,
+    route: Option<&Path>,
+    yaml_file: Option<&str>,
+) -> Option<PathBuf> {
+    if no_client_route {
+        if route.is_some() {
+            tracing::warn!("--route ignored because --no-client-route is set");
+        }
+        tracing::info!("client-route disabled by flag");
+        return None;
+    }
+    if let Some(p) = route {
+        return Some(p.to_path_buf());
+    }
+    yaml_file
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(feature = "client-route")]
+fn load_route_geoip(explicit: Option<&Path>) -> Result<hy_extras::acl::GeoIpMap, Error> {
+    use hy_extras::acl::{load_geoip_file, GeoLoader};
+    if let Some(p) = explicit {
+        return load_geoip_file(p).map_err(|e| Error::config("route-geoip", e));
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let default_path = cwd.join(geoloader::GEOIP_FILENAME);
+    if default_path.is_file() {
+        if let Ok(m) = load_geoip_file(&default_path) {
+            return Ok(m);
+        }
+    }
+    let loader = geoloader::AppGeoLoader::new(
+        None,
+        None,
+        Duration::ZERO,
+        Arc::new(geoloader::DefaultHttp),
+        cwd,
+    );
+    loader
+        .load_geoip()
+        .map_err(|e| Error::config("route-geoip", e))
+}
+
+fn build_flow_dial(
+    client: Arc<dyn Client>,
+    no_client_route: bool,
+    route: Option<&Path>,
+    route_geoip: Option<&Path>,
+    yaml_file: Option<&str>,
+) -> Result<Arc<dyn FlowDial>, Error> {
+    let route_file = resolve_route_file(no_client_route, route, yaml_file);
+    #[cfg(not(feature = "client-route"))]
+    {
+        let _ = (route_file, route_geoip);
+        return Ok(Arc::new(PassthroughDial { client }));
+    }
+    #[cfg(feature = "client-route")]
+    {
+        let Some(path) = route_file else {
+            return Ok(Arc::new(PassthroughDial { client }));
+        };
+        let geo = load_route_geoip(route_geoip)?;
+        let router = hy_route::compile_file(&path, Some(&geo))
+            .map_err(|e| Error::config("route", e.to_string()))?;
+        tracing::info!(path = %path.display(), "client-route enabled");
+        Ok(Arc::new(route_glue::RouteDial { router, client }))
+    }
+}
+
 async fn run_client(
     path: Option<&PathBuf>,
     no_client_route: bool,
-    _route: Option<&PathBuf>,
+    route: Option<&PathBuf>,
+    route_geoip: Option<&PathBuf>,
 ) -> Result<(), Error> {
     let y = parse_client_yaml(&read_cfg(path)?)?;
     let mut app = fill_client(&y)?;
@@ -104,12 +189,14 @@ async fn run_client(
     } else {
         tracing::info!("connected");
     }
-    if no_client_route {
-        tracing::info!("client-route disabled by flag");
-    }
-    let dial: Arc<dyn FlowDial> = Arc::new(PassthroughDial {
-        client: Arc::clone(&cli),
-    });
+    let yaml_route = y.route.as_ref().and_then(|r| r.file.as_deref());
+    let dial = build_flow_dial(
+        Arc::clone(&cli),
+        no_client_route,
+        route.map(|p| p.as_path()),
+        route_geoip.map(|p| p.as_path()),
+        yaml_route,
+    )?;
     let mut tasks = Vec::new();
     if let Some(s) = app.socks5.take() {
         let c = Arc::clone(&dial);
@@ -281,6 +368,8 @@ async fn select_all_join(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn client_accepts_no_client_route() {
@@ -289,9 +378,11 @@ mod tests {
             Some(Cmd::Client {
                 no_client_route,
                 route,
+                route_geoip,
             }) => {
                 assert!(no_client_route);
                 assert!(route.is_none());
+                assert!(route_geoip.is_none());
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -306,9 +397,11 @@ mod tests {
             Some(Cmd::Client {
                 no_client_route,
                 route,
+                route_geoip,
             }) => {
                 assert!(!no_client_route);
                 assert_eq!(route.as_deref(), Some(std::path::Path::new("/tmp/sr_cnip.conf")));
+                assert!(route_geoip.is_none());
             }
             other => panic!("expected Client, got {other:?}"),
         }
@@ -330,12 +423,108 @@ mod tests {
             Some(Cmd::Client {
                 no_client_route,
                 route,
+                route_geoip,
             }) => {
                 assert!(no_client_route);
                 assert_eq!(route.as_deref(), Some(std::path::Path::new("rules.conf")));
+                assert!(route_geoip.is_none());
             }
             other => panic!("expected Client, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn client_accepts_route_geoip() {
+        let c = Cli::try_parse_from([
+            "hy",
+            "client",
+            "-c",
+            "client.yaml",
+            "--route",
+            "r.conf",
+            "--route-geoip",
+            "/tmp/geoip.dat",
+        ])
+        .unwrap();
+        match c.cmd {
+            Some(Cmd::Client { route_geoip, .. }) => {
+                assert_eq!(
+                    route_geoip.as_deref(),
+                    Some(std::path::Path::new("/tmp/geoip.dat"))
+                );
+            }
+            other => panic!("expected Client, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_route_file_cli_wins_over_yaml() {
+        let p = resolve_route_file(
+            false,
+            Some(Path::new("/cli.conf")),
+            Some("/yaml.conf"),
+        );
+        assert_eq!(p.as_deref(), Some(Path::new("/cli.conf")));
+        let p = resolve_route_file(false, None, Some("/yaml.conf"));
+        assert_eq!(p.as_deref(), Some(Path::new("/yaml.conf")));
+        let p = resolve_route_file(false, None, None);
+        assert!(p.is_none());
+    }
+
+    #[test]
+    fn no_client_route_and_route_warns_then_disables() {
+        struct Make(Arc<Mutex<Vec<u8>>>);
+        struct Writer(Arc<Mutex<Vec<u8>>>);
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Make {
+            type Writer = Writer;
+            fn make_writer(&'a self) -> Self::Writer {
+                Writer(self.0.clone())
+            }
+        }
+        impl Write for Writer {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(Make(buf.clone()))
+            .finish();
+        let chosen = tracing::subscriber::with_default(subscriber, || {
+            resolve_route_file(true, Some(Path::new("rules.conf")), Some("/yaml.conf"))
+        });
+        assert!(chosen.is_none(), "must still disable routing");
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("--route ignored because --no-client-route is set"),
+            "{logs}"
+        );
+        assert!(logs.contains("client-route disabled by flag"), "{logs}");
+    }
+
+    #[cfg(feature = "client-route")]
+    #[test]
+    fn load_route_geoip_explicit_fixture_no_download() {
+        let dir = std::env::temp_dir().join(format!(
+            "hy-app-geoip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("geoip.dat");
+        std::fs::write(&p, crate::geoloader::tiny_geoip_dat()).unwrap();
+        let m = load_route_geoip(Some(&p)).unwrap();
+        assert!(m.contains_key("cn"), "fixture country must be present");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

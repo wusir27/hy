@@ -6,3 +6,6 @@ license.workspace = true
 description = "Hysteria 2 client routing"
 
 [dependencies]
+hy-extras = { path = "../hy-extras" }
+thiserror.workspace = true
+tracing.workspace = true

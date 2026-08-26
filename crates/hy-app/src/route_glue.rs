@@ -1,4 +1,4 @@
-//! Inbound dial glue. This step always uses [`PassthroughDial`] (zero routing).
+//! Inbound dial glue: [`PassthroughDial`] or (feature on + `--route`) [`RouteDial`].
 //!
 //! `FlowDial` lives here because it uses hy-core types. When `client-route` is
 //! off, dest types are a local stub so tun/socks/http never name `hy_route::`.
@@ -41,6 +41,36 @@ impl FlowDial for PassthroughDial {
 
     async fn udp(&self, _dest: Dest) -> Result<Box<dyn HyUdpConn>, Error> {
         self.client.udp().await
+    }
+}
+
+/// Decide then PROXY (unique Client) / REJECT / DIRECT-not-implemented.
+#[cfg(feature = "client-route")]
+pub struct RouteDial {
+    pub router: hy_route::Router,
+    pub client: Arc<dyn Client>,
+}
+
+#[cfg(feature = "client-route")]
+#[async_trait]
+impl FlowDial for RouteDial {
+    async fn tcp(&self, dest: Dest) -> Result<Box<dyn HyTcpConn>, Error> {
+        match self.router.decide(&dest) {
+            hy_route::Action::Proxy => {
+                let s = dest.addr_string();
+                self.client.tcp(&s).await
+            }
+            hy_route::Action::Reject => Err(Error::Dial("rejected".into())),
+            hy_route::Action::Direct => Err(Error::config("route", "DIRECT not implemented")),
+        }
+    }
+
+    async fn udp(&self, dest: Dest) -> Result<Box<dyn HyUdpConn>, Error> {
+        match self.router.decide(&dest) {
+            hy_route::Action::Proxy => self.client.udp().await,
+            hy_route::Action::Reject => Err(Error::Dial("rejected".into())),
+            hy_route::Action::Direct => Err(Error::config("route", "DIRECT not implemented")),
+        }
     }
 }
 
@@ -166,5 +196,83 @@ mod tests {
         let _ = dial.udp(d2).await;
         assert_eq!(rec.udp_calls.load(Ordering::SeqCst), 2);
         assert!(rec.tcp_addrs.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "client-route")]
+    #[tokio::test]
+    async fn route_dial_proxy_reject_direct_not_faked() {
+        let rec = Arc::new(RecClient::new());
+        let router = hy_route::compile(
+            "[Rule]\nDOMAIN,proxy.example,PROXY\nDOMAIN,rej.example,REJECT\nDOMAIN,dir.example,DIRECT\nFINAL,PROXY\n",
+            None,
+        )
+        .unwrap();
+        let dial = RouteDial {
+            router,
+            client: rec.clone(),
+        };
+
+        let _ = dial
+            .tcp(Dest {
+                host: Some("proxy.example".into()),
+                ip: None,
+                port: 443,
+                proto: Proto::Tcp,
+            })
+            .await;
+        assert_eq!(
+            rec.tcp_addrs.lock().unwrap().as_slice(),
+            &["proxy.example:443".to_string()]
+        );
+
+        rec.tcp_addrs.lock().unwrap().clear();
+        let rej = match dial
+            .tcp(Dest {
+                host: Some("rej.example".into()),
+                ip: None,
+                port: 80,
+                proto: Proto::Tcp,
+            })
+            .await
+        {
+            Ok(_) => panic!("REJECT must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            rec.tcp_addrs.lock().unwrap().is_empty(),
+            "REJECT must not open a tunnel"
+        );
+        match rej {
+            Error::Dial(s) => assert!(s.contains("reject"), "{s}"),
+            other => panic!("expected Dial reject, got {other:?}"),
+        }
+
+        let dir = match dial
+            .tcp(Dest {
+                host: Some("dir.example".into()),
+                ip: None,
+                port: 443,
+                proto: Proto::Tcp,
+            })
+            .await
+        {
+            Ok(_) => panic!("DIRECT must fail"),
+            Err(e) => e,
+        };
+        assert!(
+            rec.tcp_addrs.lock().unwrap().is_empty(),
+            "DIRECT must not fake via the hy tunnel"
+        );
+        match dir {
+            Error::Config { field, reason } => {
+                assert_eq!(field, "route");
+                assert!(
+                    reason.contains("DIRECT not implemented"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected config DIRECT not implemented, got {other:?}"),
+        }
+        assert_eq!(rec.udp_calls.load(Ordering::SeqCst), 0);
     }
 }

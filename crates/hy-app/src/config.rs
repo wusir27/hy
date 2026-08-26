@@ -55,6 +55,13 @@ pub struct ClientYaml {
     #[serde(rename = "udpTProxy")]
     pub udp_tproxy: Option<UdpTProxyYaml>,
     pub tcp_redirect: Option<TcpRedirectYaml>,
+    /// Optional client routing (`route.file`). Command line `--route` wins.
+    pub route: Option<ClientRouteYaml>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct ClientRouteYaml {
+    pub file: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -1734,6 +1741,19 @@ congestion: {{ type: bbr, bbrProfile: turbo }}
             t.ipv6.as_deref(),
             Some("2001::ffff:ffff:ffff:fff1/126")
         );
+    }
+
+    #[test]
+    fn parse_client_route_file_yaml() {
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\nroute:\n  file: /etc/hy/sr_cnip.conf\n",
+        )
+        .unwrap();
+        assert_eq!(
+            y.route.as_ref().and_then(|r| r.file.as_deref()),
+            Some("/etc/hy/sr_cnip.conf")
+        );
+        fill_client(&y).expect("route.file is optional and must not fail fill");
     }
 
     #[test]

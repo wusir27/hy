@@ -22,7 +22,7 @@ hy server -c server.yaml
 hy version
 ```
 
-当前产品版本：[0.0.1](https://github.com/wusir27/hy/releases/tag/v0.0.1)。
+当前产品版本：[0.0.2](https://github.com/wusir27/hy/releases/tag/v0.0.2)。
 
 ---
 

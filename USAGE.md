@@ -538,7 +538,7 @@ tun:
 tun:
   name: utun123
   mtu: 1500
-  timeout: 5m
+  timeout: 60s
   address:
     ipv4: 100.100.100.101/30
     ipv6: "2001::ffff:ffff:ffff:fff1/126"

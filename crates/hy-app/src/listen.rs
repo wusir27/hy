@@ -1,6 +1,6 @@
 use hy_core::Error;
 use hy_extras::udphop::parse_port_union;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
 /// Split `host:port` / `[host]:port` (port may be a hop union).
 fn split_host_port(s: &str) -> Option<(&str, &str)> {
@@ -21,12 +21,22 @@ fn is_port_hopping(port: &str) -> bool {
     port.contains(',') || port.contains('-')
 }
 
-/// Parsed client `server:` — always a concrete `SocketAddr` (first hop port).
+/// Host string + main port / hop union from `server:` (no DNS).
+#[derive(Debug, Clone)]
+pub struct ParsedServerSpec {
+    pub host: String,
+    pub port: u16,
+    pub hop_ports: Option<Vec<u16>>,
+}
+
+/// Resolved client `server:` — always a concrete `SocketAddr` (first hop port).
 /// `hop_ports` is `Some` when the port string is an official hop union.
+/// `host` is the original SplitHostPort host (for SNI), not the resolved A/AAAA.
 #[derive(Debug, Clone)]
 pub struct ParsedServer {
     pub addr: SocketAddr,
     pub hop_ports: Option<Vec<u16>>,
+    pub host: String,
 }
 
 pub fn parse_listen(s: &str, field: &'static str) -> Result<SocketAddr, Error> {
@@ -71,39 +81,64 @@ pub fn parse_listen(s: &str, field: &'static str) -> Result<SocketAddr, Error> {
     Err(Error::config(field, format!("bad listen {s}")))
 }
 
-pub fn parse_server(s: &str) -> Result<ParsedServer, Error> {
+/// Parse `server:` into host + ports. Domain hosts are accepted; DNS is fill.
+pub fn parse_server_spec(s: &str) -> Result<ParsedServerSpec, Error> {
     let t = s.trim();
     let (host, port_str) = split_host_port(t).ok_or_else(|| {
         Error::config("ServerAddr", format!("bad server {s}"))
     })?;
+    if host.is_empty() {
+        return Err(Error::config("ServerAddr", format!("bad server {s}")));
+    }
     if is_port_hopping(port_str) {
         let ports = parse_port_union(port_str).ok_or_else(|| {
             Error::config(
-                "Server",
+                "ServerAddr",
                 format!("{port_str} is not a valid port number or range"),
             )
         })?;
-        let first = ports[0];
-        let ip: IpAddr = host.parse().map_err(|_| {
-            Error::config("ServerAddr", format!("bad server {s}"))
-        })?;
-        return Ok(ParsedServer {
-            addr: SocketAddr::new(ip, first),
+        let port = ports[0];
+        return Ok(ParsedServerSpec {
+            host: host.to_string(),
+            port,
             hop_ports: Some(ports),
         });
     }
-    let joined = if t.starts_with('[') {
-        t.to_string()
-    } else {
-        format!("{host}:{port_str}")
-    };
-    let addr: SocketAddr = joined
+    let port: u16 = port_str
         .parse()
         .map_err(|_| Error::config("ServerAddr", format!("bad server {s}")))?;
-    Ok(ParsedServer {
-        addr,
+    Ok(ParsedServerSpec {
+        host: host.to_string(),
+        port,
         hop_ports: None,
     })
+}
+
+/// One system DNS lookup when `host` is not a literal IP. First A/AAAA only.
+pub fn fill_server_addr(spec: ParsedServerSpec, original: &str) -> Result<ParsedServer, Error> {
+    let addr = resolve_server_host(&spec.host, spec.port, original)?;
+    Ok(ParsedServer {
+        addr,
+        hop_ports: spec.hop_ports,
+        host: spec.host,
+    })
+}
+
+fn resolve_server_host(host: &str, port: u16, original: &str) -> Result<SocketAddr, Error> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
+    }
+    let mut addrs = (host, port).to_socket_addrs().map_err(|_| {
+        Error::config("ServerAddr", format!("bad server {original}"))
+    })?;
+    let sa = addrs.next().ok_or_else(|| {
+        Error::config("ServerAddr", format!("bad server {original}"))
+    })?;
+    Ok(SocketAddr::new(sa.ip(), port))
+}
+
+pub fn parse_server(s: &str) -> Result<ParsedServer, Error> {
+    fill_server_addr(parse_server_spec(s)?, s)
 }
 
 #[cfg(test)]
@@ -123,6 +158,12 @@ mod tests {
         assert_eq!(b.port(), 443);
         let c = parse_listen("127.0.0.1:18530,10000-10002", "listen").unwrap();
         assert_eq!(c.port(), 18530);
+    }
+
+    #[test]
+    fn parse_listen_rejects_hostname() {
+        assert!(parse_listen("localhost:1080", "Listen").is_err());
+        assert!(parse_listen("example.com:443", "listen").is_err());
     }
 
     #[test]
@@ -152,6 +193,41 @@ mod tests {
     #[test]
     fn hop_invalid_union_errors() {
         // Official-invalid: second "port" is an address fragment.
-        assert!(parse_server("1.1.1.1:443,1.1.1.1:444").is_err());
+        match parse_server("1.1.1.1:443,1.1.1.1:444") {
+            Err(Error::Config { field, .. }) => assert_eq!(field, "ServerAddr"),
+            other => panic!("expected Config ServerAddr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_server_domain_no_hop() {
+        let spec = parse_server_spec("localhost:443").unwrap();
+        assert_eq!(spec.host, "localhost");
+        assert_eq!(spec.port, 443);
+        assert!(spec.hop_ports.is_none());
+        let p = parse_server("localhost:443").unwrap();
+        assert_eq!(p.host, "localhost");
+        assert_eq!(p.addr.port(), 443);
+        assert!(p.hop_ports.is_none());
+    }
+
+    #[test]
+    fn parse_server_domain_hop() {
+        let spec = parse_server_spec("localhost:443,444").unwrap();
+        assert_eq!(spec.host, "localhost");
+        assert_eq!(spec.port, 443);
+        assert!(spec.hop_ports.is_some());
+        let p = parse_server("localhost:443,444").unwrap();
+        assert!(p.hop_ports.is_some());
+        assert_eq!(p.addr.port(), p.hop_ports.as_ref().unwrap()[0]);
+        assert_eq!(p.addr.port(), 443);
+    }
+
+    #[test]
+    fn parse_server_bad_name() {
+        match parse_server("no-such-host.invalid:443") {
+            Err(Error::Config { field, .. }) => assert_eq!(field, "ServerAddr"),
+            other => panic!("expected Config ServerAddr, got {other:?}"),
+        }
     }
 }

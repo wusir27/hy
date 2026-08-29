@@ -649,6 +649,9 @@ pub fn fill_client(y: &ClientYaml) -> Result<ClientApp, Error> {
         )?;
     } else {
         let parsed = parse_server(server)?;
+        if cfg.tls.server_name.is_empty() {
+            cfg.tls.server_name = parsed.host.clone();
+        }
         cfg.server_addr = Some(parsed.addr);
         mimic = fill_mimic(
             y.mimic.as_ref(),
@@ -1961,6 +1964,56 @@ tun:
         let app = fill_client(&y).expect("hop server should succeed");
         assert_eq!(app.core.server_addr.unwrap().port(), 443);
         assert!(app.core.conn_factory.is_some());
+    }
+
+    #[test]
+    fn fill_accepts_ipv6_hop() {
+        let y = parse_client_yaml("server: \"[::1]:443,444\"\nauth: x\n").unwrap();
+        let app = fill_client(&y).expect("ipv6 hop should fill");
+        assert_eq!(app.core.server_addr.unwrap(), "[::1]:443".parse().unwrap());
+        assert!(app.core.conn_factory.is_some());
+    }
+
+    #[test]
+    fn fill_client_domain_no_hop() {
+        let y = parse_client_yaml("server: localhost:443\nauth: x\n").unwrap();
+        let app = fill_client(&y).expect("localhost should fill");
+        let addr = app.core.server_addr.expect("SocketAddr after fill");
+        assert_eq!(addr.port(), 443);
+        assert!(app.core.conn_factory.is_none());
+    }
+
+    #[test]
+    fn fill_client_domain_hop() {
+        let y = parse_client_yaml("server: localhost:443,444\nauth: x\n").unwrap();
+        let app = fill_client(&y).expect("localhost hop should fill");
+        assert_eq!(app.core.server_addr.unwrap().port(), 443);
+        assert!(app.core.conn_factory.is_some());
+    }
+
+    #[test]
+    fn fill_client_bad_server_name() {
+        let y = parse_client_yaml("server: no-such-host.invalid:443\nauth: x\n").unwrap();
+        match fill_client(&y) {
+            Err(Error::Config { field, .. }) => assert_eq!(field, "ServerAddr"),
+            Ok(_) => panic!("expected Config ServerAddr, got Ok"),
+            Err(e) => panic!("expected Config ServerAddr, got Err({e})"),
+        }
+    }
+
+    #[test]
+    fn fill_client_sni_empty_uses_original_host() {
+        let y = parse_client_yaml("server: localhost:443\nauth: x\n").unwrap();
+        let app = fill_client(&y).expect("fill");
+        assert_eq!(app.core.tls.server_name, "localhost");
+    }
+
+    #[test]
+    fn fill_client_sni_set_is_kept() {
+        let y = parse_client_yaml("server: localhost:443\nauth: x\ntls:\n  sni: example.com\n")
+            .unwrap();
+        let app = fill_client(&y).expect("fill");
+        assert_eq!(app.core.tls.server_name, "example.com");
     }
 
     #[test]

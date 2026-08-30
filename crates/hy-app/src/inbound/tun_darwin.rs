@@ -2,7 +2,7 @@
 
 use crate::config::TunConfig;
 use crate::inbound::tun_plan::{
-    darwin_ipv4_install_list, darwin_ipv6_install_list, darwin_v6_p2p_dst, parse_utun_unit,
+    darwin_ipv4_install_list, darwin_ipv6_routes_to_install, darwin_v6_p2p_dst, parse_utun_unit,
     parse_v4_prefix, parse_v6_prefix,
 };
 use std::io;
@@ -241,8 +241,12 @@ fn maybe_routes(cfg: &TunConfig) -> io::Result<()> {
     }
     let v4 = darwin_ipv4_install_list(&route.ipv4, &route.ipv4_exclude)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let v6 = darwin_ipv6_install_list(&route.ipv6, &route.ipv6_exclude)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let v6 = darwin_ipv6_routes_to_install(
+        cfg.ipv6.is_some(),
+        &route.ipv6,
+        &route.ipv6_exclude,
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let (gw4, _) = parse_v4_prefix(&cfg.ipv4).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let gw6 = cfg
         .ipv6

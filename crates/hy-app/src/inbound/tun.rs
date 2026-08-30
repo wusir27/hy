@@ -1429,6 +1429,38 @@ mod tests {
     }
 
     #[test]
+    fn darwin_no_v6_addr_empty_route_installs_nothing() {
+        let got = crate::inbound::tun_plan::darwin_ipv6_routes_to_install(false, &[], &[]).unwrap();
+        assert!(got.is_empty());
+        // Typical hy-tui yaml: route present with ipv4Exclude only — must not official-split.
+        let got = crate::inbound::tun_plan::darwin_ipv6_routes_to_install(
+            false,
+            &[],
+            &["2001:db8::1/128".into()],
+        )
+        .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn darwin_explicit_v6_addr_empty_route_uses_official_split() {
+        let got = crate::inbound::tun_plan::darwin_ipv6_routes_to_install(true, &[], &[]).unwrap();
+        assert_eq!(got, crate::inbound::tun_plan::darwin_default_ipv6());
+    }
+
+    #[test]
+    fn darwin_explicit_route_ipv6_uses_user_list() {
+        let user = ["fd00::/8".to_string()];
+        let want = vec![crate::inbound::tun_plan::parse_v6_prefix("fd00::/8").unwrap()];
+        let no_addr =
+            crate::inbound::tun_plan::darwin_ipv6_routes_to_install(false, &user, &[]).unwrap();
+        assert_eq!(no_addr, want);
+        let with_addr =
+            crate::inbound::tun_plan::darwin_ipv6_routes_to_install(true, &user, &[]).unwrap();
+        assert_eq!(with_addr, want);
+    }
+
+    #[test]
     fn darwin_v6_p2p_dst_official() {
         let a: Ipv6Addr = "2001::ffff:ffff:ffff:fff1".parse().unwrap();
         assert!(crate::inbound::tun_plan::darwin_v6_p2p_dst(a, 126).is_none());

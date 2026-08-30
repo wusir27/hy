@@ -254,6 +254,21 @@ pub fn darwin_ipv6_install_list(
     Ok(subtract_ipv6(&bases, &ex))
 }
 
+/// Darwin IPv6 prefixes to install.
+/// Official split only when a TUN IPv6 address is set and `route.ipv6` is empty.
+/// No address and empty user list → install nothing (do not call official split).
+/// Explicit `route.ipv6` is that user list even without `address.ipv6`.
+pub fn darwin_ipv6_routes_to_install(
+    has_address_ipv6: bool,
+    user: &[String],
+    exclude: &[String],
+) -> Result<Vec<(Ipv6Addr, u8)>, String> {
+    if !has_address_ipv6 && user.is_empty() {
+        return Ok(Vec::new());
+    }
+    darwin_ipv6_install_list(user, exclude)
+}
+
 fn fmt_v4(a: Ipv4Addr, bits: u8) -> String {
     format!("{a}/{bits}")
 }

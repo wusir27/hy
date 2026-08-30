@@ -751,13 +751,10 @@ fn fill_tun(y: Option<&TunYaml>) -> Result<Option<TunConfig>, Error> {
             .unwrap_or_else(|| "100.100.100.101/30".to_string());
         parse_ip_prefix(&ipv4, false).map_err(|e| Error::config("tun.address.ipv4", e))?;
 
-        let ipv6_raw = t
-            .address
-            .as_ref()
-            .and_then(|a| a.ipv6.clone())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "2001::ffff:ffff:ffff:fff1/126".to_string());
-        parse_ip_prefix(&ipv6_raw, true).map_err(|e| Error::config("tun.address.ipv6", e))?;
+        let ipv6 = fill_tun_ipv6(
+            t.address.as_ref().and_then(|a| a.ipv6.as_deref()),
+            cfg!(target_os = "macos"),
+        )?;
 
         let route = match &t.route {
             None => None,
@@ -789,7 +786,7 @@ fn fill_tun(y: Option<&TunYaml>) -> Result<Option<TunConfig>, Error> {
             mtu,
             timeout,
             ipv4,
-            ipv6: Some(ipv6_raw),
+            ipv6,
             route,
             apply_exclude: false,
         }))
@@ -818,6 +815,27 @@ pub fn merge_tun_exclude(tun: &mut Option<TunConfig>, cidrs: &[(std::net::IpAddr
                     route.ipv6_exclude.push(s);
                 }
             }
+        }
+    }
+}
+
+/// Linux default TUN IPv6 when yaml omits `address.ipv6`. Darwin does not apply this.
+const LINUX_DEFAULT_TUN_IPV6: &str = "2001::ffff:ffff:ffff:fff1/126";
+
+/// Fill TUN IPv6 from yaml. Omitted/empty → Linux default, Darwin `None`.
+/// `is_darwin` is a parameter so Linux unit tests can cover the Darwin path.
+fn fill_tun_ipv6(raw: Option<&str>, is_darwin: bool) -> Result<Option<String>, Error> {
+    let s = raw.filter(|s| !s.is_empty());
+    match s {
+        Some(v) => {
+            parse_ip_prefix(v, true).map_err(|e| Error::config("tun.address.ipv6", e))?;
+            Ok(Some(v.to_string()))
+        }
+        None if is_darwin => Ok(None),
+        None => {
+            parse_ip_prefix(LINUX_DEFAULT_TUN_IPV6, true)
+                .map_err(|e| Error::config("tun.address.ipv6", e))?;
+            Ok(Some(LINUX_DEFAULT_TUN_IPV6.to_string()))
         }
     }
 }
@@ -1797,11 +1815,40 @@ congestion: {{ type: bbr, bbrProfile: turbo }}
         assert_eq!(t.mtu, 1500);
         assert_eq!(t.timeout, Duration::from_secs(300));
         assert_eq!(t.ipv4, "100.100.100.101/30");
+        #[cfg(target_os = "macos")]
+        assert_eq!(t.ipv6, None);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(
             t.ipv6.as_deref(),
             Some("2001::ffff:ffff:ffff:fff1/126")
         );
         assert!(!t.apply_exclude);
+    }
+
+    #[test]
+    fn fill_tun_ipv6_helper_darwin_omit_none_linux_default() {
+        assert_eq!(fill_tun_ipv6(None, true).unwrap(), None);
+        assert_eq!(fill_tun_ipv6(Some(""), true).unwrap(), None);
+        assert_eq!(
+            fill_tun_ipv6(Some("2001:db8::1/64"), true)
+                .unwrap()
+                .as_deref(),
+            Some("2001:db8::1/64")
+        );
+        assert_eq!(
+            fill_tun_ipv6(None, false).unwrap().as_deref(),
+            Some("2001::ffff:ffff:ffff:fff1/126")
+        );
+        assert_eq!(
+            fill_tun_ipv6(Some(""), false).unwrap().as_deref(),
+            Some("2001::ffff:ffff:ffff:fff1/126")
+        );
+        assert_eq!(
+            fill_tun_ipv6(Some("fd00::2/64"), false)
+                .unwrap()
+                .as_deref(),
+            Some("fd00::2/64")
+        );
     }
 
     #[test]

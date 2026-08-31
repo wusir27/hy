@@ -12,7 +12,7 @@ pub use crate::inbound::tun_plan::parse_utun_unit;
 use crate::inbound::tun_plan::{prepend_family, strip_family};
 use crate::route_glue::{Dest, FlowDial, Proto};
 use async_trait::async_trait;
-use hy_core::client::HyTcpConn;
+use hy_core::client::{HyTcpConn, HyUdpConn};
 use hy_core::Error;
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
@@ -655,36 +655,47 @@ impl TunDev {
         }
     }
 
-    async fn write_all(&self, mut data: &[u8]) -> std::io::Result<()> {
+    /// utun is SOCK_DGRAM: one packet per write. Do not split a short write
+    /// into a second syscall (that would inject a truncated frame). Try the
+    /// write immediately — EVFILT_WRITE on kernel-control sockets is unreliable,
+    /// and waiting for it deadlocks UDP replies (reader blocked on the next
+    /// packet that will not arrive until this write completes).
+    async fn write_all(&self, data: &[u8]) -> std::io::Result<()> {
         use std::os::fd::AsRawFd;
-        while !data.is_empty() {
-            let mut guard = self.fd.writable().await?;
-            match guard.try_io(|inner| {
-                let n = unsafe {
-                    libc::write(
-                        inner.get_ref().as_raw_fd(),
-                        data.as_ptr() as *const libc::c_void,
-                        data.len(),
-                    )
-                };
-                if n < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(n as usize)
-                }
-            }) {
-                Ok(Ok(0)) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "tun write zero",
-                    ));
-                }
-                Ok(Ok(n)) => data = &data[n..],
-                Ok(Err(e)) => return Err(e),
-                Err(_would_block) => continue,
-            }
+        if data.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        loop {
+            let n = unsafe {
+                libc::write(
+                    self.fd.get_ref().as_raw_fd(),
+                    data.as_ptr() as *const libc::c_void,
+                    data.len(),
+                )
+            };
+            if n < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    let mut guard = self.fd.writable().await?;
+                    guard.clear_ready();
+                    continue;
+                }
+                return Err(e);
+            }
+            let n = n as usize;
+            if n == data.len() {
+                return Ok(());
+            }
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "tun write zero",
+                ));
+            }
+            // Short write: retry the whole datagram, never the remainder.
+            let mut guard = self.fd.writable().await?;
+            guard.clear_ready();
+        }
     }
 }
 
@@ -733,7 +744,9 @@ async fn run_dataplane(
                 pkt
             };
             let mut w = writer_task.lock().await;
-            let _ = w.write_all(&wire).await;
+            if let Err(e) = w.write_all(&wire).await {
+                tracing::warn!(error = %e, len = wire.len(), "tun write failed");
+            }
         }
     });
     // Keep writer alive for the read loop lifetime (channel closes on drop of pkt_tx at end).
@@ -948,7 +961,9 @@ fn spawn_udp_or_dns(
     let _ = tx.try_send(payload);
     udp_txs.insert(key, tx);
     tokio::spawn(async move {
-        let _ = udp_session(client, rx, pkt_tx, src, dst, idle).await;
+        if let Err(e) = udp_session(client, rx, pkt_tx, src, dst, idle).await {
+            tracing::debug!(error = %e, src = %src, dst = %dst, "tun udp session");
+        }
     });
     true
 }
@@ -962,40 +977,61 @@ async fn udp_session(
     idle: Duration,
 ) -> Result<(), Error> {
     let dest = Dest::from_socket_addr(dst, Proto::Udp);
-    let mut hy = client.udp(dest).await?;
+    let hy = client.udp(dest).await?;
+    let hy: Arc<dyn HyUdpConn> = Arc::from(hy);
     let dst_s = dst.to_string();
-    while let Some(payload) = rx.recv().await {
-        hy.send(&payload, &dst_s).await?;
+
+    // Receive in its own task so select/timeout never cancels `receive()`
+    // (that drops an already-dequeued datagram). Idle still resets on
+    // uplink *or* downlink, same as the old single-select loop.
+    let bump = Arc::new(Notify::new());
+    let down_hy = Arc::clone(&hy);
+    let down_tx = pkt_tx;
+    let down_bump = Arc::clone(&bump);
+    let down = tokio::spawn(async move {
         loop {
-            tokio::select! {
-                biased;
-                Some(more) = rx.recv() => {
-                    hy.send(&more, &dst_s).await?;
+            match down_hy.receive().await {
+                Ok((payload, _)) => {
+                    // Reply: swap src/dst so it looks like it came from remote.
+                    let pkt = build_udp_packet(dst, src, &payload);
+                    if pkt.is_empty() {
+                        continue;
+                    }
+                    if down_tx.send(pkt).await.is_err() {
+                        break;
+                    }
+                    down_bump.notify_waiters();
                 }
-                r = tokio::time::timeout(idle, hy.receive()) => {
-                    match r {
-                        Ok(Ok((payload, _))) => {
-                            // Reply: swap src/dst so it looks like it came from remote.
-                            let pkt = build_udp_packet(dst, src, &payload);
-                            let _ = pkt_tx.send(pkt).await;
-                        }
-                        Ok(Err(_)) => {
-                            let _ = hy.close().await;
+                Err(_) => break,
+            }
+        }
+    });
+
+    let result = async {
+        while let Some(payload) = rx.recv().await {
+            hy.send(&payload, &dst_s).await?;
+            loop {
+                let wait_down = bump.notified();
+                tokio::select! {
+                    Some(more) = rx.recv() => {
+                        hy.send(&more, &dst_s).await?;
+                    }
+                    _ = wait_down => {}
+                    _ = tokio::time::sleep(idle) => {
+                        if rx.is_empty() {
                             return Ok(());
-                        }
-                        Err(_) => {
-                            if rx.is_empty() {
-                                let _ = hy.close().await;
-                                return Ok(());
-                            }
                         }
                     }
                 }
             }
         }
+        Ok(())
     }
+    .await;
+
     let _ = hy.close().await;
-    Ok(())
+    down.abort();
+    result
 }
 
 /// Wait up to `timeout` for the first TCP payload after the handshake ACK.
@@ -1533,6 +1569,35 @@ mod tests {
         assert_eq!(parsed.src, Ipv4Addr::new(1, 2, 3, 4));
     }
 
+    #[test]
+    fn tun_udp_reply_prepend_family_roundtrip() {
+        // Query 10.0.0.2:54321 -> 1.1.1.1:443 (not :53; P14 hijacks DNS).
+        let src: SocketAddr = "10.0.0.2:54321".parse().unwrap();
+        let dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        let payload = b"http3-quic";
+        let query = build_udp_packet(src, dst, payload);
+        let qip = parse_ipv4(&query).expect("query ipv4");
+        let qudp = parse_udp(&query, &qip).expect("query udp");
+
+        // udp_session writeback: swap src/dst, keep payload, then Darwin family header.
+        let reply = build_udp_packet(dst, src, payload);
+        let wire = prepend_family(&reply);
+        assert_eq!(&wire[..4], &[0, 0, 0, 2], "AF_INET network-order family");
+        let body = strip_family(&wire).expect("strip");
+        let ip = parse_ipv4(body).expect("ipv4 after strip");
+        let udp = parse_udp(body, &ip).expect("udp after strip");
+        assert_eq!(ip.src, qip.dst);
+        assert_eq!(ip.dst, qip.src);
+        assert_eq!(udp.src_port, qudp.dst_port);
+        assert_eq!(udp.dst_port, qudp.src_port);
+        assert_eq!(
+            &body[udp.payload_off..udp.payload_off + udp.payload_len],
+            payload
+        );
+        // Header with embedded checksum folds to 0.
+        assert_eq!(internet_checksum(&body[..ip.header_len]), 0);
+    }
+
     struct DummyClient;
 
     #[async_trait]
@@ -1653,6 +1718,93 @@ mod tests {
             1,
             "--route-no-hijack-dns / no --route: :53 still FlowDial"
         );
+    }
+
+    struct EchoUdp {
+        q: Mutex<VecDeque<(Vec<u8>, String)>>,
+        notify: Notify,
+        closed: AtomicBool,
+    }
+
+    impl EchoUdp {
+        fn new() -> Self {
+            Self {
+                q: Mutex::new(VecDeque::new()),
+                notify: Notify::new(),
+                closed: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HyUdpConn for EchoUdp {
+        async fn receive(&self) -> Result<(Vec<u8>, String), Error> {
+            loop {
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(Error::Closed(None));
+                }
+                let wait = self.notify.notified();
+                if let Some(v) = self.q.lock().await.pop_front() {
+                    return Ok(v);
+                }
+                wait.await;
+            }
+        }
+        async fn send(&self, data: &[u8], addr: &str) -> Result<(), Error> {
+            self.q.lock().await.push_back((data.to_vec(), addr.to_string()));
+            self.notify.notify_waiters();
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), Error> {
+            self.closed.store(true, Ordering::SeqCst);
+            self.notify.notify_waiters();
+            Ok(())
+        }
+    }
+
+    struct EchoUdpDial;
+
+    #[async_trait]
+    impl FlowDial for EchoUdpDial {
+        async fn tcp(&self, _dest: Dest) -> Result<Box<dyn HyTcpConn>, Error> {
+            Err(Error::Dial("echo tcp".into()))
+        }
+        async fn udp(&self, _dest: Dest) -> Result<Box<dyn HyUdpConn>, Error> {
+            Ok(Box::new(EchoUdp::new()))
+        }
+    }
+
+    #[tokio::test]
+    async fn tun_udp_session_writes_swapped_reply_to_pkt_tx() {
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
+        let (pkt_tx, mut pkt_rx) = mpsc::channel::<Vec<u8>>(8);
+        let src: SocketAddr = "10.0.0.2:54321".parse().unwrap();
+        let dst: SocketAddr = "1.1.1.1:443".parse().unwrap();
+        tx.try_send(b"quic-hello".to_vec()).unwrap();
+        let session = tokio::spawn(udp_session(
+            Arc::new(EchoUdpDial),
+            rx,
+            pkt_tx,
+            src,
+            dst,
+            Duration::from_secs(2),
+        ));
+        let pkt = tokio::time::timeout(Duration::from_secs(2), pkt_rx.recv())
+            .await
+            .expect("udp reply")
+            .expect("pkt");
+        let ip = parse_ipv4(&pkt).expect("ipv4 reply");
+        assert_eq!(ip.src, Ipv4Addr::new(1, 1, 1, 1));
+        assert_eq!(ip.dst, Ipv4Addr::new(10, 0, 0, 2));
+        let udp = parse_udp(&pkt, &ip).expect("udp");
+        assert_eq!(udp.src_port, 443);
+        assert_eq!(udp.dst_port, 54321);
+        assert_eq!(
+            &pkt[udp.payload_off..udp.payload_off + udp.payload_len],
+            b"quic-hello"
+        );
+        drop(tx);
+        let _ = session.await;
     }
 
     fn craft_icmp_echo_v4(

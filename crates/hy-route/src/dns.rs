@@ -180,9 +180,7 @@ pub fn fill_host_from_cache(dest: &mut Dest, cache: &DnsCache) {
 }
 
 fn normalize_qname(n: &str) -> String {
-    n.trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
+    n.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// DNS query/response wire helpers.
@@ -384,20 +382,41 @@ impl PlainTcp for DirectDialer {
     }
 }
 
+/// Default DoH URL when Darwin a-only has empty `--route-dns` and conf `dns-server`.
+pub const DARWIN_A_ONLY_DOH: &str = "https://1.1.1.1/dns-query";
+
 /// TUN stub: cache + upstreams. Answers on the TUN; never uses hy Client.
 pub struct DnsStub {
     pub cache: Arc<DnsCache>,
     pub upstreams: Vec<Arc<dyn DnsUpstream>>,
+    aaaa_nodata: bool,
 }
 
 impl DnsStub {
     pub fn new(cache: Arc<DnsCache>, upstreams: Vec<Arc<dyn DnsUpstream>>) -> Self {
-        Self { cache, upstreams }
+        Self {
+            cache,
+            upstreams,
+            aaaa_nodata: false,
+        }
+    }
+
+    /// Darwin a-only: AAAA → NOERROR / ANCOUNT=0; never cache AAAA.
+    pub fn with_aaaa_nodata(mut self, on: bool) -> Self {
+        self.aaaa_nodata = on;
+        self
+    }
+
+    pub fn aaaa_nodata(&self) -> bool {
+        self.aaaa_nodata
     }
 
     /// Answer a UDP (or already de-framed TCP) DNS query payload.
     pub async fn answer(&self, query: &[u8]) -> Result<Vec<u8>, Error> {
         let q = parse_question(query)?;
+        if self.aaaa_nodata && q.qtype == TYPE_AAAA {
+            return Ok(encode_response(&q, &[]));
+        }
         if q.qtype == TYPE_A || q.qtype == TYPE_AAAA {
             if let Some(ips) = self.cache.lookup_ips(&q.qname, q.qtype) {
                 let recs: Vec<(IpAddr, u32)> =
@@ -410,6 +429,17 @@ impl DnsStub {
             match u.exchange(query).await {
                 Ok(raw) => {
                     if let Ok(recs) = parse_answers(&raw) {
+                        if self.aaaa_nodata {
+                            let recs: Vec<DnsRecord> =
+                                recs.into_iter().filter(|r| r.typ != TYPE_AAAA).collect();
+                            self.cache.insert_from_message(&q.qname, &recs);
+                            if q.qtype == TYPE_AAAA {
+                                return Ok(encode_response(&q, &[]));
+                            }
+                            let pairs: Vec<(IpAddr, u32)> =
+                                recs.iter().map(|r| (r.ip, r.ttl)).collect();
+                            return Ok(encode_response(&q, &pairs));
+                        }
                         self.cache.insert_from_message(&q.qname, &recs);
                     }
                     return Ok(raw);
@@ -485,10 +515,11 @@ pub fn system_dns_servers() -> Vec<ResolverSpec> {
     out
 }
 
-/// CLI `--route-dns` wins over conf; both empty → system DNS.
+/// CLI `--route-dns` wins over conf; both empty → system DNS, or Darwin a-only DoH.
 pub fn resolve_server_list(
     cli: Option<&str>,
     conf: &[String],
+    darwin_a_only_default: bool,
 ) -> Result<Vec<ResolverSpec>, Error> {
     if let Some(s) = cli.map(str::trim).filter(|s| !s.is_empty()) {
         return parse_dns_list(s);
@@ -496,7 +527,39 @@ pub fn resolve_server_list(
     if !conf.is_empty() {
         return parse_dns_list(&conf.join(","));
     }
+    if darwin_a_only_default {
+        return Ok(vec![ResolverSpec::Doh {
+            url: DARWIN_A_ONLY_DOH.to_string(),
+        }]);
+    }
     Ok(system_dns_servers())
+}
+
+/// Darwin TUN with no `address.ipv6`: AAAA NODATA + DoH default + system DNS magnet.
+pub fn darwin_a_only_mode(is_darwin: bool, tun_present: bool, has_address_ipv6: bool) -> bool {
+    is_darwin && tun_present && !has_address_ipv6
+}
+
+/// Enable the :53 stub: route file (existing) or Darwin a-only even without a route file.
+/// Linux without a route file stays off. `--route-no-hijack-dns` always wins.
+pub fn want_tun_dns_stub(has_route_file: bool, no_hijack: bool, darwin_a_only: bool) -> bool {
+    if no_hijack {
+        return false;
+    }
+    has_route_file || darwin_a_only
+}
+
+/// Build a TUN stub from CLI/conf resolvers. `aaaa_nodata` also selects the Darwin DoH default.
+pub fn build_dns_stub(
+    cache: Arc<DnsCache>,
+    cli: Option<&str>,
+    conf: &[String],
+    dialer: DirectDialer,
+    aaaa_nodata: bool,
+) -> Result<DnsStub, Error> {
+    let specs = resolve_server_list(cli, conf, aaaa_nodata)?;
+    let upstreams = build_upstreams(&specs, dialer)?;
+    Ok(DnsStub::new(cache, upstreams).with_aaaa_nodata(aaaa_nodata))
 }
 
 /// Parsed DoH URL (RFC 8484 POST).
@@ -544,9 +607,7 @@ fn parse_hostport(hostport: &str, default_port: u16) -> Result<(String, u16, Des
         } else {
             default_port
         };
-        let ip: IpAddr = host
-            .parse()
-            .map_err(|_| Error::dns("bad DoH IPv6"))?;
+        let ip: IpAddr = host.parse().map_err(|_| Error::dns("bad DoH IPv6"))?;
         return Ok((
             format!("[{host}]"),
             port,
@@ -639,7 +700,10 @@ where
         .write_all(&req)
         .await
         .map_err(|e| Error::dns(e.to_string()))?;
-    stream.flush().await.map_err(|e| Error::dns(e.to_string()))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| Error::dns(e.to_string()))?;
     let mut raw = Vec::new();
     stream
         .read_to_end(&mut raw)
@@ -649,7 +713,10 @@ where
 }
 
 /// Dial DoH's TCP via `tcp` (DirectDialer in production). No TLS.
-pub async fn doh_tcp_connect(tcp: &dyn PlainTcp, url: &str) -> Result<(TcpStream, DohTarget), Error> {
+pub async fn doh_tcp_connect(
+    tcp: &dyn PlainTcp,
+    url: &str,
+) -> Result<(TcpStream, DohTarget), Error> {
     let target = parse_doh_url(url)?;
     let stream = tcp.tcp(&target.dest).await?;
     Ok((stream, target))
@@ -697,8 +764,8 @@ impl DohUpstream {
 impl DnsUpstream for DohUpstream {
     async fn exchange(&self, query: &[u8]) -> Result<Vec<u8>, Error> {
         let (stream, target) = doh_tcp_connect(&*self.tcp, &self.url).await?;
-        let name = ServerName::try_from(target.sni.clone())
-            .map_err(|e| Error::dns(e.to_string()))?;
+        let name =
+            ServerName::try_from(target.sni.clone()).map_err(|e| Error::dns(e.to_string()))?;
         let tls = self
             .tls
             .connect(name, stream)
@@ -723,10 +790,7 @@ impl PlainUpstream {
 #[async_trait]
 impl DnsUpstream for PlainUpstream {
     async fn exchange(&self, query: &[u8]) -> Result<Vec<u8>, Error> {
-        let sock = self
-            .dialer
-            .udp_bind(self.addr.is_ipv6())
-            .await?;
+        let sock = self.dialer.udp_bind(self.addr.is_ipv6()).await?;
         sock.send_to(query, self.addr)
             .await
             .map_err(|e| Error::dns(e.to_string()))?;
@@ -748,8 +812,12 @@ impl PlainUpstream {
         let dest = Dest::from_socket_addr(self.addr, Proto::Tcp);
         let mut s = self.dialer.tcp(&dest).await?;
         let len = (query.len() as u16).to_be_bytes();
-        s.write_all(&len).await.map_err(|e| Error::dns(e.to_string()))?;
-        s.write_all(query).await.map_err(|e| Error::dns(e.to_string()))?;
+        s.write_all(&len)
+            .await
+            .map_err(|e| Error::dns(e.to_string()))?;
+        s.write_all(query)
+            .await
+            .map_err(|e| Error::dns(e.to_string()))?;
         let mut lb = [0u8; 2];
         s.read_exact(&mut lb)
             .await
@@ -788,6 +856,7 @@ pub fn build_upstreams(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DirectDialer;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -802,10 +871,7 @@ mod tests {
             qtype: TYPE_A,
             qclass: CLASS_IN,
         };
-        encode_response(
-            &q,
-            &[(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 60)],
-        )
+        encode_response(&q, &[(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 60)])
     }
 
     #[test]
@@ -892,7 +958,9 @@ mod tests {
         let recs = parse_answers(&resp).unwrap();
         assert_eq!(recs[0].ip, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
         assert_eq!(
-            cache.lookup_qname(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))).as_deref(),
+            cache
+                .lookup_qname(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
+                .as_deref(),
             Some("example.com")
         );
         let q = parse_question(&resp).unwrap();
@@ -919,14 +987,173 @@ mod tests {
 
     #[test]
     fn route_dns_cli_wins_over_conf() {
-        let cli = resolve_server_list(Some("9.9.9.9"), &["8.8.8.8".into()]).unwrap();
+        let cli = resolve_server_list(Some("9.9.9.9"), &["8.8.8.8".into()], false).unwrap();
         match &cli[0] {
             ResolverSpec::Plain { addr } => assert_eq!(addr, &"9.9.9.9:53".parse().unwrap()),
             other => panic!("{other:?}"),
         }
-        let conf = resolve_server_list(None, &["1.1.1.1".into()]).unwrap();
+        let conf = resolve_server_list(None, &["1.1.1.1".into()], false).unwrap();
         match &conf[0] {
             ResolverSpec::Plain { addr } => assert_eq!(addr, &"1.1.1.1:53".parse().unwrap()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn darwin_a_only_default_doh_explicit_still_wins() {
+        let d = resolve_server_list(None, &[], true).unwrap();
+        assert_eq!(d.len(), 1);
+        match &d[0] {
+            ResolverSpec::Doh { url } => assert_eq!(url, DARWIN_A_ONLY_DOH),
+            other => panic!("{other:?}"),
+        }
+        let linux = resolve_server_list(None, &[], false).unwrap();
+        assert!(
+            !linux.is_empty(),
+            "Linux/default path must still yield system DNS"
+        );
+        match &linux[0] {
+            ResolverSpec::Doh { url } => {
+                assert_ne!(
+                    url, DARWIN_A_ONLY_DOH,
+                    "Linux must not default to Darwin DoH"
+                )
+            }
+            ResolverSpec::Plain { addr } => {
+                assert_eq!(addr.port(), 53);
+            }
+        }
+        let cli = resolve_server_list(Some("9.9.9.9"), &[], true).unwrap();
+        match &cli[0] {
+            ResolverSpec::Plain { addr } => assert_eq!(addr, &"9.9.9.9:53".parse().unwrap()),
+            other => panic!("{other:?}"),
+        }
+        let conf = resolve_server_list(None, &["8.8.8.8".into()], true).unwrap();
+        match &conf[0] {
+            ResolverSpec::Plain { addr } => assert_eq!(addr, &"8.8.8.8:53".parse().unwrap()),
+            other => panic!("{other:?}"),
+        }
+        let both = resolve_server_list(Some("1.1.1.1"), &["8.8.8.8".into()], true).unwrap();
+        match &both[0] {
+            ResolverSpec::Plain { addr } => assert_eq!(addr, &"1.1.1.1:53".parse().unwrap()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn rcode(msg: &[u8]) -> u8 {
+        msg[3] & 0x0f
+    }
+
+    fn ancount(msg: &[u8]) -> u16 {
+        u16::from_be_bytes([msg[6], msg[7]])
+    }
+
+    struct TypedMock;
+
+    #[async_trait]
+    impl DnsUpstream for TypedMock {
+        async fn exchange(&self, query: &[u8]) -> Result<Vec<u8>, Error> {
+            let q = parse_question(query)?;
+            if q.qtype == TYPE_AAAA {
+                Ok(encode_response(
+                    &q,
+                    &[(IpAddr::V6("2001::1".parse().unwrap()), 60)],
+                ))
+            } else {
+                Ok(encode_response(
+                    &q,
+                    &[(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)), 60)],
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn aaaa_nodata_empty_answers_does_not_cache_aaaa() {
+        let cache = Arc::new(DnsCache::new());
+        let stub = DnsStub::new(cache.clone(), vec![Arc::new(TypedMock)]).with_aaaa_nodata(true);
+        let q6 = encode_query(0x1111, "www.youtube.com", TYPE_AAAA);
+        let resp = stub.answer(&q6).await.unwrap();
+        assert_eq!(rcode(&resp), 0, "NOERROR, not SERVFAIL/NXDOMAIN");
+        assert_eq!(ancount(&resp), 0);
+        assert!(parse_answers(&resp).unwrap().is_empty());
+        let q = parse_question(&resp).unwrap();
+        assert_eq!(q.qtype, TYPE_AAAA);
+        assert_eq!(q.id, 0x1111);
+        let fake: IpAddr = "2001::1".parse().unwrap();
+        assert!(cache.lookup_ips("www.youtube.com", TYPE_AAAA).is_none());
+        assert!(cache.lookup_qname(fake).is_none());
+
+        let q4 = encode_query(0x2222, "example.com", TYPE_A);
+        let resp = stub.answer(&q4).await.unwrap();
+        let recs = parse_answers(&resp).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].ip, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(
+            cache
+                .lookup_qname(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
+                .as_deref(),
+            Some("example.com")
+        );
+        assert!(cache.lookup_ips("example.com", TYPE_AAAA).is_none());
+        assert!(cache.lookup_qname(fake).is_none());
+    }
+
+    #[tokio::test]
+    async fn aaaa_forwarded_when_nodata_flag_off() {
+        let cache = Arc::new(DnsCache::new());
+        let stub = DnsStub::new(cache.clone(), vec![Arc::new(TypedMock)]);
+        assert!(!stub.aaaa_nodata());
+        let q6 = encode_query(0x3333, "www.youtube.com", TYPE_AAAA);
+        let resp = stub.answer(&q6).await.unwrap();
+        let recs = parse_answers(&resp).unwrap();
+        assert_eq!(rcode(&resp), 0);
+        assert_eq!(recs.len(), 1);
+        let fake: IpAddr = "2001::1".parse().unwrap();
+        assert_eq!(recs[0].ip, fake);
+        assert_eq!(
+            cache.lookup_ips("www.youtube.com", TYPE_AAAA),
+            Some(vec![fake])
+        );
+        assert_eq!(cache.lookup_qname(fake).as_deref(), Some("www.youtube.com"));
+    }
+
+    #[test]
+    fn darwin_without_route_enables_stub_linux_does_not() {
+        assert!(
+            darwin_a_only_mode(true, true, false),
+            "Darwin TUN without address.ipv6"
+        );
+        assert!(
+            !darwin_a_only_mode(true, true, true),
+            "address.ipv6 turns the gate off"
+        );
+        assert!(!darwin_a_only_mode(false, true, false), "Linux: no a-only");
+        assert!(!darwin_a_only_mode(true, false, false), "no TUN");
+
+        assert!(
+            want_tun_dns_stub(false, false, true),
+            "Darwin a-only still hijacks :53 without a route file"
+        );
+        assert!(
+            !want_tun_dns_stub(false, false, false),
+            "Linux without a route file must not hijack"
+        );
+        assert!(
+            want_tun_dns_stub(true, false, false),
+            "Linux with route file"
+        );
+        assert!(
+            !want_tun_dns_stub(true, true, true),
+            "--route-no-hijack-dns wins"
+        );
+
+        let d = DirectDialer::relaxed(0x162);
+        let stub = build_dns_stub(Arc::new(DnsCache::new()), None, &[], d, true).unwrap();
+        assert!(stub.aaaa_nodata());
+        let specs = resolve_server_list(None, &[], stub.aaaa_nodata()).unwrap();
+        match &specs[0] {
+            ResolverSpec::Doh { url } => assert_eq!(url, DARWIN_A_ONLY_DOH),
             other => panic!("{other:?}"),
         }
     }
@@ -998,24 +1225,24 @@ mod tests {
             let n = server.read(&mut buf).await.unwrap();
             let req = &buf[..n];
             assert!(req.windows(4).any(|w| w == b"POST"));
-            let mut resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\r\n"
-                .to_vec();
+            let mut resp =
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/dns-message\r\n\r\n".to_vec();
             resp.extend_from_slice(&body);
             server.write_all(&resp).await.unwrap();
         });
         let got = doh_http_exchange(client, "dns.google", "/dns-query", &q)
             .await
             .unwrap();
-        assert_eq!(parse_answers(&got).unwrap()[0].ip, IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(
+            parse_answers(&got).unwrap()[0].ip,
+            IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))
+        );
     }
 
     #[test]
     fn decide_uses_cached_qname() {
-        let r = crate::compile(
-            "[Rule]\nDOMAIN-SUFFIX,example,REJECT\nFINAL,PROXY\n",
-            None,
-        )
-        .unwrap();
+        let r =
+            crate::compile("[Rule]\nDOMAIN-SUFFIX,example,REJECT\nFINAL,PROXY\n", None).unwrap();
         let cache = DnsCache::new();
         let ip = IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9));
         cache.insert("ads.example", TYPE_A, &[ip], 60);

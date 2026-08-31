@@ -8,12 +8,12 @@
 //! never swallowed.
 
 use crate::config::TunConfig;
-use crate::inbound::tun_plan::{prepend_family, strip_family};
 pub use crate::inbound::tun_plan::parse_utun_unit;
+use crate::inbound::tun_plan::{prepend_family, strip_family};
 use crate::route_glue::{Dest, FlowDial, Proto};
+use async_trait::async_trait;
 use hy_core::client::HyTcpConn;
 use hy_core::Error;
-use async_trait::async_trait;
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
@@ -230,11 +230,7 @@ fn build_udp_packet(src: SocketAddr, dst: SocketAddr, payload: &[u8]) -> Vec<u8>
     }
 }
 
-fn build_udp_v4(
-    src: SocketAddrV4,
-    dst: SocketAddrV4,
-    payload: &[u8],
-) -> Vec<u8> {
+fn build_udp_v4(src: SocketAddrV4, dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
     let mut udp = vec![0u8; 8 + payload.len()];
     udp[0..2].copy_from_slice(&src.port().to_be_bytes());
     udp[2..4].copy_from_slice(&dst.port().to_be_bytes());
@@ -459,6 +455,7 @@ pub async fn run(
     dns: Option<Arc<dyn DnsAnswerer>>,
     sni_peek: bool,
     icmp_reply: bool,
+    darwin_dns_device: Option<String>,
 ) -> Result<(), Error> {
     let fd = match crate::inbound::tun_darwin::open_and_configure(&cfg) {
         Ok(fd) => fd,
@@ -470,6 +467,23 @@ pub async fn run(
             ));
         }
     };
+    #[cfg(feature = "client-route")]
+    let _dns_restore = if cfg.ipv6.is_none() {
+        darwin_dns_device.as_deref().and_then(|dev| {
+            match hy_route::darwin_dns::hijack_system_dns(dev) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    tracing::error!(error = %e, device = %dev, "darwin system DNS magnet failed");
+                    None
+                }
+            }
+        })
+    } else {
+        let _ = darwin_dns_device;
+        None
+    };
+    #[cfg(not(feature = "client-route"))]
+    let _ = darwin_dns_device;
     tracing::info!(iface = %cfg.name, "TUN listening");
     run_dataplane(
         fd,
@@ -544,47 +558,47 @@ fn configure_device(cfg: &TunConfig) -> std::io::Result<()> {
     }
     run_ip(&["link", "set", "dev", &cfg.name, "up"])?;
 
-        if let Some(ref route) = cfg.route {
-            if route.strict {
-                tracing::info!("tun route.strict requested (best-effort)");
-            }
-            match crate::inbound::tun_plan::linux_ipv4_install_list(
-                &route.ipv4,
-                &route.ipv4_exclude,
-                cfg.apply_exclude,
-            ) {
-                Ok(prefixes) => {
-                    for p in &prefixes {
-                        if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
-                            tracing::error!(prefix = %p, error = %e, "tun auto-route failed");
-                        }
+    if let Some(ref route) = cfg.route {
+        if route.strict {
+            tracing::info!("tun route.strict requested (best-effort)");
+        }
+        match crate::inbound::tun_plan::linux_ipv4_install_list(
+            &route.ipv4,
+            &route.ipv4_exclude,
+            cfg.apply_exclude,
+        ) {
+            Ok(prefixes) => {
+                for p in &prefixes {
+                    if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
+                        tracing::error!(prefix = %p, error = %e, "tun auto-route failed");
                     }
                 }
-                Err(e) => tracing::error!(error = %e, "tun ipv4 route list"),
             }
-            match crate::inbound::tun_plan::linux_ipv6_install_list(
-                &route.ipv6,
-                &route.ipv6_exclude,
-                cfg.apply_exclude,
-            ) {
-                Ok(prefixes) => {
-                    for p in &prefixes {
-                        if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
-                            tracing::error!(prefix = %p, error = %e, "tun auto-route (ipv6) failed");
-                        }
+            Err(e) => tracing::error!(error = %e, "tun ipv4 route list"),
+        }
+        match crate::inbound::tun_plan::linux_ipv6_install_list(
+            &route.ipv6,
+            &route.ipv6_exclude,
+            cfg.apply_exclude,
+        ) {
+            Ok(prefixes) => {
+                for p in &prefixes {
+                    if let Err(e) = run_ip(&["route", "replace", p, "dev", &cfg.name]) {
+                        tracing::error!(prefix = %p, error = %e, "tun auto-route (ipv6) failed");
                     }
                 }
-                Err(e) => tracing::error!(error = %e, "tun ipv6 route list"),
             }
-            if !cfg.apply_exclude {
-                for p in &route.ipv4_exclude {
-                    tracing::warn!(prefix = %p, "tun route ipv4Exclude ignored (no sing-tun)");
-                }
-                for p in &route.ipv6_exclude {
-                    tracing::warn!(prefix = %p, "tun route ipv6Exclude ignored (no sing-tun)");
-                }
+            Err(e) => tracing::error!(error = %e, "tun ipv6 route list"),
+        }
+        if !cfg.apply_exclude {
+            for p in &route.ipv4_exclude {
+                tracing::warn!(prefix = %p, "tun route ipv4Exclude ignored (no sing-tun)");
+            }
+            for p in &route.ipv6_exclude {
+                tracing::warn!(prefix = %p, "tun route ipv6Exclude ignored (no sing-tun)");
             }
         }
+    }
     Ok(())
 }
 
@@ -601,7 +615,6 @@ fn run_ip(args: &[&str]) -> std::io::Result<()> {
     }
     Ok(())
 }
-
 
 #[cfg(target_os = "macos")]
 struct TunDev {
@@ -697,7 +710,9 @@ async fn run_dataplane(
     let (mut reader, writer) = {
         (
             unsafe { tokio::fs::File::from_raw_fd(fd) },
-            Arc::new(Mutex::new(unsafe { tokio::fs::File::from_raw_fd(write_fd) })),
+            Arc::new(Mutex::new(unsafe {
+                tokio::fs::File::from_raw_fd(write_fd)
+            })),
         )
     };
     #[cfg(target_os = "macos")]
@@ -712,7 +727,11 @@ async fn run_dataplane(
     let writer_task = Arc::clone(&writer);
     tokio::spawn(async move {
         while let Some(pkt) = pkt_rx.recv().await {
-            let wire = if family_hdr { prepend_family(&pkt) } else { pkt };
+            let wire = if family_hdr {
+                prepend_family(&pkt)
+            } else {
+                pkt
+            };
             let mut w = writer_task.lock().await;
             let _ = w.write_all(&wire).await;
         }
@@ -745,70 +764,71 @@ async fn run_dataplane(
             raw
         };
         if let Some(ip) = parse_ipv4(pkt) {
-        match ip.proto {
-            IP_PROTO_ICMP => {
-                // Local echo reply only; never proxy ICMP into FlowDial / the hy tunnel.
-                maybe_send_icmp_echo(pkt, icmp_reply, false, &pkt_tx).await;
-            }
-            IP_PROTO_UDP => {
-                let Some(udp) = parse_udp(pkt, &ip) else {
-                    continue;
-                };
-                let src = SocketAddr::V4(SocketAddrV4::new(ip.src, udp.src_port));
-                let dst = SocketAddr::V4(SocketAddrV4::new(ip.dst, udp.dst_port));
-                let payload = pkt[udp.payload_off..udp.payload_off + udp.payload_len].to_vec();
-                let key = (src, dst);
-                udp_txs.retain(|_, tx| !tx.is_closed());
-                if let Some(tx) = udp_txs.get(&key) {
-                    let _ = tx.try_send(payload);
-                    continue;
+            match ip.proto {
+                IP_PROTO_ICMP => {
+                    // Local echo reply only; never proxy ICMP into FlowDial / the hy tunnel.
+                    maybe_send_icmp_echo(pkt, icmp_reply, false, &pkt_tx).await;
                 }
-                if spawn_udp_or_dns(
-                    Arc::clone(&client),
-                    dns.clone(),
-                    payload,
-                    pkt_tx.clone(),
-                    src,
-                    dst,
-                    idle,
-                    &mut udp_txs,
-                    key,
-                ) {
-                    continue;
+                IP_PROTO_UDP => {
+                    let Some(udp) = parse_udp(pkt, &ip) else {
+                        continue;
+                    };
+                    let src = SocketAddr::V4(SocketAddrV4::new(ip.src, udp.src_port));
+                    let dst = SocketAddr::V4(SocketAddrV4::new(ip.dst, udp.dst_port));
+                    let payload = pkt[udp.payload_off..udp.payload_off + udp.payload_len].to_vec();
+                    let key = (src, dst);
+                    udp_txs.retain(|_, tx| !tx.is_closed());
+                    if let Some(tx) = udp_txs.get(&key) {
+                        let _ = tx.try_send(payload);
+                        continue;
+                    }
+                    if spawn_udp_or_dns(
+                        Arc::clone(&client),
+                        dns.clone(),
+                        payload,
+                        pkt_tx.clone(),
+                        src,
+                        dst,
+                        idle,
+                        &mut udp_txs,
+                        key,
+                    ) {
+                        continue;
+                    }
                 }
-            }
-            IP_PROTO_TCP => {
-                let Some(tcp) = parse_tcp(pkt, &ip) else {
-                    continue;
-                };
-                let src = SocketAddr::V4(SocketAddrV4::new(ip.src, tcp.src_port));
-                let dst = SocketAddr::V4(SocketAddrV4::new(ip.dst, tcp.dst_port));
-                let key = (src, dst);
-                tcp_txs.retain(|_, tx| !tx.is_closed());
-                if let Some(tx) = tcp_txs.get(&key) {
+                IP_PROTO_TCP => {
+                    let Some(tcp) = parse_tcp(pkt, &ip) else {
+                        continue;
+                    };
+                    let src = SocketAddr::V4(SocketAddrV4::new(ip.src, tcp.src_port));
+                    let dst = SocketAddr::V4(SocketAddrV4::new(ip.dst, tcp.dst_port));
+                    let key = (src, dst);
+                    tcp_txs.retain(|_, tx| !tx.is_closed());
+                    if let Some(tx) = tcp_txs.get(&key) {
+                        let frame = pkt[ip.header_len..ip.total_len].to_vec();
+                        let _ = tx.try_send(frame);
+                        continue;
+                    }
+                    // New flow: only start on SYN (not SYN+ACK from us).
+                    if tcp.flags & TCP_SYN == 0 || tcp.flags & TCP_ACK != 0 {
+                        continue;
+                    }
+                    let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
                     let frame = pkt[ip.header_len..ip.total_len].to_vec();
                     let _ = tx.try_send(frame);
-                    continue;
+                    tcp_txs.insert(key, tx);
+                    let client = Arc::clone(&client);
+                    let pkt_tx = pkt_tx.clone();
+                    let dns = dns.clone();
+                    let sni_peek = sni_peek;
+                    tokio::spawn(async move {
+                        let _ =
+                            tcp_session(client, dns, rx, pkt_tx, src, dst, idle, sni_peek).await;
+                    });
                 }
-                // New flow: only start on SYN (not SYN+ACK from us).
-                if tcp.flags & TCP_SYN == 0 || tcp.flags & TCP_ACK != 0 {
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel::<Vec<u8>>(128);
-                let frame = pkt[ip.header_len..ip.total_len].to_vec();
-                let _ = tx.try_send(frame);
-                tcp_txs.insert(key, tx);
-                let client = Arc::clone(&client);
-                let pkt_tx = pkt_tx.clone();
-                let dns = dns.clone();
-                let sni_peek = sni_peek;
-                tokio::spawn(async move {
-                    let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle, sni_peek).await;
-                });
+                _ => {}
             }
-            _ => {}
-        }
-        continue;
+            continue;
         }
         if enable_v6 {
             if let Some(ip6) = parse_ipv6(pkt) {
@@ -817,10 +837,13 @@ async fn run_dataplane(
                         maybe_send_icmp_echo(pkt, icmp_reply, true, &pkt_tx).await;
                     }
                     IP_PROTO_UDP => {
-                        let Some(udp) = parse_udp6(pkt, &ip6) else { continue };
+                        let Some(udp) = parse_udp6(pkt, &ip6) else {
+                            continue;
+                        };
                         let src = SocketAddr::V6(SocketAddrV6::new(ip6.src, udp.src_port, 0, 0));
                         let dst = SocketAddr::V6(SocketAddrV6::new(ip6.dst, udp.dst_port, 0, 0));
-                        let payload = pkt[udp.payload_off..udp.payload_off + udp.payload_len].to_vec();
+                        let payload =
+                            pkt[udp.payload_off..udp.payload_off + udp.payload_len].to_vec();
                         let key = (src, dst);
                         udp_txs.retain(|_, tx| !tx.is_closed());
                         if let Some(tx) = udp_txs.get(&key) {
@@ -842,7 +865,9 @@ async fn run_dataplane(
                         }
                     }
                     IP_PROTO_TCP => {
-                        let Some(tcp) = parse_tcp6(pkt, &ip6) else { continue };
+                        let Some(tcp) = parse_tcp6(pkt, &ip6) else {
+                            continue;
+                        };
                         let src = SocketAddr::V6(SocketAddrV6::new(ip6.src, tcp.src_port, 0, 0));
                         let dst = SocketAddr::V6(SocketAddrV6::new(ip6.dst, tcp.dst_port, 0, 0));
                         let key = (src, dst);
@@ -864,7 +889,8 @@ async fn run_dataplane(
                         let dns = dns.clone();
                         let sni_peek = sni_peek;
                         tokio::spawn(async move {
-                            let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle, sni_peek).await;
+                            let _ = tcp_session(client, dns, rx, pkt_tx, src, dst, idle, sni_peek)
+                                .await;
                         });
                     }
                     _ => {}
@@ -1126,7 +1152,14 @@ async fn tcp_established(
             match client.tcp(dest).await {
                 Ok(c) => Arc::from(c),
                 Err(_) => {
-                    let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
+                    let rst = build_tcp_segment(
+                        remote_addr,
+                        client_addr,
+                        snd_nxt,
+                        rcv_nxt,
+                        TCP_RST | TCP_ACK,
+                        &[],
+                    );
                     let _ = pkt_tx.send(rst).await;
                     return Ok(());
                 }
@@ -1136,7 +1169,14 @@ async fn tcp_established(
         match client.tcp(dest).await {
             Ok(c) => Arc::from(c),
             Err(_) => {
-                let rst = build_tcp_segment(remote_addr, client_addr, snd_nxt, rcv_nxt, TCP_RST | TCP_ACK, &[]);
+                let rst = build_tcp_segment(
+                    remote_addr,
+                    client_addr,
+                    snd_nxt,
+                    rcv_nxt,
+                    TCP_RST | TCP_ACK,
+                    &[],
+                );
                 let _ = pkt_tx.send(rst).await;
                 return Ok(());
             }
@@ -1345,7 +1385,10 @@ mod tests {
         let udp = parse_udp(&pkt, &ip).expect("udp");
         assert_eq!(udp.src_port, 12345);
         assert_eq!(udp.dst_port, 53);
-        assert_eq!(&pkt[udp.payload_off..udp.payload_off + udp.payload_len], b"hi");
+        assert_eq!(
+            &pkt[udp.payload_off..udp.payload_off + udp.payload_len],
+            b"hi"
+        );
     }
 
     #[test]
@@ -1377,8 +1420,14 @@ mod tests {
 
     #[test]
     fn utun_name_scan() {
-        assert_eq!(crate::inbound::tun_plan::parse_utun_unit("utun123").unwrap(), 123);
-        assert_eq!(crate::inbound::tun_plan::parse_utun_unit("utun0").unwrap(), 0);
+        assert_eq!(
+            crate::inbound::tun_plan::parse_utun_unit("utun123").unwrap(),
+            123
+        );
+        assert_eq!(
+            crate::inbound::tun_plan::parse_utun_unit("utun0").unwrap(),
+            0
+        );
         assert!(crate::inbound::tun_plan::parse_utun_unit("utun").is_err());
         assert!(crate::inbound::tun_plan::parse_utun_unit("hy0").is_err());
         assert!(crate::inbound::tun_plan::parse_utun_unit("utunX").is_err());
@@ -1391,7 +1440,9 @@ mod tests {
         assert_eq!(p.len(), 8);
         assert_eq!(p[0], (Ipv4Addr::new(1, 0, 0, 0), 8));
         assert_eq!(p[7], (Ipv4Addr::new(128, 0, 0, 0), 1));
-        assert!(!p.iter().any(|(a, b)| *a == Ipv4Addr::UNSPECIFIED && *b == 0));
+        assert!(!p
+            .iter()
+            .any(|(a, b)| *a == Ipv4Addr::UNSPECIFIED && *b == 0));
     }
 
     #[test]
@@ -1420,11 +1471,9 @@ mod tests {
     fn darwin_default_v6_and_exclude() {
         let p = crate::inbound::tun_plan::darwin_default_ipv6();
         assert_eq!(p.len(), 8);
-        let got = crate::inbound::tun_plan::darwin_ipv6_install_list(
-            &[],
-            &["2001:db8::1/128".into()],
-        )
-        .unwrap();
+        let got =
+            crate::inbound::tun_plan::darwin_ipv6_install_list(&[], &["2001:db8::1/128".into()])
+                .unwrap();
         assert!(!got.is_empty());
     }
 
@@ -1564,7 +1613,11 @@ mod tests {
             .await
             .expect("dns reply")
             .expect("pkt");
-        assert_eq!(dial.udp.load(Ordering::SeqCst), 0, ":53 must not enter hy tunnel");
+        assert_eq!(
+            dial.udp.load(Ordering::SeqCst),
+            0,
+            ":53 must not enter hy tunnel"
+        );
         assert_eq!(dial.tcp.load(Ordering::SeqCst), 0);
         let ip = parse_ipv4(&pkt).expect("ipv4 reply");
         assert_eq!(ip.proto, IP_PROTO_UDP);
@@ -1602,7 +1655,13 @@ mod tests {
         );
     }
 
-    fn craft_icmp_echo_v4(src: [u8; 4], dst: [u8; 4], id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+    fn craft_icmp_echo_v4(
+        src: [u8; 4],
+        dst: [u8; 4],
+        id: u16,
+        seq: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let total = 20 + 8 + payload.len();
         let mut pkt = vec![0u8; total];
         pkt[0] = 0x45;
@@ -1633,15 +1692,25 @@ mod tests {
             .await
             .expect("icmp reply")
             .expect("pkt");
-        assert_eq!(dial.udp.load(Ordering::SeqCst), 0, "ICMP must not enter hy tunnel");
+        assert_eq!(
+            dial.udp.load(Ordering::SeqCst),
+            0,
+            "ICMP must not enter hy tunnel"
+        );
         assert_eq!(dial.tcp.load(Ordering::SeqCst), 0);
         let ip = parse_ipv4(&reply).expect("ipv4 reply");
         assert_eq!(ip.proto, IP_PROTO_ICMP);
         assert_eq!(ip.src, Ipv4Addr::new(1, 1, 1, 1));
         assert_eq!(ip.dst, Ipv4Addr::new(10, 0, 0, 2));
         assert_eq!(reply[ip.header_len], 0, "echo reply type 0");
-        assert_eq!(&reply[ip.header_len + 4..ip.header_len + 6], &0x11u16.to_be_bytes());
-        assert_eq!(&reply[ip.header_len + 6..ip.header_len + 8], &0x22u16.to_be_bytes());
+        assert_eq!(
+            &reply[ip.header_len + 4..ip.header_len + 6],
+            &0x11u16.to_be_bytes()
+        );
+        assert_eq!(
+            &reply[ip.header_len + 6..ip.header_len + 8],
+            &0x22u16.to_be_bytes()
+        );
         assert_eq!(&reply[ip.header_len + 8..], b"ping");
     }
 
@@ -1660,7 +1729,11 @@ mod tests {
             got.is_err(),
             "no --route / --route-no-icmp-reply must not write an ICMP reply"
         );
-        assert_eq!(dial.udp.load(Ordering::SeqCst), 0, "ICMP must not enter hy tunnel");
+        assert_eq!(
+            dial.udp.load(Ordering::SeqCst),
+            0,
+            "ICMP must not enter hy tunnel"
+        );
         assert_eq!(dial.tcp.load(Ordering::SeqCst), 0);
     }
 
@@ -1846,7 +1919,9 @@ mod tests {
             tx.send(frame).await.unwrap();
         }
         let dest = wait_first_dest(&dial).await;
-        let _ = tx.send(tcp_hdr(TEST_SYN_SEQ.wrapping_add(1), TCP_RST, &[])).await;
+        let _ = tx
+            .send(tcp_hdr(TEST_SYN_SEQ.wrapping_add(1), TCP_RST, &[]))
+            .await;
         let _ = session.await;
         dest
     }

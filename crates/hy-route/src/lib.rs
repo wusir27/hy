@@ -4,6 +4,7 @@
 //! No RULE-SET download.
 
 mod action;
+pub mod darwin_dns;
 mod dest;
 mod direct;
 pub mod dns;

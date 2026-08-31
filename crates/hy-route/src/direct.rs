@@ -126,6 +126,22 @@ impl DirectDialer {
         self.fwmark
     }
 
+    /// Darwin non-utun default NIC (for `networksetup`). None on other OS or if unset.
+    pub fn iface(&self) -> Option<&str> {
+        #[cfg(target_os = "macos")]
+        {
+            if self.iface.is_empty() {
+                None
+            } else {
+                Some(self.iface.as_str())
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
     pub fn is_strict(&self) -> bool {
         self.strict
     }
@@ -230,7 +246,8 @@ fn new_socket(v6: bool, tcp: bool) -> Result<Socket, Error> {
 fn apply_linux_mark(sock: &Socket, mark: u32, strict: bool) -> Result<(), Error> {
     match sock.set_mark(mark) {
         Ok(()) => {
-            let got = so_mark(sock).map_err(|e| Error::direct(format!("getsockopt SO_MARK: {e}")))?;
+            let got =
+                so_mark(sock).map_err(|e| Error::direct(format!("getsockopt SO_MARK: {e}")))?;
             if got != mark {
                 return Err(Error::direct(format!(
                     "SO_MARK verify failed: set {mark:#x} got {got:#x}"
@@ -393,7 +410,10 @@ mod tests {
             default: true,
         }];
         let e = pick_non_utun_default(&rows).unwrap_err();
-        assert!(e.to_string().contains("utun") || e.to_string().contains("non-utun"), "{e}");
+        assert!(
+            e.to_string().contains("utun") || e.to_string().contains("non-utun"),
+            "{e}"
+        );
         assert!(is_utun_name("utun3"));
         assert!(is_utun_name("UTUN0"));
         assert!(!is_utun_name("en0"));
@@ -463,10 +483,7 @@ mod tests {
             return;
         }
         let d = DirectDialer::new(0x162).unwrap();
-        let dest = Dest::from_socket_addr(
-            SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
-            Proto::Tcp,
-        );
+        let dest = Dest::from_socket_addr(SocketAddr::from((Ipv4Addr::LOCALHOST, 1)), Proto::Tcp);
         let e = d.tcp(&dest).await.unwrap_err();
         let s = e.to_string();
         assert!(
@@ -522,5 +539,11 @@ mod tests {
     #[test]
     fn default_fwmark_is_0x162() {
         assert_eq!(DEFAULT_FWMARK, 0x162);
+    }
+
+    #[test]
+    fn iface_getter_relaxed_is_none() {
+        let d = DirectDialer::relaxed(0x162);
+        assert!(d.iface().is_none());
     }
 }

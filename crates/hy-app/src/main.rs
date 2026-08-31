@@ -4,11 +4,11 @@ mod config;
 mod geoloader;
 mod inbound;
 mod listen;
+#[cfg(feature = "client-route")]
+mod marked_udp;
 mod mimic;
 mod policy_route;
 mod route_glue;
-#[cfg(feature = "client-route")]
-mod marked_udp;
 
 use clap::{Parser, Subcommand};
 use config::{fill_client, fill_server, parse_client_yaml, parse_server_yaml};
@@ -85,19 +85,34 @@ async fn main() {
             route_no_hijack_dns,
             route_no_sniff,
             route_no_icmp_reply,
-        }) => run_client(
-            cli.config.as_ref(),
-            no_client_route,
-            route.as_ref(),
-            route_geoip.as_ref(),
-            route_fwmark.as_deref(),
-            route_dns.as_deref(),
-            route_no_hijack_dns,
-            route_no_sniff,
-            route_no_icmp_reply,
-        )
-        .await,
-        None => run_client(cli.config.as_ref(), false, None, None, None, None, false, false, false).await,
+        }) => {
+            run_client(
+                cli.config.as_ref(),
+                no_client_route,
+                route.as_ref(),
+                route_geoip.as_ref(),
+                route_fwmark.as_deref(),
+                route_dns.as_deref(),
+                route_no_hijack_dns,
+                route_no_sniff,
+                route_no_icmp_reply,
+            )
+            .await
+        }
+        None => {
+            run_client(
+                cli.config.as_ref(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+        }
     };
     if let Err(e) = r {
         eprintln!("{e}");
@@ -199,6 +214,7 @@ fn prepare_client_route(
     route_no_hijack_dns: bool,
     route_no_sniff: bool,
     route_no_icmp_reply: bool,
+    darwin_a_only: bool,
 ) -> Result<Option<PreparedRoute>, Error> {
     let Some(path) = resolve_route_file(no_client_route, route, yaml_file) else {
         return Ok(None);
@@ -210,8 +226,8 @@ fn prepare_client_route(
 
     let fwmark = crate::policy_route::parse_fwmark(route_fwmark)
         .map_err(|e| Error::config("route-fwmark", e))?;
-    let direct = hy_route::DirectDialer::new(fwmark)
-        .map_err(|e| Error::config("route", e.to_string()))?;
+    let direct =
+        hy_route::DirectDialer::new(fwmark).map_err(|e| Error::config("route", e.to_string()))?;
 
     let marked = std::sync::Arc::new(crate::marked_udp::MarkedUdpFactory::new(direct.clone()));
     let kind = crate::marked_udp::mark_kind_from_app(app);
@@ -221,14 +237,15 @@ fn prepare_client_route(
     let dns = if route_no_hijack_dns {
         None
     } else {
-        let specs = hy_route::dns::resolve_server_list(route_dns, router.dns_servers())
-            .map_err(|e| Error::config("route-dns", e.to_string()))?;
+        let specs =
+            hy_route::dns::resolve_server_list(route_dns, router.dns_servers(), darwin_a_only)
+                .map_err(|e| Error::config("route-dns", e.to_string()))?;
         let upstreams = hy_route::dns::build_upstreams(&specs, direct.clone())
             .map_err(|e| Error::config("route-dns", e.to_string()))?;
-        Some(std::sync::Arc::new(hy_route::dns::DnsStub::new(
-            std::sync::Arc::clone(&dns_cache),
-            upstreams,
-        )))
+        Some(std::sync::Arc::new(
+            hy_route::dns::DnsStub::new(std::sync::Arc::clone(&dns_cache), upstreams)
+                .with_aaaa_nodata(darwin_a_only),
+        ))
     };
 
     #[cfg(target_os = "linux")]
@@ -284,6 +301,44 @@ fn build_flow_dial(
     }
 }
 
+/// :53 stub + optional Darwin `networksetup` NIC. No route file still hijacks on Darwin a-only.
+/// Does not enable decide / DIRECT / ICMP / fwmark (FlowDial stays passthrough when `prepared` is None).
+#[cfg(feature = "client-route")]
+fn tun_dns_hijack(
+    prepared: Option<&PreparedRoute>,
+    darwin_a_only: bool,
+    route_no_hijack_dns: bool,
+    route_dns: Option<&str>,
+) -> Result<(Option<Arc<dyn inbound::tun::DnsAnswerer>>, Option<String>), Error> {
+    if !hy_route::dns::want_tun_dns_stub(prepared.is_some(), route_no_hijack_dns, darwin_a_only) {
+        return Ok((None, None));
+    }
+    if let Some(p) = prepared {
+        let iface = if darwin_a_only {
+            p.direct.iface().map(|s| s.to_string())
+        } else {
+            None
+        };
+        let dns = p
+            .dns
+            .clone()
+            .map(|s| s as Arc<dyn inbound::tun::DnsAnswerer>);
+        return Ok((dns, iface));
+    }
+    let direct = hy_route::DirectDialer::new(hy_route::DEFAULT_FWMARK)
+        .map_err(|e| Error::config("tun", e.to_string()))?;
+    let iface = direct.iface().map(|s| s.to_string());
+    let stub = hy_route::dns::build_dns_stub(
+        std::sync::Arc::new(hy_route::dns::DnsCache::new()),
+        route_dns,
+        &[],
+        direct,
+        true,
+    )
+    .map_err(|e| Error::config("route-dns", e.to_string()))?;
+    Ok((Some(Arc::new(stub)), iface))
+}
+
 async fn run_client(
     path: Option<&PathBuf>,
     no_client_route: bool,
@@ -302,6 +357,16 @@ async fn run_client(
     let yaml_route = y.route.as_ref().and_then(|r| r.file.as_deref());
 
     #[cfg(feature = "client-route")]
+    let darwin_a_only = hy_route::dns::darwin_a_only_mode(
+        cfg!(target_os = "macos"),
+        app.tun.is_some(),
+        app.tun.as_ref().and_then(|t| t.ipv6.as_ref()).is_some(),
+    );
+    #[cfg(not(feature = "client-route"))]
+    let darwin_a_only = false;
+    let _ = darwin_a_only;
+
+    #[cfg(feature = "client-route")]
     let prepared = prepare_client_route(
         &mut app,
         no_client_route,
@@ -313,15 +378,22 @@ async fn run_client(
         route_no_hijack_dns,
         route_no_sniff,
         route_no_icmp_reply,
+        darwin_a_only,
     )?;
     #[cfg(not(feature = "client-route"))]
     {
-        let _ = (no_client_route, route, route_geoip, yaml_route, route_fwmark, route_dns, route_no_hijack_dns, route_no_sniff, route_no_icmp_reply);
-        let _ = resolve_route_file(
+        let _ = (
             no_client_route,
-            route.map(|p| p.as_path()),
+            route,
+            route_geoip,
             yaml_route,
+            route_fwmark,
+            route_dns,
+            route_no_hijack_dns,
+            route_no_sniff,
+            route_no_icmp_reply,
         );
+        let _ = resolve_route_file(no_client_route, route.map(|p| p.as_path()), yaml_route);
     }
 
     let cli = client::connect_reconnectable(app.core, lazy).await?;
@@ -331,15 +403,16 @@ async fn run_client(
         tracing::info!("connected");
     }
     #[cfg(feature = "client-route")]
-    let dns_hijack: Option<Arc<dyn inbound::tun::DnsAnswerer>> = prepared
-        .as_ref()
-        .and_then(|p| {
-            p.dns
-                .clone()
-                .map(|s| s as Arc<dyn inbound::tun::DnsAnswerer>)
-        });
+    let (dns_hijack, darwin_dns_device) = tun_dns_hijack(
+        prepared.as_ref(),
+        darwin_a_only,
+        route_no_hijack_dns,
+        route_dns,
+    )?;
     #[cfg(not(feature = "client-route"))]
     let dns_hijack: Option<Arc<dyn inbound::tun::DnsAnswerer>> = None;
+    #[cfg(not(feature = "client-route"))]
+    let darwin_dns_device: Option<String> = None;
     #[cfg(feature = "client-route")]
     let sni_peek = prepared.as_ref().map(|p| p.sni_peek).unwrap_or(false);
     #[cfg(not(feature = "client-route"))]
@@ -355,7 +428,9 @@ async fn run_client(
     let mut tasks = Vec::new();
     if let Some(s) = app.socks5.take() {
         let c = Arc::clone(&dial);
-        tasks.push(tokio::spawn(async move { inbound::socks5::run(&s, c).await }));
+        tasks.push(tokio::spawn(
+            async move { inbound::socks5::run(&s, c).await },
+        ));
     }
     if let Some(h) = app.http.take() {
         let c = Arc::clone(&dial);
@@ -412,17 +487,32 @@ async fn run_client(
     if let Some(t) = app.tun.take() {
         let c = Arc::clone(&dial);
         let dns = dns_hijack;
-        tasks.push(tokio::spawn(async move { inbound::tun::run(t, c, dns, sni_peek, icmp_reply).await }));
+        #[cfg(target_os = "macos")]
+        {
+            let iface = darwin_dns_device;
+            tasks.push(tokio::spawn(async move {
+                inbound::tun::run(t, c, dns, sni_peek, icmp_reply, iface).await
+            }));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let _ = darwin_dns_device;
+            tasks.push(tokio::spawn(async move {
+                inbound::tun::run(t, c, dns, sni_peek, icmp_reply).await
+            }));
+        }
     } else {
         let _ = dns_hijack;
         let _ = sni_peek;
         let _ = icmp_reply;
+        let _ = darwin_dns_device;
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = dns_hijack;
         let _ = sni_peek;
         let _ = icmp_reply;
+        let _ = darwin_dns_device;
     }
     if tasks.is_empty() {
         tracing::warn!("no inbound configured");
@@ -487,7 +577,11 @@ async fn run_server(path: Option<&PathBuf>) -> Result<(), Error> {
 
 async fn futures_select(
     tasks: &mut Vec<tokio::task::JoinHandle<Result<(), Error>>>,
-) -> (Result<(), Error>, usize, Vec<tokio::task::JoinHandle<Result<(), Error>>>) {
+) -> (
+    Result<(), Error>,
+    usize,
+    Vec<tokio::task::JoinHandle<Result<(), Error>>>,
+) {
     if tasks.is_empty() {
         return (Ok(()), 0, Vec::new());
     }
@@ -496,12 +590,18 @@ async fn futures_select(
 
 async fn futures_select_inner(
     tasks: &mut Vec<tokio::task::JoinHandle<Result<(), Error>>>,
-) -> (Result<(), Error>, usize, Vec<tokio::task::JoinHandle<Result<(), Error>>>) {
+) -> (
+    Result<(), Error>,
+    usize,
+    Vec<tokio::task::JoinHandle<Result<(), Error>>>,
+) {
     let r = futures_next(tasks).await;
     (r, 0, Vec::new())
 }
 
-async fn futures_next(tasks: &mut Vec<tokio::task::JoinHandle<Result<(), Error>>>) -> Result<(), Error> {
+async fn futures_next(
+    tasks: &mut Vec<tokio::task::JoinHandle<Result<(), Error>>>,
+) -> Result<(), Error> {
     let (idx, res) = {
         let (res, idx, _rest) = select_all_join(tasks).await;
         (idx, res)
@@ -516,11 +616,7 @@ async fn futures_next(tasks: &mut Vec<tokio::task::JoinHandle<Result<(), Error>>
 
 async fn select_all_join(
     tasks: &mut Vec<tokio::task::JoinHandle<Result<(), Error>>>,
-) -> (
-    Result<Result<(), Error>, tokio::task::JoinError>,
-    usize,
-    (),
-) {
+) -> (Result<Result<(), Error>, tokio::task::JoinError>, usize, ()) {
     loop {
         for (i, t) in tasks.iter_mut().enumerate() {
             if t.is_finished() {
@@ -539,7 +635,8 @@ mod tests {
 
     #[test]
     fn client_accepts_no_client_route() {
-        let c = Cli::try_parse_from(["hy", "client", "--no-client-route", "-c", "client.yaml"]).unwrap();
+        let c = Cli::try_parse_from(["hy", "client", "--no-client-route", "-c", "client.yaml"])
+            .unwrap();
         match c.cmd {
             Some(Cmd::Client {
                 no_client_route,
@@ -562,13 +659,23 @@ mod tests {
             }
             other => panic!("expected Client, got {other:?}"),
         }
-        assert_eq!(c.config.as_deref(), Some(std::path::Path::new("client.yaml")));
+        assert_eq!(
+            c.config.as_deref(),
+            Some(std::path::Path::new("client.yaml"))
+        );
     }
 
     #[test]
     fn client_accepts_route_path() {
-        let c = Cli::try_parse_from(["hy", "client", "--route", "/tmp/sr_cnip.conf", "-c", "client.yaml"])
-            .unwrap();
+        let c = Cli::try_parse_from([
+            "hy",
+            "client",
+            "--route",
+            "/tmp/sr_cnip.conf",
+            "-c",
+            "client.yaml",
+        ])
+        .unwrap();
         match c.cmd {
             Some(Cmd::Client {
                 no_client_route,
@@ -581,7 +688,10 @@ mod tests {
                 route_no_icmp_reply,
             }) => {
                 assert!(!no_client_route);
-                assert_eq!(route.as_deref(), Some(std::path::Path::new("/tmp/sr_cnip.conf")));
+                assert_eq!(
+                    route.as_deref(),
+                    Some(std::path::Path::new("/tmp/sr_cnip.conf"))
+                );
                 assert!(route_geoip.is_none());
                 assert!(route_fwmark.is_none());
                 assert!(route_dns.is_none());
@@ -655,11 +765,7 @@ mod tests {
 
     #[test]
     fn resolve_route_file_cli_wins_over_yaml() {
-        let p = resolve_route_file(
-            false,
-            Some(Path::new("/cli.conf")),
-            Some("/yaml.conf"),
-        );
+        let p = resolve_route_file(false, Some(Path::new("/cli.conf")), Some("/yaml.conf"));
         assert_eq!(p.as_deref(), Some(Path::new("/cli.conf")));
         let p = resolve_route_file(false, None, Some("/yaml.conf"));
         assert_eq!(p.as_deref(), Some(Path::new("/yaml.conf")));
@@ -833,7 +939,10 @@ mod tests {
         }
         let c = Cli::try_parse_from(["hy", "client", "-c", "client.yaml"]).unwrap();
         match c.cmd {
-            Some(Cmd::Client { route_no_icmp_reply, .. }) => {
+            Some(Cmd::Client {
+                route_no_icmp_reply,
+                ..
+            }) => {
                 assert!(
                     !route_no_icmp_reply,
                     "echo reply ON by default when routing is on (flag absent)"
@@ -874,5 +983,40 @@ mod tests {
             assert!(app.core.conn_factory.is_none());
         }
     }
-}
 
+    #[cfg(feature = "client-route")]
+    #[test]
+    fn darwin_without_route_constructs_stub_linux_does_not() {
+        let y = parse_client_yaml("server: 127.0.0.1:1\nauth: x\ntun: { name: hy0 }\n").unwrap();
+        let app = fill_client(&y).unwrap();
+        let tun = app.tun.as_ref().expect("tun");
+        let linux = hy_route::dns::darwin_a_only_mode(false, true, tun.ipv6.is_some());
+        assert!(
+            !hy_route::dns::want_tun_dns_stub(false, false, linux),
+            "Linux without a route file must not hijack :53"
+        );
+        let darwin = hy_route::dns::darwin_a_only_mode(true, true, false);
+        assert!(
+            hy_route::dns::want_tun_dns_stub(false, false, darwin),
+            "Darwin TUN without address.ipv6 must hijack :53 without a route file"
+        );
+        assert!(!hy_route::dns::want_tun_dns_stub(
+            false,
+            false,
+            hy_route::dns::darwin_a_only_mode(true, true, true)
+        ));
+
+        let (dns, iface) = tun_dns_hijack(None, false, false, None).unwrap();
+        assert!(dns.is_none(), "Linux: no stub without route file");
+        assert!(iface.is_none());
+
+        let (dns, _iface) = tun_dns_hijack(None, true, false, None).unwrap();
+        assert!(
+            dns.is_some(),
+            "Darwin a-only constructs :53 stub without route"
+        );
+
+        let (dns, _) = tun_dns_hijack(None, true, true, None).unwrap();
+        assert!(dns.is_none(), "--route-no-hijack-dns");
+    }
+}

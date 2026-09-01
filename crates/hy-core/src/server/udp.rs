@@ -1,6 +1,6 @@
 //! Server UDP session manager.
 
-use super::{EventLogger, HyUdpSocket, Outbound, RequestHook, TrafficLogger};
+use super::{EventLogger, HyUdpSocket, Outbound, RequestHook, StreamDump, StreamStats, TrafficLogger};
 use crate::error::Error;
 use crate::frag::{frag_udp_message, Defragger};
 use crate::protocol::{parse_udp_message, UdpMessage, CLOSE_EXCESSIVE_LOAD, MAX_UDP_SIZE};
@@ -25,6 +25,7 @@ pub struct ServerUdpSm {
     event_logger: Option<Arc<dyn EventLogger>>,
     traffic_logger: Option<Arc<dyn TrafficLogger>>,
     auth_id: String,
+    conn_id: u32,
     remote: SocketAddr,
     idle: Duration,
     sessions: Mutex<HashMap<u32, Arc<Session>>>,
@@ -42,6 +43,7 @@ struct Session {
     write_tx: Mutex<Option<mpsc::Sender<(Vec<u8>, String)>>>,
     closed: AtomicBool,
     acl_cache: Mutex<HashMap<String, Option<String>>>,
+    dump: Mutex<Option<Arc<StreamDump>>>,
 }
 
 impl ServerUdpSm {
@@ -64,6 +66,7 @@ impl ServerUdpSm {
             event_logger,
             traffic_logger,
             auth_id,
+            conn_id: p9x.conn_seq as u32,
             remote,
             idle,
             sessions: Mutex::new(HashMap::new()),
@@ -134,6 +137,7 @@ impl ServerUdpSm {
                     write_tx: Mutex::new(None),
                     closed: AtomicBool::new(false),
                     acl_cache: Mutex::new(HashMap::new()),
+                    dump: Mutex::new(None),
                 });
                 map.insert(session_id, Arc::clone(&s));
                 s
@@ -249,8 +253,21 @@ impl ServerUdpSm {
             }
         };
         if first.addr != actual {
-            *session.override_addr.lock().unwrap() = Some(actual);
+            *session.override_addr.lock().unwrap() = Some(actual.clone());
             *session.original_addr.lock().unwrap() = Some(first.addr.clone());
+        }
+        if let Some(ref tl) = self.traffic_logger {
+            let dump = StreamDump::start(
+                Arc::clone(tl),
+                session.id as u64,
+                StreamStats {
+                    auth_id: self.auth_id.clone(),
+                    conn_id: self.conn_id,
+                    req_addr: actual,
+                    ..Default::default()
+                },
+            );
+            *session.dump.lock().unwrap() = Some(dump);
         }
         Ok(sock)
     }
@@ -306,6 +323,9 @@ impl ServerUdpSm {
                                     sm.close_session(&session, Some(e)).await;
                                     break;
                                 }
+                                if let Some(d) = session.dump.lock().unwrap().clone() {
+                                    d.stats.tx.fetch_add(data.len() as u64, Ordering::Relaxed);
+                                }
                             }
                             None => {
                                 let _ = sock.close().await;
@@ -321,6 +341,9 @@ impl ServerUdpSm {
                                     let orig = session.original_addr.lock().unwrap();
                                     orig.clone().unwrap_or(raddr)
                                 };
+                                if let Some(d) = session.dump.lock().unwrap().clone() {
+                                    d.stats.rx.fetch_add(n as u64, Ordering::Relaxed);
+                                }
                                 let msg = UdpMessage {
                                     session_id: session.id,
                                     packet_id: 0,
@@ -356,6 +379,9 @@ impl ServerUdpSm {
             .is_err()
         {
             return;
+        }
+        if let Some(d) = session.dump.lock().unwrap().take() {
+            d.untrace();
         }
         // Dropping write_tx closes the channel → io loop exits.
         *session.write_tx.lock().unwrap() = None;

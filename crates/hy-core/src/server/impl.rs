@@ -2,7 +2,8 @@
 
 use super::udp::ServerUdpSm;
 use super::{
-    Authenticator, Config, EventLogger, HyTcpStream, HyUdpSocket, Outbound, Server, TrafficLogger,
+    Authenticator, Config, EventLogger, HyTcpStream, HyUdpSocket, Outbound, Server, StreamDump,
+    StreamStats, TrafficLogger,
 };
 use crate::congestion::apply_cc_mode;
 use crate::error::Error;
@@ -410,6 +411,13 @@ impl TcpSend {
             }
         }
     }
+
+    fn quic_stream_id(&self) -> u64 {
+        match self {
+            TcpSend::Quinn(s) => u64::from(s.id()),
+            TcpSend::H3(s) => H3SendStream::send_id(s).into_inner(),
+        }
+    }
 }
 
 impl TcpRecv {
@@ -518,6 +526,17 @@ async fn handle_tcp(
     }
     tracing::info!(remote = %remote, id = %auth_id, dest = %addr, "tcp request");
 
+    let dump = StreamDump::maybe_start(
+        traffic_logger.as_ref(),
+        send.quic_stream_id(),
+        StreamStats {
+            auth_id: auth_id.to_string(),
+            conn_id: p9x.conn_seq as u32,
+            req_addr: addr.clone(),
+            ..Default::default()
+        },
+    );
+
     match outbound.tcp(&addr).await {
         Err(e) => {
             tracing::info!(
@@ -565,7 +584,11 @@ async fn handle_tcp(
                 client.leftover.clear();
             }
             if !to_remote.is_empty() {
+                let n = to_remote.len() as u64;
                 let _ = remote_tcp.write(&to_remote).await;
+                if let Some(d) = dump.as_ref() {
+                    d.stats.tx.fetch_add(n, Ordering::Relaxed);
+                }
             }
 
             let err = copy_two_way(
@@ -574,6 +597,7 @@ async fn handle_tcp(
                 remote_tcp.as_mut(),
                 auth_id,
                 traffic_logger.as_deref(),
+                dump.as_ref().map(|d| d.stats.as_ref()),
                 &mut counts,
             )
             .await;
@@ -637,6 +661,7 @@ async fn copy_two_way(
     remote: &mut dyn HyTcpStream,
     auth_id: &str,
     traffic: Option<&dyn TrafficLogger>,
+    dump: Option<&StreamStats>,
     counts: &mut TcpByteCounts,
 ) -> Option<Error> {
     let mut c2r_buf = vec![0u8; 32 * 1024];
@@ -656,6 +681,9 @@ async fn copy_two_way(
                         if let Err(e) = remote.write(&c2r_buf[..n]).await {
                             return Some(e);
                         }
+                        if let Some(s) = dump {
+                            s.tx.fetch_add(n as u64, Ordering::Relaxed);
+                        }
                         counts.add_c2s(n as u64);
                     }
                     Err(e) => return Some(e),
@@ -672,6 +700,9 @@ async fn copy_two_way(
                         }
                         if let Err(e) = send.write_all(&r2c_buf[..n]).await {
                             return Some(e);
+                        }
+                        if let Some(s) = dump {
+                            s.rx.fetch_add(n as u64, Ordering::Relaxed);
                         }
                         counts.add_s2c(n as u64);
                     }

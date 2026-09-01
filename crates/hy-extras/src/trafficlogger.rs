@@ -4,6 +4,7 @@ use hy_core::server::{StreamStats, TrafficLogger};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -136,8 +137,8 @@ impl TrafficStats {
                     connection: s.conn_id,
                     stream: *sid,
                     req_addr: s.req_addr.clone(),
-                    tx: s.tx,
-                    rx: s.rx,
+                    tx: s.tx.load(Ordering::Relaxed),
+                    rx: s.rx.load(Ordering::Relaxed),
                 })
                 .collect();
             let body = serde_json::to_vec(&Dump { streams }).unwrap_or_else(|_| b"{}".to_vec());

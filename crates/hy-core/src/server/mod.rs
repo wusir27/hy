@@ -6,6 +6,7 @@ use crate::io::DatagramIo;
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,8 +95,8 @@ pub struct StreamStats {
     pub req_addr: String,
     pub hooked_req_addr: Option<String>,
     pub state: StreamState,
-    pub tx: u64,
-    pub rx: u64,
+    pub tx: AtomicU64,
+    pub rx: AtomicU64,
 }
 
 pub trait TrafficLogger: Send + Sync {
@@ -104,6 +105,51 @@ pub trait TrafficLogger: Send + Sync {
     fn log_online_state(&self, id: &str, online: bool);
     fn trace_stream(&self, stream_id: u64, stats: Arc<StreamStats>);
     fn untrace_stream(&self, stream_id: u64);
+}
+
+/// Registers a stream with `TrafficLogger` and untraces on Drop (panic / early return).
+pub(crate) struct StreamDump {
+    logger: Arc<dyn TrafficLogger>,
+    stream_id: u64,
+    pub stats: Arc<StreamStats>,
+    untraced: AtomicBool,
+}
+
+impl StreamDump {
+    pub(crate) fn start(
+        logger: Arc<dyn TrafficLogger>,
+        stream_id: u64,
+        stats: StreamStats,
+    ) -> Arc<Self> {
+        let stats = Arc::new(stats);
+        logger.trace_stream(stream_id, Arc::clone(&stats));
+        Arc::new(Self {
+            logger,
+            stream_id,
+            stats,
+            untraced: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn maybe_start(
+        logger: Option<&Arc<dyn TrafficLogger>>,
+        stream_id: u64,
+        stats: StreamStats,
+    ) -> Option<Arc<Self>> {
+        logger.map(|tl| Self::start(Arc::clone(tl), stream_id, stats))
+    }
+
+    pub(crate) fn untrace(&self) {
+        if !self.untraced.swap(true, Ordering::SeqCst) {
+            self.logger.untrace_stream(self.stream_id);
+        }
+    }
+}
+
+impl Drop for StreamDump {
+    fn drop(&mut self) {
+        self.untrace();
+    }
 }
 
 #[async_trait]

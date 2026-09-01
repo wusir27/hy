@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -597,6 +597,99 @@ fn host_header(host: &str, port: u16, default: u16) -> String {
     }
 }
 
+/// Write fill-time A into `dest.ip`. SNI / Host stay the original hostname.
+pub fn pin_doh_dest(target: &mut DohTarget, ip: IpAddr) {
+    target.dest.ip = Some(ip);
+}
+
+/// Blocking A lookup via the current system resolver. Skips AAAA (Darwin a-only).
+pub fn resolve_doh_a(host: &str, port: u16) -> Result<IpAddr, Error> {
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| Error::dns(format!("pin DoH {host}: {e}")))?;
+    addrs
+        .map(|a| a.ip())
+        .find(IpAddr::is_ipv4)
+        .ok_or_else(|| Error::dns(format!("pin DoH {host}: no A record")))
+}
+
+fn try_pin_doh_target(
+    target: &mut DohTarget,
+    resolve_a: impl Fn(&str, u16) -> Result<IpAddr, Error>,
+) -> Result<(), Error> {
+    if target.dest.ip.is_some() {
+        return Ok(());
+    }
+    let host = target
+        .dest
+        .host
+        .as_deref()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| Error::dns("DoH URL has no host to pin"))?;
+    let ip = resolve_a(host, target.dest.port)?;
+    if !ip.is_ipv4() {
+        return Err(Error::dns(format!("pin DoH {host}: AAAA not used")));
+    }
+    pin_doh_dest(target, ip);
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum PreparedResolver {
+    Doh { url: String, target: DohTarget },
+    Plain { addr: SocketAddr },
+}
+
+/// Pin hostname DoH before the Darwin magnet. Drop URLs that fail; empty → literal 1.1.1.1.
+fn prepare_stub_resolvers(
+    specs: &[ResolverSpec],
+    resolve_a: impl Fn(&str, u16) -> Result<IpAddr, Error>,
+) -> Vec<PreparedResolver> {
+    let mut out = Vec::new();
+    for s in specs {
+        match s {
+            ResolverSpec::Doh { url } => {
+                let mut target = match parse_doh_url(url) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(url = %url, error = %e, "bad DoH URL; dropping");
+                        continue;
+                    }
+                };
+                if let Err(e) = try_pin_doh_target(&mut target, &resolve_a) {
+                    tracing::warn!(
+                        url = %url,
+                        error = %e,
+                        "DoH hostname pin failed; dropping URL"
+                    );
+                    continue;
+                }
+                out.push(PreparedResolver::Doh {
+                    url: url.clone(),
+                    target,
+                });
+            }
+            ResolverSpec::Plain { addr } => {
+                out.push(PreparedResolver::Plain { addr: *addr });
+            }
+        }
+    }
+    if out.is_empty() {
+        tracing::warn!(
+            fallback = DARWIN_A_ONLY_DOH,
+            "no DNS stub upstreams after pin; falling back to literal-IP DoH"
+        );
+        match parse_doh_url(DARWIN_A_ONLY_DOH) {
+            Ok(target) => out.push(PreparedResolver::Doh {
+                url: DARWIN_A_ONLY_DOH.to_string(),
+                target,
+            }),
+            Err(e) => tracing::error!(error = %e, "internal: fallback DoH URL failed to parse"),
+        }
+    }
+    out
+}
+
 fn parse_hostport(hostport: &str, default_port: u16) -> Result<(String, u16, Dest), Error> {
     if let Some(rest) = hostport.strip_prefix('[') {
         let (host, after) = rest
@@ -739,39 +832,54 @@ fn rustls_client_config() -> Result<ClientConfig, Error> {
 }
 
 /// DoH upstream: DirectDialer TCP + rustls + RFC 8484 POST.
+/// `target.dest.ip` is pinned at fill time so the query path never `lookup_host`s the hostname.
 pub struct DohUpstream {
     pub url: String,
+    pub target: DohTarget,
     tcp: Arc<dyn PlainTcp>,
     tls: TlsConnector,
 }
 
 impl DohUpstream {
     pub fn new(url: String, tcp: Arc<dyn PlainTcp>) -> Result<Self, Error> {
-        let cfg = Arc::new(rustls_client_config()?);
-        Ok(Self {
-            url,
-            tcp,
-            tls: TlsConnector::from(cfg),
-        })
+        let mut target = parse_doh_url(&url)?;
+        try_pin_doh_target(&mut target, resolve_doh_a)?;
+        Self::with_pinned(url, target, tcp)
     }
 
     pub fn with_direct(url: String, dialer: DirectDialer) -> Result<Self, Error> {
         Self::new(url, Arc::new(dialer))
+    }
+
+    fn with_pinned(url: String, target: DohTarget, tcp: Arc<dyn PlainTcp>) -> Result<Self, Error> {
+        let cfg = Arc::new(rustls_client_config()?);
+        Ok(Self {
+            url,
+            target,
+            tcp,
+            tls: TlsConnector::from(cfg),
+        })
     }
 }
 
 #[async_trait]
 impl DnsUpstream for DohUpstream {
     async fn exchange(&self, query: &[u8]) -> Result<Vec<u8>, Error> {
-        let (stream, target) = doh_tcp_connect(&*self.tcp, &self.url).await?;
-        let name =
-            ServerName::try_from(target.sni.clone()).map_err(|e| Error::dns(e.to_string()))?;
+        let stream = self.tcp.tcp(&self.target.dest).await?;
+        let name = ServerName::try_from(self.target.sni.clone())
+            .map_err(|e| Error::dns(e.to_string()))?;
         let tls = self
             .tls
             .connect(name, stream)
             .await
             .map_err(|e| Error::dns(e.to_string()))?;
-        doh_http_exchange(tls, &target.host_header, &target.path, query).await
+        doh_http_exchange(
+            tls,
+            &self.target.host_header,
+            &self.target.path,
+            query,
+        )
+        .await
     }
 }
 
@@ -831,22 +939,33 @@ impl PlainUpstream {
     }
 }
 
-/// Build upstreams from a resolver list. All TCP/UDP uses `dialer`.
+/// Build upstreams from a resolver list. Hostname DoH is pinned to A before any query.
+/// All TCP/UDP uses `dialer`.
 pub fn build_upstreams(
     specs: &[ResolverSpec],
     dialer: DirectDialer,
 ) -> Result<Vec<Arc<dyn DnsUpstream>>, Error> {
+    build_upstreams_with_resolve(specs, dialer, resolve_doh_a)
+}
+
+fn build_upstreams_with_resolve(
+    specs: &[ResolverSpec],
+    dialer: DirectDialer,
+    resolve_a: impl Fn(&str, u16) -> Result<IpAddr, Error>,
+) -> Result<Vec<Arc<dyn DnsUpstream>>, Error> {
+    let prepared = prepare_stub_resolvers(specs, resolve_a);
     let mut out: Vec<Arc<dyn DnsUpstream>> = Vec::new();
-    for s in specs {
-        match s {
-            ResolverSpec::Doh { url } => {
-                out.push(Arc::new(DohUpstream::with_direct(
-                    url.clone(),
-                    dialer.clone(),
+    for p in prepared {
+        match p {
+            PreparedResolver::Doh { url, target } => {
+                out.push(Arc::new(DohUpstream::with_pinned(
+                    url,
+                    target,
+                    Arc::new(dialer.clone()),
                 )?));
             }
-            ResolverSpec::Plain { addr } => {
-                out.push(Arc::new(PlainUpstream::new(*addr, dialer.clone())));
+            PreparedResolver::Plain { addr } => {
+                out.push(Arc::new(PlainUpstream::new(addr, dialer.clone())));
             }
         }
     }
@@ -1256,5 +1375,150 @@ mod tests {
         fill_host_from_cache(&mut dest, &cache);
         assert_eq!(dest.host.as_deref(), Some("ads.example"));
         assert_eq!(r.decide(&dest), crate::Action::Reject);
+    }
+
+    #[test]
+    fn parse_doh_url_alidns_pin_fixture_a() {
+        let mut t = parse_doh_url("https://dns.alidns.com/dns-query").unwrap();
+        assert_eq!(t.dest.host.as_deref(), Some("dns.alidns.com"));
+        assert!(t.dest.ip.is_none());
+        assert_eq!(t.sni, "dns.alidns.com");
+        assert_eq!(t.host_header, "dns.alidns.com");
+        let pin = IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5));
+        pin_doh_dest(&mut t, pin);
+        assert_eq!(t.dest.ip, Some(pin));
+        assert_eq!(t.dest.host.as_deref(), Some("dns.alidns.com"));
+        assert_eq!(t.sni, "dns.alidns.com");
+        assert_eq!(t.host_header, "dns.alidns.com");
+    }
+
+    #[test]
+    fn resolve_server_list_keeps_sr_cnip_doh_urls() {
+        let sr_cnip_dns = [
+            "https://dns.alidns.com/dns-query".to_string(),
+            "https://doh.pub/dns-query".to_string(),
+        ];
+        let v = resolve_server_list(None, &sr_cnip_dns, true).unwrap();
+        assert_eq!(v.len(), 2);
+        match &v[0] {
+            ResolverSpec::Doh { url } => assert_eq!(url, "https://dns.alidns.com/dns-query"),
+            other => panic!("{other:?}"),
+        }
+        match &v[1] {
+            ResolverSpec::Doh { url } => assert_eq!(url, "https://doh.pub/dns-query"),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            v.iter().all(|s| match s {
+                ResolverSpec::Doh { url } => url != DARWIN_A_ONLY_DOH,
+                _ => true,
+            }),
+            "sr_cnip URLs must not be replaced by DARWIN_A_ONLY_DOH"
+        );
+    }
+
+    #[test]
+    fn pin_two_hostnames_fail_falls_back_to_darwin_a_only_doh() {
+        let specs = [
+            ResolverSpec::Doh {
+                url: "https://no-such-p16-a.invalid/dns-query".into(),
+            },
+            ResolverSpec::Doh {
+                url: "https://no-such-p16-b.invalid/dns-query".into(),
+            },
+        ];
+        let planned = prepare_stub_resolvers(&specs, |_, _| Err(Error::dns("no A")));
+        assert_eq!(planned.len(), 1);
+        match &planned[0] {
+            PreparedResolver::Doh { url, target } => {
+                assert_eq!(url, DARWIN_A_ONLY_DOH);
+                assert_eq!(
+                    target.dest.ip,
+                    Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
+                );
+                assert!(target.dest.host.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        let upstreams = build_upstreams_with_resolve(
+            &specs,
+            DirectDialer::relaxed(0x162),
+            |_, _| Err(Error::dns("no A")),
+        )
+        .unwrap();
+        assert_eq!(upstreams.len(), 1);
+    }
+
+    #[test]
+    fn pin_success_keeps_aliyun_and_dohpub_not_fallback() {
+        let specs = [
+            ResolverSpec::Doh {
+                url: "https://dns.alidns.com/dns-query".into(),
+            },
+            ResolverSpec::Doh {
+                url: "https://doh.pub/dns-query".into(),
+            },
+        ];
+        let planned = prepare_stub_resolvers(&specs, |host, _| {
+            Ok(IpAddr::V4(if host.contains("alidns") {
+                Ipv4Addr::new(223, 5, 5, 5)
+            } else {
+                Ipv4Addr::new(1, 12, 0, 1)
+            }))
+        });
+        assert_eq!(planned.len(), 2);
+        match &planned[0] {
+            PreparedResolver::Doh { url, target } => {
+                assert_eq!(url, "https://dns.alidns.com/dns-query");
+                assert_eq!(
+                    target.dest.ip,
+                    Some(IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)))
+                );
+                assert_eq!(target.dest.host.as_deref(), Some("dns.alidns.com"));
+                assert_eq!(target.sni, "dns.alidns.com");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &planned[1] {
+            PreparedResolver::Doh { url, target } => {
+                assert_eq!(url, "https://doh.pub/dns-query");
+                assert_eq!(target.dest.host.as_deref(), Some("doh.pub"));
+                assert_eq!(target.sni, "doh.pub");
+                assert_eq!(
+                    target.dest.ip,
+                    Some(IpAddr::V4(Ipv4Addr::new(1, 12, 0, 1)))
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn doh_exchange_tcp_uses_pinned_ip_not_hostname_lookup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let local = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        let rec = Arc::new(RecTcp {
+            dests: Mutex::new(Vec::new()),
+            local,
+            calls: AtomicUsize::new(0),
+        });
+        let mut target = parse_doh_url("https://dns.alidns.com/dns-query").unwrap();
+        let pin = IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5));
+        pin_doh_dest(&mut target, pin);
+        let up = DohUpstream::with_pinned(
+            "https://dns.alidns.com/dns-query".into(),
+            target,
+            rec.clone(),
+        )
+        .unwrap();
+        let _ = up.exchange(&fixture_query_example_a()).await;
+        assert_eq!(rec.calls.load(Ordering::SeqCst), 1);
+        let d = rec.dests.lock().unwrap();
+        assert_eq!(d[0].ip, Some(pin));
+        assert_eq!(d[0].host.as_deref(), Some("dns.alidns.com"));
+        assert_eq!(d[0].port, 443);
     }
 }

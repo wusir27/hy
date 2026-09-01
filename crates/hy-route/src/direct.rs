@@ -536,6 +536,19 @@ mod tests {
         let _ = IpAddr::V4(Ipv4Addr::LOCALHOST);
     }
 
+    #[tokio::test]
+    async fn resolve_dest_pinned_ip_skips_lookup() {
+        let dest = Dest {
+            host: Some("this-name-does-not-exist.invalid".into()),
+            ip: Some(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
+            port: 443,
+            proto: Proto::Tcp,
+        };
+        let sa = resolve_dest(&dest).await.unwrap();
+        assert_eq!(sa.ip(), IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)));
+        assert_eq!(sa.port(), 443);
+    }
+
     #[test]
     fn default_fwmark_is_0x162() {
         assert_eq!(DEFAULT_FWMARK, 0x162);

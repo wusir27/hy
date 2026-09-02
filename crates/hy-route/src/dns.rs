@@ -1,8 +1,10 @@
 //! TUN DNS hijack: parse/cache, stub, plain UDP/TCP, and DoH over DirectDialer.
 //!
 //! DoH TCP is marked/bound via [`crate::DirectDialer`] so it cannot loop into TUN.
+//! Darwin: after pin, stub upstream IPv4 `/32`s are punched (never the magnet `1.1.1.1`).
 //! This crate must not use ureq, hy-core, quinn, or h3.
 
+use crate::darwin_dns::MAGNET_DNS;
 use crate::dest::{Dest, Proto};
 use crate::direct::DirectDialer;
 use crate::error::Error;
@@ -383,7 +385,37 @@ impl PlainTcp for DirectDialer {
 }
 
 /// Default DoH URL when Darwin a-only has empty `--route-dns` and conf `dns-server`.
-pub const DARWIN_A_ONLY_DOH: &str = "https://1.1.1.1/dns-query";
+/// Must not be `https://1.1.1.1/dns-query`: that dest is the magnet and cannot be excluded.
+pub const DARWIN_A_ONLY_DOH: &str = "https://dns.alidns.com/dns-query";
+/// Hardcoded Ali DoH anycast (pin-fail / magnet-dest replacement).
+pub const ALI_DOH_ANYCAST: Ipv4Addr = Ipv4Addr::new(223, 5, 5, 5);
+/// SNI / Host for [`ALI_DOH_ANYCAST`].
+pub const ALI_DOH_HOST: &str = "dns.alidns.com";
+/// RFC 8484 path for Ali DoH.
+pub const ALI_DOH_PATH: &str = "/dns-query";
+
+fn magnet_ip() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))
+}
+
+fn is_magnet_ip(ip: IpAddr) -> bool {
+    ip == magnet_ip() || ip.to_string() == MAGNET_DNS
+}
+
+/// Hardcoded Ali anycast DoH: dest `223.5.5.5:443`, SNI/Host `dns.alidns.com`.
+pub fn ali_anycast_doh_target() -> DohTarget {
+    DohTarget {
+        dest: Dest {
+            host: Some(ALI_DOH_HOST.to_string()),
+            ip: Some(IpAddr::V4(ALI_DOH_ANYCAST)),
+            port: 443,
+            proto: Proto::Tcp,
+        },
+        host_header: ALI_DOH_HOST.to_string(),
+        sni: ALI_DOH_HOST.to_string(),
+        path: ALI_DOH_PATH.to_string(),
+    }
+}
 
 /// TUN stub: cache + upstreams. Answers on the TUN; never uses hy Client.
 pub struct DnsStub {
@@ -602,6 +634,15 @@ pub fn pin_doh_dest(target: &mut DohTarget, ip: IpAddr) {
     target.dest.ip = Some(ip);
 }
 
+/// rustls SNI: hostname → DnsName; literal IP → IpAddress (never DnsName).
+pub fn doh_server_name(sni: &str) -> Result<ServerName<'static>, Error> {
+    if let Ok(ip) = sni.parse::<IpAddr>() {
+        Ok(ServerName::from(ip))
+    } else {
+        ServerName::try_from(sni.to_string()).map_err(|e| Error::dns(e.to_string()))
+    }
+}
+
 /// Blocking A lookup via the current system resolver. Skips AAAA (Darwin a-only).
 pub fn resolve_doh_a(host: &str, port: u16) -> Result<IpAddr, Error> {
     let addrs = (host, port)
@@ -625,12 +666,14 @@ fn try_pin_doh_target(
         .host
         .as_deref()
         .filter(|h| !h.is_empty())
-        .ok_or_else(|| Error::dns("DoH URL has no host to pin"))?;
-    let ip = resolve_a(host, target.dest.port)?;
+        .ok_or_else(|| Error::dns("DoH URL has no host to pin"))?
+        .to_string();
+    let ip = resolve_a(&host, target.dest.port)?;
     if !ip.is_ipv4() {
         return Err(Error::dns(format!("pin DoH {host}: AAAA not used")));
     }
     pin_doh_dest(target, ip);
+    tracing::info!(host = %host, %ip, "DoH hostname pinned");
     Ok(())
 }
 
@@ -640,7 +683,22 @@ enum PreparedResolver {
     Plain { addr: SocketAddr },
 }
 
-/// Pin hostname DoH before the Darwin magnet. Drop URLs that fail; empty → literal 1.1.1.1.
+/// If DoH dest is the magnet (`1.1.1.1`), replace with hardcoded Ali anycast.
+fn rewrite_magnet_doh(url: &mut String, target: &mut DohTarget) {
+    if target.dest.ip.is_some_and(is_magnet_ip) {
+        tracing::info!(
+            was = %url,
+            dest = %ALI_DOH_ANYCAST,
+            sni = ALI_DOH_HOST,
+            "DoH dest equals magnet; using Ali anycast"
+        );
+        *target = ali_anycast_doh_target();
+        *url = DARWIN_A_ONLY_DOH.to_string();
+    }
+}
+
+/// Pin hostname DoH before the Darwin magnet. Drop URLs that fail; empty → Ali anycast.
+/// Never leaves dest `1.1.1.1` (magnet must stay inside TUN).
 fn prepare_stub_resolvers(
     specs: &[ResolverSpec],
     resolve_a: impl Fn(&str, u16) -> Result<IpAddr, Error>,
@@ -664,10 +722,9 @@ fn prepare_stub_resolvers(
                     );
                     continue;
                 }
-                out.push(PreparedResolver::Doh {
-                    url: url.clone(),
-                    target,
-                });
+                let mut url = url.clone();
+                rewrite_magnet_doh(&mut url, &mut target);
+                out.push(PreparedResolver::Doh { url, target });
             }
             ResolverSpec::Plain { addr } => {
                 out.push(PreparedResolver::Plain { addr: *addr });
@@ -676,15 +733,42 @@ fn prepare_stub_resolvers(
     }
     if out.is_empty() {
         tracing::warn!(
-            fallback = DARWIN_A_ONLY_DOH,
-            "no DNS stub upstreams after pin; falling back to literal-IP DoH"
+            dest = %ALI_DOH_ANYCAST,
+            sni = ALI_DOH_HOST,
+            "no DNS stub upstreams after pin; falling back to Ali DoH anycast"
         );
-        match parse_doh_url(DARWIN_A_ONLY_DOH) {
-            Ok(target) => out.push(PreparedResolver::Doh {
-                url: DARWIN_A_ONLY_DOH.to_string(),
-                target,
-            }),
-            Err(e) => tracing::error!(error = %e, "internal: fallback DoH URL failed to parse"),
+        out.push(PreparedResolver::Doh {
+            url: DARWIN_A_ONLY_DOH.to_string(),
+            target: ali_anycast_doh_target(),
+        });
+    }
+    out
+}
+
+/// Stub upstream IPv4 `/32`s to punch on Darwin TUN. Never includes [`MAGNET_DNS`].
+pub fn stub_upstream_exclude_cidrs(
+    specs: &[ResolverSpec],
+    resolve_a: impl Fn(&str, u16) -> Result<IpAddr, Error>,
+) -> Vec<(IpAddr, u8)> {
+    exclude_v4_from_prepared(&prepare_stub_resolvers(specs, resolve_a))
+}
+
+fn exclude_v4_from_prepared(prepared: &[PreparedResolver]) -> Vec<(IpAddr, u8)> {
+    let mut out = Vec::new();
+    for p in prepared {
+        let ip = match p {
+            PreparedResolver::Doh { target, .. } => target.dest.ip,
+            PreparedResolver::Plain { addr } => Some(addr.ip()),
+        };
+        let Some(ip) = ip else {
+            continue;
+        };
+        if !ip.is_ipv4() || is_magnet_ip(ip) {
+            continue;
+        }
+        let cidr = (ip, 32u8);
+        if !out.contains(&cidr) {
+            out.push(cidr);
         }
     }
     out
@@ -866,8 +950,7 @@ impl DohUpstream {
 impl DnsUpstream for DohUpstream {
     async fn exchange(&self, query: &[u8]) -> Result<Vec<u8>, Error> {
         let stream = self.tcp.tcp(&self.target.dest).await?;
-        let name = ServerName::try_from(self.target.sni.clone())
-            .map_err(|e| Error::dns(e.to_string()))?;
+        let name = doh_server_name(&self.target.sni)?;
         let tls = self
             .tls
             .connect(name, stream)
@@ -940,11 +1023,19 @@ impl PlainUpstream {
 }
 
 /// Build upstreams from a resolver list. Hostname DoH is pinned to A before any query.
-/// All TCP/UDP uses `dialer`.
+/// All TCP/UDP uses `dialer`. Also returns Darwin TUN `/32` excludes (magnet omitted).
 pub fn build_upstreams(
     specs: &[ResolverSpec],
     dialer: DirectDialer,
 ) -> Result<Vec<Arc<dyn DnsUpstream>>, Error> {
+    Ok(build_upstreams_with_exclude(specs, dialer)?.0)
+}
+
+/// Like [`build_upstreams`], plus stub upstream IPv4 `/32`s (never [`MAGNET_DNS`]).
+pub fn build_upstreams_with_exclude(
+    specs: &[ResolverSpec],
+    dialer: DirectDialer,
+) -> Result<(Vec<Arc<dyn DnsUpstream>>, Vec<(IpAddr, u8)>), Error> {
     build_upstreams_with_resolve(specs, dialer, resolve_doh_a)
 }
 
@@ -952,8 +1043,9 @@ fn build_upstreams_with_resolve(
     specs: &[ResolverSpec],
     dialer: DirectDialer,
     resolve_a: impl Fn(&str, u16) -> Result<IpAddr, Error>,
-) -> Result<Vec<Arc<dyn DnsUpstream>>, Error> {
+) -> Result<(Vec<Arc<dyn DnsUpstream>>, Vec<(IpAddr, u8)>), Error> {
     let prepared = prepare_stub_resolvers(specs, resolve_a);
+    let exclude = exclude_v4_from_prepared(&prepared);
     let mut out: Vec<Arc<dyn DnsUpstream>> = Vec::new();
     for p in prepared {
         match p {
@@ -969,7 +1061,7 @@ fn build_upstreams_with_resolve(
             }
         }
     }
-    Ok(out)
+    Ok((out, exclude))
 }
 
 #[cfg(test)]
@@ -1409,16 +1501,16 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(
-            v.iter().all(|s| match s {
-                ResolverSpec::Doh { url } => url != DARWIN_A_ONLY_DOH,
-                _ => true,
+            v.iter().any(|s| match s {
+                ResolverSpec::Doh { url } => url == "https://doh.pub/dns-query",
+                _ => false,
             }),
-            "sr_cnip URLs must not be replaced by DARWIN_A_ONLY_DOH"
+            "sr_cnip must keep doh.pub; not collapse to a single Darwin default"
         );
     }
 
     #[test]
-    fn pin_two_hostnames_fail_falls_back_to_darwin_a_only_doh() {
+    fn pin_two_hostnames_fail_falls_back_to_ali_anycast() {
         let specs = [
             ResolverSpec::Doh {
                 url: "https://no-such-p16-a.invalid/dns-query".into(),
@@ -1432,21 +1524,27 @@ mod tests {
         match &planned[0] {
             PreparedResolver::Doh { url, target } => {
                 assert_eq!(url, DARWIN_A_ONLY_DOH);
-                assert_eq!(
-                    target.dest.ip,
-                    Some(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)))
-                );
-                assert!(target.dest.host.is_none());
+                assert_eq!(target.dest.ip, Some(IpAddr::V4(ALI_DOH_ANYCAST)));
+                assert_eq!(target.dest.host.as_deref(), Some(ALI_DOH_HOST));
+                assert_eq!(target.dest.port, 443);
+                assert_eq!(target.sni, ALI_DOH_HOST);
+                assert_eq!(target.host_header, ALI_DOH_HOST);
+                assert_eq!(target.path, ALI_DOH_PATH);
             }
             other => panic!("{other:?}"),
         }
-        let upstreams = build_upstreams_with_resolve(
+        let (upstreams, excl) = build_upstreams_with_resolve(
             &specs,
             DirectDialer::relaxed(0x162),
             |_, _| Err(Error::dns("no A")),
         )
         .unwrap();
         assert_eq!(upstreams.len(), 1);
+        assert!(excl.contains(&(IpAddr::V4(ALI_DOH_ANYCAST), 32)));
+        assert!(
+            !excl.iter().any(|(ip, _)| is_magnet_ip(*ip)),
+            "magnet must not be excluded: {excl:?}"
+        );
     }
 
     #[test]
@@ -1491,6 +1589,91 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        let excl = exclude_v4_from_prepared(&planned);
+        assert!(excl.contains(&(IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)), 32)));
+        assert!(excl.contains(&(IpAddr::V4(Ipv4Addr::new(1, 12, 0, 1)), 32)));
+        assert!(
+            !excl.contains(&(magnet_ip(), 32)),
+            "magnet 1.1.1.1/32 must not be punched: {excl:?}"
+        );
+        assert_eq!(MAGNET_DNS, "1.1.1.1");
+        assert_eq!(magnet_ip().to_string(), MAGNET_DNS);
+    }
+
+    fn pin_ali_dohpub(host: &str, _port: u16) -> Result<IpAddr, Error> {
+        Ok(IpAddr::V4(if host.contains("alidns") {
+            Ipv4Addr::new(223, 5, 5, 5)
+        } else {
+            Ipv4Addr::new(1, 12, 0, 1)
+        }))
+    }
+
+    #[test]
+    fn stub_exclude_after_pin_ali_dohpub_omits_magnet() {
+        let specs = [
+            ResolverSpec::Doh {
+                url: "https://dns.alidns.com/dns-query".into(),
+            },
+            ResolverSpec::Doh {
+                url: "https://doh.pub/dns-query".into(),
+            },
+        ];
+        let excl = stub_upstream_exclude_cidrs(&specs, pin_ali_dohpub);
+        assert!(excl.contains(&(IpAddr::V4(ALI_DOH_ANYCAST), 32)));
+        assert!(excl.contains(&(IpAddr::V4(Ipv4Addr::new(1, 12, 0, 1)), 32)));
+        assert!(!excl.iter().any(|(ip, p)| is_magnet_ip(*ip) && *p == 32));
+        assert_eq!(MAGNET_DNS, "1.1.1.1");
+    }
+
+    #[test]
+    fn magnet_doh_dest_replaced_with_ali_anycast_not_excluded() {
+        let specs = [ResolverSpec::Doh {
+            url: "https://1.1.1.1/dns-query".into(),
+        }];
+        let planned = prepare_stub_resolvers(&specs, |_, _| Err(Error::dns("must not lookup")));
+        assert_eq!(planned.len(), 1);
+        match &planned[0] {
+            PreparedResolver::Doh { target, .. } => {
+                assert_eq!(target.dest.ip, Some(IpAddr::V4(ALI_DOH_ANYCAST)));
+                assert_eq!(target.dest.port, 443);
+                assert_eq!(target.sni, ALI_DOH_HOST);
+                assert_eq!(target.host_header, ALI_DOH_HOST);
+                assert_eq!(target.path, ALI_DOH_PATH);
+                assert_eq!(target.dest.host.as_deref(), Some(ALI_DOH_HOST));
+            }
+            other => panic!("{other:?}"),
+        }
+        let excl = exclude_v4_from_prepared(&planned);
+        assert!(excl.contains(&(IpAddr::V4(ALI_DOH_ANYCAST), 32)));
+        assert!(!excl.contains(&(magnet_ip(), 32)));
+        assert_eq!(MAGNET_DNS, "1.1.1.1");
+    }
+
+    #[test]
+    fn doh_server_name_hostname_is_dns_literal_ip_is_ip_address() {
+        let host = doh_server_name("dns.alidns.com").unwrap();
+        match &host {
+            ServerName::DnsName(d) => assert_eq!(d.as_ref(), "dns.alidns.com"),
+            other => panic!("hostname SNI must be DnsName, got {other:?}"),
+        }
+        let t = parse_doh_url("https://1.0.0.1/dns-query").unwrap();
+        assert_eq!(t.sni, "1.0.0.1");
+        assert_eq!(t.dest.ip, Some("1.0.0.1".parse().unwrap()));
+        let ip = doh_server_name(&t.sni).unwrap();
+        match &ip {
+            ServerName::IpAddress(_) => assert_eq!(ip.to_str().as_ref(), "1.0.0.1"),
+            other => panic!("literal IP SNI must be IpAddress, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn darwin_default_doh_is_ali_not_magnet() {
+        assert_eq!(DARWIN_A_ONLY_DOH, "https://dns.alidns.com/dns-query");
+        assert!(!DARWIN_A_ONLY_DOH.contains("1.1.1.1"));
+        let t = ali_anycast_doh_target();
+        assert_eq!(t.dest.ip, Some(IpAddr::V4(ALI_DOH_ANYCAST)));
+        assert_ne!(t.dest.ip, Some(magnet_ip()));
+        assert_eq!(MAGNET_DNS, "1.1.1.1");
     }
 
     #[tokio::test]

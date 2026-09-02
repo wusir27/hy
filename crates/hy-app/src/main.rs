@@ -200,6 +200,28 @@ struct PreparedRoute {
     icmp_reply: bool,
 }
 
+/// Punch stub upstream IPv4 `/32`s on Darwin TUN only. Linux uses fwmark.
+#[cfg(feature = "client-route")]
+fn merge_darwin_stub_tun_exclude(
+    tun: &mut Option<config::TunConfig>,
+    cidrs: &[(std::net::IpAddr, u8)],
+    is_darwin: bool,
+) {
+    if !is_darwin || cidrs.is_empty() {
+        return;
+    }
+    config::merge_tun_exclude(tun, cidrs);
+    let punched: Vec<String> = cidrs
+        .iter()
+        .map(|(ip, pfx)| format!("{ip}/{pfx}"))
+        .collect();
+    tracing::info!(
+        excludes = %punched.join(","),
+        magnet = hy_route::darwin_dns::MAGNET_DNS,
+        "darwin stub DNS TUN exclude"
+    );
+}
+
 /// Resolve route file, compile, inject marked QUIC factory + policy routing.
 /// Must run before `connect_reconnectable`.
 #[cfg(feature = "client-route")]
@@ -234,14 +256,16 @@ fn prepare_client_route(
     crate::marked_udp::inject_marked_udp(&mut app.core, marked, kind);
 
     let dns_cache = std::sync::Arc::new(hy_route::dns::DnsCache::new());
+    let mut stub_excl: Vec<(std::net::IpAddr, u8)> = Vec::new();
     let dns = if route_no_hijack_dns {
         None
     } else {
         let specs =
             hy_route::dns::resolve_server_list(route_dns, router.dns_servers(), darwin_a_only)
                 .map_err(|e| Error::config("route-dns", e.to_string()))?;
-        let upstreams = hy_route::dns::build_upstreams(&specs, direct.clone())
+        let (upstreams, excl) = hy_route::dns::build_upstreams_with_exclude(&specs, direct.clone())
             .map_err(|e| Error::config("route-dns", e.to_string()))?;
+        stub_excl = excl;
         Some(std::sync::Arc::new(
             hy_route::dns::DnsStub::new(std::sync::Arc::clone(&dns_cache), upstreams)
                 .with_aaaa_nodata(darwin_a_only),
@@ -262,6 +286,9 @@ fn prepare_client_route(
     }
 
     config::merge_tun_exclude(&mut app.tun, &router.tun_exclude_cidrs());
+    // Darwin: punch stub DoH/plain IPv4 /32s so DirectDialer IP_BOUND_IF can reach them.
+    // Linux already has fwmark; do not add these CIDRs.
+    merge_darwin_stub_tun_exclude(&mut app.tun, &stub_excl, cfg!(target_os = "macos"));
     Ok(Some(PreparedRoute {
         router,
         direct,
@@ -1018,5 +1045,104 @@ mod tests {
 
         let (dns, _) = tun_dns_hijack(None, true, true, None).unwrap();
         assert!(dns.is_none(), "--route-no-hijack-dns");
+    }
+
+    #[cfg(feature = "client-route")]
+    fn pin_ali_dohpub(host: &str, _port: u16) -> Result<std::net::IpAddr, hy_route::Error> {
+        use std::net::{IpAddr, Ipv4Addr};
+        Ok(IpAddr::V4(if host.contains("alidns") {
+            Ipv4Addr::new(223, 5, 5, 5)
+        } else {
+            Ipv4Addr::new(1, 12, 0, 1)
+        }))
+    }
+
+    #[cfg(feature = "client-route")]
+    #[test]
+    fn darwin_stub_exclude_ali_dohpub_not_magnet() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let specs = [
+            hy_route::dns::ResolverSpec::Doh {
+                url: "https://dns.alidns.com/dns-query".into(),
+            },
+            hy_route::dns::ResolverSpec::Doh {
+                url: "https://doh.pub/dns-query".into(),
+            },
+        ];
+        let cidrs = hy_route::dns::stub_upstream_exclude_cidrs(&specs, pin_ali_dohpub);
+        assert!(cidrs.contains(&(IpAddr::V4(Ipv4Addr::new(223, 5, 5, 5)), 32)));
+        assert!(cidrs.contains(&(IpAddr::V4(Ipv4Addr::new(1, 12, 0, 1)), 32)));
+        assert!(!cidrs.contains(&(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 32)));
+        assert_eq!(hy_route::darwin_dns::MAGNET_DNS, "1.1.1.1");
+
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\ntun:\n  name: hy0\n  route: {}\n",
+        )
+        .unwrap();
+        let mut app = fill_client(&y).unwrap();
+        merge_darwin_stub_tun_exclude(&mut app.tun, &cidrs, false);
+        let linux = app.tun.as_ref().unwrap();
+        assert!(
+            linux
+                .route
+                .as_ref()
+                .map(|r| r.ipv4_exclude.is_empty())
+                .unwrap_or(true),
+            "Linux must not punch stub /32s"
+        );
+        assert!(!linux.apply_exclude);
+
+        merge_darwin_stub_tun_exclude(&mut app.tun, &cidrs, true);
+        let t = app.tun.as_ref().unwrap();
+        assert!(t.apply_exclude);
+        let r = t.route.as_ref().unwrap();
+        assert!(r.ipv4_exclude.iter().any(|s| s == "223.5.5.5/32"));
+        assert!(r.ipv4_exclude.iter().any(|s| s == "1.12.0.1/32"));
+        assert!(
+            !r.ipv4_exclude.iter().any(|s| s == "1.1.1.1/32"),
+            "magnet must stay inside TUN: {:?}",
+            r.ipv4_exclude
+        );
+        let got = crate::inbound::tun_plan::darwin_ipv4_install_list(&r.ipv4, &r.ipv4_exclude)
+            .unwrap();
+        let covers = |host: Ipv4Addr| {
+            got.iter().any(|(a, bits)| {
+                let mask = if *bits == 0 { 0 } else { !0u32 << (32 - bits) };
+                (u32::from(*a) & mask) == (u32::from(host) & mask)
+            })
+        };
+        assert!(!covers(Ipv4Addr::new(223, 5, 5, 5)), "Ali DoH must be a hole: {got:?}");
+        assert!(!covers(Ipv4Addr::new(1, 12, 0, 1)), "doh.pub must be a hole: {got:?}");
+        assert!(covers(Ipv4Addr::new(1, 1, 1, 1)), "magnet 1.1.1.1 must still enter utun: {got:?}");
+    }
+
+    #[cfg(feature = "client-route")]
+    #[test]
+    fn darwin_stub_exclude_rewritten_magnet_doh_is_ali() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let specs = [hy_route::dns::ResolverSpec::Doh {
+            url: "https://1.1.1.1/dns-query".into(),
+        }];
+        let cidrs = hy_route::dns::stub_upstream_exclude_cidrs(&specs, |_, _| {
+            Err(hy_route::Error::Dns("must not lookup".into()))
+        });
+        assert!(cidrs.contains(&(IpAddr::V4(hy_route::dns::ALI_DOH_ANYCAST), 32)));
+        assert!(!cidrs.contains(&(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 32)));
+        assert_eq!(hy_route::darwin_dns::MAGNET_DNS, "1.1.1.1");
+
+        let y = parse_client_yaml(
+            "server: 127.0.0.1:1\nauth: x\ntun:\n  name: hy0\n  route: {}\n",
+        )
+        .unwrap();
+        let mut app = fill_client(&y).unwrap();
+        merge_darwin_stub_tun_exclude(&mut app.tun, &cidrs, true);
+        let r = app.tun.as_ref().unwrap().route.as_ref().unwrap();
+        assert!(r.ipv4_exclude.iter().any(|s| s == "223.5.5.5/32"));
+        assert!(!r.ipv4_exclude.iter().any(|s| s == "1.1.1.1/32"));
+    }
+
+    #[test]
+    fn hy_version_still_0_0_2() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.0.2");
     }
 }
